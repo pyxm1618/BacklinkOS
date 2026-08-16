@@ -214,14 +214,21 @@ General traffic rules:
 
 Cache/reuse traffic evidence by provider + metric type + domain/origin + period when appropriate. Do not repeat an unchanged monthly lookup merely because another placement on the same domain is screened.
 
-### 8. Verify domain age
+### 8. Fetch domain age from the project API
 
-Use authoritative RDAP/registrar registration data where available.
+Use the production domain-age endpoint for the canonical domain:
 
-- find the domain registration/creation event
-- record the exact registration date in evidence
-- compute/display `域龄` from that date
-- if the authoritative response lacks a usable registration date, use `未确认`
+`GET https://backlink-metrics-api.vercel.app/api/domain-age?domain=<canonical_domain>`
+
+The runtime is RDAP-first and may attempt WHOIS only as a fallback. Screening should use the normalized response rather than implementing its own registration-date heuristics.
+
+Domain-age evidence rules:
+
+- `status=CONFIRMED` with a usable `registration_date` -> record the exact registration date, returned `domain_age_years`, `source`, and `checked_at`; retain `expiration_date` when present
+- any non-confirmed result (`UNKNOWN`, `LOOKUP_FAILED`, or `PROVIDER_ERROR`) -> `域龄 = 未确认`
+- never turn a missing/failed registration date into `0`
+- never substitute Wayback first-seen dates, copyright years, search snippets, or SEO-tool age for authoritative registration evidence
+- reuse one current domain-age observation across placements on the same canonical domain when appropriate
 
 Do not treat the age of a root platform domain as the age of a newly created user page/subdomain.
 
@@ -292,7 +299,7 @@ Every decisive fact should be traceable. Keep, when applicable:
 - raw `<a rel>` value
 - registration/pricing evidence URL
 - Ahrefs DR value and `checked_at`
-- RDAP registration date/source
+- domain-age API registration date, expiration date when present, source, status, `checked_at`, and derived `域龄`
 - traffic observation(s): metric type, normalized value, optional raw provider value, source, provider status, period, provider snapshot date when available, checked_at, confidence, origin/domain, raw field used, and notes
 - aggregate traffic review status/conflict state when multiple observations exist
 - optional CrUX coverage/rank only if CrUX is actually queried in a future implementation
@@ -318,7 +325,8 @@ Before completing a screening task, verify:
 - [ ] provider errors/timeouts are not converted to zero or F
 - [ ] observation status is separate from aggregate conflict/review status
 - [ ] any future popularity rank is never converted into monthly visits
-- [ ] domain age is authoritative or `未确认`
+- [ ] domain age comes from the project domain-age API; only `CONFIRMED` becomes a numeric `域龄`
+- [ ] non-confirmed domain-age results remain `未确认`
 - [ ] no relevance field was added
 - [ ] F is supported by a hard-rejection reason
 - [ ] persistence success is not claimed without confirmation
@@ -332,3 +340,4 @@ Before completing a screening task, verify:
 - Behavioral regression scenarios: [references/test-cases.md](references/test-cases.md)
 - Executable metric-adapter tests live in the `pyxm1618/backlink-metrics-api` repository.
 - Crawlora live validation report lives in `backlink-metrics-api/docs/crawlora-live-validation-2026-08-15.md`.
+- Domain-age production validation report lives in `backlink-metrics-api/docs/domain-age-live-validation-2026-08-16.md`.
