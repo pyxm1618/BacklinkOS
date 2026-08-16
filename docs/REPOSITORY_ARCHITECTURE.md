@@ -2,241 +2,202 @@
 
 ## Status
 
-Approved design for repository responsibility and migration. This document defines structure only; it does not authorize feature expansion during the repository-cleanup step.
+Approved two-repository architecture and current operating model.
 
-## Decision
+The system is optimized for personal use with typical screening runs of roughly **100–1000 candidate URLs**. It is intentionally not designed as a 100K-scale distributed data system.
 
-BacklinkOS will use two repositories with explicit boundaries:
+## 1. Repository responsibilities
 
-1. `pyxm1618/BacklinkOS` — product/orchestration layer.
-2. `pyxm1618/backlink-metrics-api` — deterministic metrics service.
+BacklinkOS uses two repositories with explicit boundaries:
+
+1. `pyxm1618/BacklinkOS` — product, Skills, screening workflow, evidence/rating rules, and persistence contracts.
+2. `pyxm1618/backlink-metrics-api` — deterministic metric-provider integrations, normalization, provider error semantics, tests, and Vercel runtime.
 
 Do not create a third repository for the current scope.
 
----
+### `pyxm1618/BacklinkOS`
 
-## 1. `BacklinkOS`: product and workflow layer
-
-`BacklinkOS` is the canonical home for backlink product logic.
+This is the canonical home for backlink product logic.
 
 It owns:
 
 - backlink opportunity model and lifecycle
 - `screening-backlinks` Skill
-- future `discovering-backlinks` Skill
 - A/B/C/D/F screening semantics
 - publishability / registration / pricing / link-attribute verification workflow
 - evidence and persistence contracts
 - Feishu/Lark integration when implemented
-- batch screening orchestration when implemented
+- future `discovering-backlinks` Skill as a separate module
 - product strategy, architecture and decisions
-- future acquisition / measurement / learning workflows
 
-It must not implement or duplicate proprietary/deterministic metric-provider logic when that logic belongs in `backlink-metrics-api`.
+It must not duplicate Ahrefs, Crawlora, or other provider-specific runtime code.
 
-### Target structure
-
-```text
-BacklinkOS/
-├── .agents/
-│   └── skills/
-│       ├── screening-backlinks/
-│       └── discovering-backlinks/        # future, not part of cleanup
-├── .claude/
-│   └── skills/                            # compatibility symlinks only
-├── docs/
-│   ├── V1_PRODUCT_PLAN.md
-│   ├── V2_PRODUCT_PLAN.md
-│   ├── V3_PRODUCT_STRATEGY.md
-│   └── REPOSITORY_ARCHITECTURE.md
-├── integrations/
-│   └── feishu/                            # future
-├── workflows/
-│   └── screening/                         # future
-└── tests/
-    └── skill-contracts/                   # future if executable contract tests are added
-```
-
-The cleanup must not create empty speculative directories solely to match this diagram.
-
----
-
-## 2. `backlink-metrics-api`: deterministic metrics service
-
-`backlink-metrics-api` is a supporting infrastructure repository. It exposes stable metric endpoints and provider adapters.
-
-It owns:
-
-- Ahrefs DR provider integration
-- Crawlora total-monthly-visits provider integration
-- future CrUX popularity runtime
-- provider normalization
-- provider error / no-data semantics
-- provider-specific tests
-- provider validation reports
-- Vercel deployment/runtime configuration
-
-It does not own:
-
-- backlink discovery
-- backlink opportunity rating
-- A/B/C/D/F logic
-- backlink publishability logic
-- registration/pricing classification
-- placement-type business rules
-- Feishu schema/business workflow
-- Skill orchestration
-- topical relevance
-
-### Target structure
-
-```text
-backlink-metrics-api/
-├── app/
-│   └── api/
-│       ├── dr/
-│       ├── traffic/
-│       └── crux/                          # future
-├── lib/
-│   └── providers/                         # preferred destination for provider code as it grows
-├── tests/
-│   └── providers/                         # preferred destination for provider tests as it grows
-├── docs/
-│   └── provider-validation/
-└── README.md
-```
-
-The cleanup may move existing provider files into clearer directories only when imports/tests remain stable and the move has clear value. It must not add CrUX runtime or other new features during the cleanup.
-
----
-
-## 3. System relationship
-
-The product flow is:
-
-```text
-Discovering Backlinks (future)
-        ↓
-Raw Opportunity
-        ↓
-Screening Backlinks
-        ↓
-Verified Opportunity
-        ↓
-Persistence / Acquisition / Learning
-```
-
-`screening-backlinks` may call `backlink-metrics-api` for deterministic evidence:
-
-```text
-BacklinkOS / screening-backlinks
-        │
-        ├── DR request ───────→ backlink-metrics-api /api/dr
-        ├── visits request ───→ backlink-metrics-api /api/traffic
-        └── CrUX request ─────→ backlink-metrics-api /api/crux   # future
-```
-
-The API returns evidence. The Skill decides how evidence is interpreted in the backlink workflow.
-
----
-
-## 4. Migration scope
-
-The repository cleanup is intentionally narrow.
-
-### Move to `BacklinkOS`
-
-Move the canonical `screening-backlinks` Skill and its references from `backlink-metrics-api` to `BacklinkOS`:
+Current canonical Skill:
 
 ```text
 .agents/skills/screening-backlinks/
 ```
 
-Recreate/maintain the Claude compatibility symlink in `BacklinkOS`:
+Claude compatibility entry:
 
 ```text
 .claude/skills/screening-backlinks
 → ../../.agents/skills/screening-backlinks
 ```
 
-The migrated Skill must continue to call the deployed metrics API rather than importing provider implementation code.
+### `pyxm1618/backlink-metrics-api`
 
-### Keep in `backlink-metrics-api`
+This repository provides deterministic metric evidence.
 
-Keep:
+It owns:
 
-- `/api/dr`
-- `/api/traffic`
-- Ahrefs provider implementation
-- Crawlora provider implementation
-- executable provider tests
-- provider validation report(s)
-- deployment/runtime configuration
+- Ahrefs DR single-domain integration
+- Ahrefs DR bounded batch integration
+- Crawlora total-monthly-visits integration
+- shared domain normalization for domain-scoped metrics
+- provider error / missing-data semantics
+- provider-specific executable tests
+- provider validation evidence
+- Vercel deployment/runtime configuration
 
-### Remove from `backlink-metrics-api`
+It does not own:
 
-After the Skill exists and is verified in `BacklinkOS`, remove the duplicated canonical Skill directory and its Claude compatibility link from `backlink-metrics-api`.
+- backlink discovery
+- backlink A/B/C/D/F decisions
+- publishability rules
+- registration/pricing classification
+- placement-type business rules
+- Feishu business workflow
+- topical relevance
 
-Do not leave two independently editable copies of `screening-backlinks`.
+## 2. Current runtime relationship
 
----
+The current screening path is:
 
-## 5. Source of truth
+```text
+Candidate URLs
+      ↓
+BacklinkOS / screening-backlinks
+      ↓
+normalize + deduplicate domain-level work
+      ↓
+backlink-metrics-api
+      ├── /api/dr            single-domain DR
+      ├── /api/dr/batch      bounded batch DR
+      └── /api/traffic       selective total-monthly-visits estimate
+      ↓
+BacklinkOS combines metric evidence with current page/placement verification
+      ↓
+A / B / C / D / F
+      ↓
+Feishu/Lark persistence (remaining integration)
+```
 
-After migration:
+The metrics API returns evidence. The Skill decides how that evidence is used in the screening workflow.
+
+## 3. Realistic batch model
+
+The expected operating scale is roughly **100–1000 candidate URLs per run**.
+
+The workflow should reduce external calls before doing provider lookups:
+
+1. normalize candidate URLs/domains
+2. deduplicate by the correct identity
+3. reuse one domain-wide metric observation across placements when the metric itself is domain-wide
+4. query DR for the unique domains
+5. keep placement verification independent even when several placements share a domain
+
+### DR batching
+
+`backlink-metrics-api` exposes:
+
+```text
+POST /api/dr/batch
+```
+
+One HTTP call accepts at most **20 unique normalized domains**. A larger 100–1000-candidate screening run is split into sequential chunks of at most 20 unique domains.
+
+This limit is intentional. It keeps each Vercel request bounded while respecting the Ahrefs provider rate limit instead of building a long-running queue system.
+
+The batch runtime:
+
+- normalizes URL/domain inputs
+- deduplicates normalized domains
+- rejects malformed/local/IP inputs before provider calls
+- paces provider requests conservatively
+- retries only temporary failures within a small bounded limit
+- preserves partial results when one domain fails
+- never converts missing/failed DR into zero
+
+No distributed workers or large-scale ingestion infrastructure is required for the current personal-use workflow.
+
+## 4. Traffic evidence
+
+Traffic remains optional supporting evidence, not a required lookup for every candidate.
+
+### Crawlora
+
+Current production use:
+
+- selective follow-up for a concrete `total_monthly_visits_estimate`
+- medium-confidence modelled estimate, not first-party analytics
+- positive current `data.Engagments.Visits` may be used as confirmed evidence
+- raw zero remains `UNKNOWN`, not confirmed zero
+- stale `EstimatedMonthlyVisits` values are not used as the current monthly-visits value
+
+Do not spend Crawlora credits on every domain in a batch. Use it where a concrete traffic estimate materially helps the screening decision.
+
+### CrUX
+
+CrUX is an **optional future enhancement**, not a current MVP dependency, blocker, or required next stage.
+
+If it is implemented later, its popularity rank must remain a separate `popularity_rank` observation and must never be written as monthly visits.
+
+## 5. Missing-data discipline
+
+Across the system:
+
+- lookup failure is not zero
+- provider no-coverage is not zero
+- parser failure is not zero
+- tool access failure is not `F`
+- Crawlora raw zero is not confirmed zero
+- a real numeric Ahrefs DR zero is valid only when Ahrefs successfully returns that numeric zero
+
+These rules are part of the product contract, not optional implementation details.
+
+## 6. Source of truth
 
 - Product/Skill source of truth: `pyxm1618/BacklinkOS`
 - Deterministic metric source of truth: `pyxm1618/backlink-metrics-api`
 - Production metric endpoint: `https://backlink-metrics-api.vercel.app`
 
-A provider implementation must not be copied into the Skill repository merely to make the Skill self-contained.
+Do not create a second editable copy of `screening-backlinks` in the metrics repository.
 
----
+## 7. Current completion boundary
 
-## 6. Cleanup safety rules
+For the current `screening-backlinks` implementation, the intended runtime and workflow pieces are:
 
-Repository cleanup must preserve behavior.
+- screening/evidence/rating contract — implemented
+- Ahrefs DR single-domain lookup — implemented
+- bounded Ahrefs DR batching for realistic runs — implemented
+- selective Crawlora monthly-visits evidence — implemented
+- current-page/placement verification workflow — defined by the Skill
+- Feishu/Lark automatic persistence — **remaining implementation gap**
 
-1. No new backlink feature development during the move.
-2. No CrUX runtime implementation during the move.
-3. No Discovery Skill implementation during the move.
-4. No Feishu adapter implementation during the move.
-5. No rating-rule redesign during the move.
-6. No secret values may be copied between repositories.
-7. Existing production `/api/dr` and `/api/traffic` must remain operational.
-8. Existing provider tests must remain green.
-9. The Skill content must be byte-equivalent or semantically unchanged except for repository/path references required by the move.
-10. Migration is not complete until only one canonical editable `screening-backlinks` copy remains.
+Separate future work is not counted as an unfinished part of the current screening implementation:
 
----
+- `discovering-backlinks`
+- optional CrUX popularity evidence
+- future acquisition/measurement/learning workflows
 
-## 7. Verification after migration
+## 8. Work order from here
 
-The cleanup is accepted only after all of the following are verified:
+1. Finish and verify the bounded batch DR implementation.
+2. Configure and implement Feishu/Lark automatic persistence.
+3. Run a controlled small dry-run and audit the records.
+4. Then use `screening-backlinks` on normal real batches.
+5. Build `discovering-backlinks` separately when needed.
+6. Consider CrUX only if real usage shows that the existing evidence is insufficient.
 
-- `BacklinkOS/.agents/skills/screening-backlinks/SKILL.md` exists.
-- All current `screening-backlinks/references/*` files exist in `BacklinkOS`.
-- `BacklinkOS/.claude/skills/screening-backlinks` resolves to the `.agents` Skill.
-- No canonical `screening-backlinks` Skill remains in `backlink-metrics-api`.
-- `backlink-metrics-api` provider/runtime files remain present.
-- `npm test` passes in `backlink-metrics-api`.
-- production `/api/dr?domain=hey.com` returns a valid Ahrefs DR response.
-- production `/api/traffic?domain=github.com` returns a valid Crawlora observation.
-- no API key or secret is added to GitHub.
-
----
-
-## 8. Work order after cleanup
-
-Do not run the full screening Skill immediately after repository cleanup.
-
-Recommended sequence:
-
-1. Complete and verify repository cleanup.
-2. Implement CrUX BigQuery bulk popularity runtime in `backlink-metrics-api`.
-3. Add only the minimum persistence/batch infrastructure needed by the screening workflow.
-4. Perform a controlled dry-run on a small candidate set and audit outputs.
-5. Only then run `screening-backlinks` on larger real candidate sets.
-6. Build `discovering-backlinks` as a separate Skill later.
-
-This ordering keeps infrastructure validation separate from business-workflow validation and prevents repository restructuring from being mixed with new feature development.
+This ordering keeps the personal tool simple and lets real usage determine whether more infrastructure is justified.
