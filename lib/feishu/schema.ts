@@ -1,4 +1,4 @@
-import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuFieldProperty } from './types.ts';
+import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuFieldProperty } from './types.js';
 
 export type TableKind = 'opportunity' | 'evidence';
 

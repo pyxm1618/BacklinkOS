@@ -17,7 +17,7 @@ function request(action: string, sig = signature(action), ts = TS) {
 }
 
 test('bootstrap does not import sibling api entrypoints that are absent from a Vercel function bundle', async () => {
-  const source = await readFile(new URL('../api/feishu/bootstrap.ts', import.meta.url), 'utf8');
+  const source = await readFile('api/feishu/bootstrap.ts', 'utf8');
   assert.doesNotMatch(source, /from ['"]\.\/(setup|persist)\.ts['"]/);
 });
 
