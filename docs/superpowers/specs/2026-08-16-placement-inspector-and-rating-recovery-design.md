@@ -26,6 +26,8 @@ The first validation target is `blogstival.com`. Because several candidates appe
 - spot-check 2–3 sibling sites for technical consistency;
 - expand the sample only if material differences are observed.
 
+Validation must use a legitimate, useful Quick I Ching article and a real editorial backlink to `https://www.quickiching.com/`. Do not publish synthetic test text or disposable test posts merely to probe the platform.
+
 ## Considered approaches
 
 ### A. Continue using ChatGPT/web retrieval to infer link attributes
@@ -198,13 +200,13 @@ Do not introduce a black-box weighted SEO score. Use transparent gates.
 
 ### Phase 1
 
-Use `blogstival` as the complete representative sample:
+Use `blogstival` as the complete representative sample with a real Quick I Ching publication:
 
 1. register/login;
-2. create a minimal test post;
-3. insert one known external target URL;
-4. publish;
-5. run Placement Inspector against the public post;
+2. publish a useful, standalone article relevant to I Ching practice rather than synthetic test content;
+3. include one natural editorial backlink to `https://www.quickiching.com/`, preferably using the branded anchor `Quick I Ching` rather than a forced exact-match keyword;
+4. publish the article normally and keep it as a legitimate live asset;
+5. run Placement Inspector against the public post using the Quick I Ching target URL;
 6. capture exact `rel`, indexability, final host/subdomain and canonical behavior;
 7. assign the recommendation from deterministic rules.
 
@@ -228,7 +230,7 @@ Add executable tests using stored HTML fixtures for:
 - SSRF/private-host rejection;
 - oversized/timeout failure semantics.
 
-The real `blogstival` published page becomes a manually revalidatable live fixture, not a unit test dependency.
+The real `blogstival` Quick I Ching article becomes a manually revalidatable live fixture, not a unit test dependency.
 
 ## Persistence changes
 
@@ -250,9 +252,9 @@ Existing DR, traffic, age and Feishu infrastructure remains. Do not spend more e
 
 ## Success criteria
 
-The recovery is successful when a newly published `blogstival` test post can be given to BacklinkOS and the system can, without LLM guessing:
+The recovery is successful when the legitimate Quick I Ching article published on `blogstival` can be given to BacklinkOS and the system can, without LLM guessing:
 
-1. find the exact outbound test link;
+1. find the exact backlink to `https://www.quickiching.com/`;
 2. return raw `rel` and Dofollow/Nofollow immediately;
 3. report indexability directives;
 4. identify the actual published hostname/subdomain;
