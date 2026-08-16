@@ -2,25 +2,29 @@
 
 ## 1. Product Vision
 
-BacklinkOS is a personal SEO Link Opportunity Intelligence System.
+BacklinkOS is a personal SEO backlink opportunity system for building and maintaining a reusable database of **general-purpose backlink opportunities**.
 
-It helps a solo operator who manages multiple websites discover, evaluate, execute, record, and learn from backlink opportunities.
+The system has two core intelligence capabilities:
 
-The goal is not to collect the largest backlink dataset. The goal is to make better acquisition decisions with less repeated work.
+1. **Discover** — find potential backlink opportunities.
+2. **Screen** — verify whether those candidates are currently executable and worth keeping, then assign A/B/C/D/F.
+
+Verified opportunities are persisted to Feishu/Lark Base for later use.
+
+BacklinkOS does **not** evaluate topical relevance to a promoted website. It does not perform project-to-opportunity matching. The opportunity database is intentionally reusable across different websites and industries.
 
 ## 2. Core Problem
 
-Commercial SEO tools already expose large amounts of backlink data. The difficult parts for personal use are:
+Commercial SEO tools expose large amounts of backlink data, but a personal backlink workflow still has two difficult problems:
 
-1. finding opportunities that may actually be reproducible
-2. verifying whether an opportunity still works today
-3. collecting trustworthy evidence without turning missing data into fake facts
-4. prioritizing limited execution time
-5. recording outcomes so the same research does not need to be repeated
+1. finding enough potentially reproducible backlink opportunities
+2. verifying whether each discovered opportunity still works today and is worth keeping
 
-BacklinkOS should optimize judgment quality and execution efficiency rather than data volume.
+The second problem is already handled by `screening-backlinks`.
 
-## 3. Product Positioning
+The remaining core product gap is the first problem: systematically discovering new backlink candidates and feeding them into the existing screening pipeline.
+
+## 3. Product Boundary
 
 BacklinkOS is not:
 
@@ -29,36 +33,32 @@ BacklinkOS is not:
 - a spam automation system
 - a generic CRM
 - a SaaS product
+- a topical-relevance engine
+- a Project × Opportunity matching system
 
-The long-term loop is:
+The V3 core workflow is:
 
 ```text
 Discover
   ↓
 Screen
   ↓
-Decide
-  ↓
-Act
-  ↓
-Record
-  ↓
-Learn
+Persist
 ```
 
-Discovery and screening are separate capabilities. A discovery source may produce a candidate; it does not prove that the candidate is currently usable.
+Where:
 
-## 4. Current User Scenario
+- `discovering-backlinks` finds candidate opportunities.
+- `screening-backlinks` verifies, evaluates, and grades those candidates.
+- Feishu/Lark Base stores the verified opportunity records and supporting evidence.
 
-The system is for one person operating multiple websites.
+Discovery and screening must remain separate responsibilities. A historical backlink, search result, directory listing, community page, resource page, or other discovery source may reveal a candidate, but it does not prove that the candidate is currently usable.
 
-Typical screening input is roughly **100–1000 candidate URLs per run**. The system does not need 100K-scale ingestion, distributed workers, or a large crawler infrastructure.
+## 4. Opportunity Model
 
-A run may take several minutes or longer when external providers are rate-limited. That is acceptable for the current personal-use workflow.
+BacklinkOS stores **general-purpose backlink opportunities**.
 
-## 5. Current Screening Evidence
-
-`screening-backlinks` evaluates already-discovered opportunities using current evidence such as:
+An opportunity is evaluated on properties of the opportunity itself, such as:
 
 - whether the site/page still exists
 - whether an ordinary user can reach a real publishing path
@@ -72,22 +72,74 @@ A run may take several minutes or longer when external providers are rate-limite
 - optional traffic evidence when it materially helps the decision
 - broader site/platform quality and spam/manipulation signals
 
-### No topical relevance in the shared opportunity database
+The database may store a broad `行业` classification describing the source site/platform, but this is descriptive metadata only.
 
-BacklinkOS is shared across multiple outbound websites and industries. Therefore topical relevance is **not an intrinsic property of an opportunity** and is not part of A/B/C/D/F screening.
+There is no `相关度` field, no topical-relevance score, and no future Project × Opportunity matching layer in the V3 scope.
 
-The database may store the source site's broad `行业` classification, but there is no `相关度` field in the current screening schema.
+## 5. `screening-backlinks`: Implemented Evaluation Layer
 
-If project-specific relevance is ever needed, it belongs to a later **Project × Opportunity matching** step, not the reusable opportunity record itself.
+`screening-backlinks` receives already-discovered candidate URLs/domains and determines whether each candidate is a valid reusable backlink opportunity.
 
-## 6. Current Screening Decision Model
+It is responsible for:
 
-The current operational rating is A/B/C/D/F.
+1. normalizing candidates and deduplicating domain-wide metric work
+2. verifying current publishability
+3. verifying registration/login and free/paid status
+4. identifying the actual placement type and publishing entry
+5. verifying Dofollow/Nofollow from same-type final HTML when possible
+6. retrieving Ahrefs DR through the project metrics API
+7. retrieving authoritative domain-age evidence through the project API
+8. using traffic evidence selectively when it materially helps the decision
+9. assigning A/B/C/D/F from verified evidence
+10. building auditable main/evidence records
+11. persisting records to Feishu/Lark Base
 
-- A/B/C/D are publishable opportunity priority grades based on evidence.
-- F is a verified hard rejection for a non-executable/unsafe opportunity, not a synonym for low quality.
-- Missing evidence is preserved as unknown rather than invented as zero/false/nofollow/F.
-- No weighted black-box score is used.
+The operational rating is A/B/C/D/F:
+
+- A/B/C/D are priority grades for publishable opportunities.
+- F is a verified hard rejection for a non-executable or unsafe opportunity, not a synonym for low quality.
+- Missing evidence remains unknown rather than being converted to zero, false, Nofollow, or F.
+- No topical relevance is used in the rating.
+
+This evaluation layer is already implemented. It should not be duplicated inside discovery.
+
+## 6. `discovering-backlinks`: Remaining Core Module
+
+`discovering-backlinks` is the remaining core V3 capability.
+
+Its job is only to answer:
+
+> Where are the potential general-purpose backlink opportunities?
+
+Potential discovery sources include:
+
+- competitor backlinks
+- search results
+- directories
+- communities and forums
+- resource pages
+- profile pages
+- blog/comment footprints
+- Web 2.0 platforms
+- classifieds
+- previously successful opportunity patterns
+- other sources that can yield candidate URLs or domains
+
+Discovery should produce candidate records with enough provenance to understand where each candidate came from, then hand those candidates to `screening-backlinks`.
+
+A minimal discovery output may include:
+
+```text
+candidate_url
+source_url
+source_type
+possible_placement_type
+discovered_at
+```
+
+Discovery must **not** duplicate screening work. It should not independently decide final publishability, Dofollow/Nofollow, pricing, DR, domain age, traffic quality, or A/B/C/D/F when those facts belong to `screening-backlinks`.
+
+Historical backlink existence is discovery evidence only. Current usability must be verified by screening.
 
 ## 7. Current Technical Architecture
 
@@ -99,28 +151,31 @@ Owns:
 
 - product strategy
 - `screening-backlinks` Skill
-- evidence/rating rules
-- persistence contract
 - future `discovering-backlinks` Skill
-- future acquisition/learning workflows
+- evidence/rating rules
+- Feishu/Lark persistence workflow
+- backlink opportunity records and lifecycle
 
 ### `pyxm1618/backlink-metrics-api`
 
-Owns deterministic provider integrations and Vercel runtime:
+Owns deterministic provider integrations and Vercel runtime, including:
 
 - Ahrefs DR single lookup
 - bounded Ahrefs DR batch lookup
 - selective Crawlora total-monthly-visits lookup
+- domain-age lookup
 - provider normalization/failure semantics
 - executable provider tests
 
-Do not duplicate provider implementation code inside the Skill repository.
+Provider implementation code should not be duplicated inside the Skills repository.
 
-There is no current requirement to build a separate Web UI, Python backend, distributed worker system, or database server merely to satisfy the MVP. Those should be introduced only if real usage proves they are necessary.
+There is no current requirement for a separate Web UI, Python backend, distributed worker system, or database server merely to satisfy the personal-use workflow.
 
-## 8. Realistic Batch Strategy
+## 8. Screening Scale and Batch Strategy
 
-For a normal 100–1000-candidate screening run:
+Typical screening input is roughly **100–1000 candidate URLs per run**.
+
+For a normal run:
 
 1. normalize inputs
 2. deduplicate domain-wide metric work
@@ -128,9 +183,9 @@ For a normal 100–1000-candidate screening run:
 4. verify placement-specific facts independently
 5. use Crawlora only for the smaller subset where a concrete monthly-visits estimate helps the decision
 6. build auditable A/B/C/D/F records
-7. persist to Feishu/Lark once the integration is configured
+7. persist verified records to Feishu/Lark Base
 
-This is deliberately simpler than a large-scale queue system.
+The system intentionally avoids 100K-scale ingestion, distributed workers, and unnecessary queue infrastructure.
 
 ## 9. Traffic Strategy
 
@@ -147,54 +202,66 @@ Important semantics:
 - organic-search traffic and total monthly visits remain separate metrics
 - traffic alone never causes F
 
-CrUX is an optional future enhancement if real usage shows that popularity evidence adds enough value. It is not a current MVP dependency or blocker.
+CrUX remains an optional future evidence source only if real screening usage proves that it adds useful information. It is not part of the core V3 gap.
 
 ## 10. Persistence
 
-Feishu/Lark Base is the current persistence target.
+Feishu/Lark Base is the production persistence target.
 
 The visible operational table stays compact, while supporting evidence may live in linked/separate evidence records.
 
-The remaining implementation gap for the current `screening-backlinks` workflow is automatic Feishu/Lark persistence.
+Automatic Feishu/Lark persistence is **implemented and production-validated**.
 
-Until that integration is actually working, the Skill may prepare import-ready records but must never claim that data was written successfully.
+The production workflow supports:
 
-## 11. Future Modules
+- protected schema setup
+- deterministic main-record upsert
+- deterministic evidence-record upsert
+- exact-key lookup
+- create/update without duplicate logical records
 
-Future work is intentionally separate from the current screening implementation:
+Persistence is therefore not a remaining core V3 implementation gap.
 
-### `discovering-backlinks`
+## 11. What V3 Explicitly Does Not Build
 
-Find candidate opportunities from competitor backlinks, search results, directories, communities, resource pages, and other sources.
-
-Output candidates into `screening-backlinks`; do not merge discovery and screening into one monolithic Skill.
-
-### Acquisition / Learning
-
-Later stages may track execution, successful placements, failures, reusable patterns, and site-level history.
-
-These should be driven by actual usage rather than built speculatively.
-
-## 12. What We Explicitly Do Not Build Now
-
+- topical relevance scoring
+- Project × Opportunity matching
+- destination-site relevance decisions
 - Ahrefs replacement
 - massive backlink crawler/index
 - 100K-scale processing infrastructure
 - distributed job system
 - automatic backlink spam system
 - black-box weighted SEO score
-- topical relevance inside the shared screening grade
-- unnecessary UI/backend layers before the workflow proves they are needed
+- unnecessary UI/backend layers before real usage proves they are needed
+
+## 12. Current Completion State
+
+### Implemented
+
+- `screening-backlinks` evidence and rating workflow
+- current publishability verification contract
+- Ahrefs DR integration and bounded batch processing
+- selective traffic evidence
+- authoritative domain-age workflow
+- A/B/C/D/F decision semantics
+- Feishu/Lark automatic persistence and production verification
+
+### Remaining core capability
+
+- `discovering-backlinks`
+
+Therefore the current BacklinkOS V3 development focus is straightforward:
+
+> Build a dedicated `discovering-backlinks` Skill that finds general-purpose backlink candidates and feeds them into the already-implemented `screening-backlinks` pipeline.
 
 ## 13. Current Roadmap
 
-1. Finish and verify realistic batch screening infrastructure.
-2. Configure and implement Feishu/Lark automatic persistence.
-3. Run a controlled small dry-run and audit the output.
-4. Use `screening-backlinks` on normal real batches.
-5. Build `discovering-backlinks` separately when needed.
-6. Add optional evidence/infrastructure only when real usage demonstrates a gap.
+1. Use `screening-backlinks` on real candidate batches and fix only problems revealed by real usage.
+2. Design and implement `discovering-backlinks` as a separate Skill.
+3. Connect discovery output directly into the existing screening pipeline.
+4. Add optional evidence or infrastructure only when real usage demonstrates a concrete gap.
 
-The V3 principle is simple:
+The V3 principle is:
 
-> Better evidence, better decisions, less repeated work — without building infrastructure the personal workflow does not need.
+> Find more real opportunities, verify them rigorously, and avoid rebuilding functionality that already exists.
