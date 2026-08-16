@@ -91,16 +91,20 @@ traffic.cv and Ahrefs Traffic Checker remain manual secondary evidence unless a 
 
 ## Domain age
 
-Prefer authoritative RDAP or registrar creation/registration events.
+Canonical screening source:
 
-Store:
+`https://backlink-metrics-api.vercel.app/api/domain-age?domain=<domain>`
 
-- exact registration date
-- source
-- verification date
-- derived age
+The project adapter normalizes authoritative registration evidence and is RDAP-first with WHOIS fallback.
 
-If no reliable registration event exists, use `未确认`.
+Rules:
+
+- accept a numeric `domain_age_years` only when `status=CONFIRMED` and `registration_date` is present
+- store the exact `registration_date`, returned `source`, and `checked_at`; retain `expiration_date` when available
+- `UNKNOWN`, `LOOKUP_FAILED`, or `PROVIDER_ERROR` -> `域龄=未确认`
+- never turn missing/failed age into zero
+- never substitute Wayback first-seen dates, copyright years, search snippets, or SEO-tool age
+- domain age is supporting quality evidence; it never independently causes `F`
 
 ## A/B/C/D/F policy
 
@@ -198,7 +202,7 @@ Use only for objectively verified non-executable/unsafe opportunities:
 - actual verification shows the intended placement cannot contain an external link
 - confirmed malicious/phishing/unsafe site
 
-Do not assign F because of low DR, low/zero/unknown traffic, CrUX no coverage, Nofollow, payment, login requirements, industry mismatch, or a temporary tool/provider-access failure.
+Do not assign F because of low DR, low/zero/unknown traffic, CrUX no coverage, Nofollow, payment, login requirements, industry mismatch, domain age, or a temporary tool/provider-access failure.
 
 ## F evidence
 
