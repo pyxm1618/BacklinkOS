@@ -1,5 +1,5 @@
-import type { FeishuConfig } from './config.ts';
-import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuRecord } from './types.ts';
+import type { FeishuConfig } from './config.js';
+import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuRecord } from './types.js';
 
 const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
 
