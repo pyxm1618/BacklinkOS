@@ -13,16 +13,29 @@ This skill screens already-discovered candidates. It does **not** discover backl
 
 This skill orchestrates research and verification. Deterministic metrics belong in APIs/scripts; do not reimplement them by guessing or by substituting unrelated third-party metrics.
 
+## Operating scale
+
+This is a personal-use workflow. A typical run contains roughly **100–1000 candidate URLs**, not 100K-scale input.
+
+For domain-wide metrics:
+
+1. normalize candidate URLs/domains
+2. deduplicate normalized domains
+3. reuse one current domain-wide metric observation across placements on that same domain when appropriate
+4. keep placement-specific facts such as publishability and link attribute independent
+
+Do not build or assume distributed workers, large ingestion queues, or other large-scale infrastructure for the current workflow.
+
 ## Non-negotiable rules
 
 1. **Verify each candidate independently.** Never infer one site's registration, pricing, link attribute, publishability, or traffic from another site, even when they share a CMS, template, owner, or network.
 2. **Historical backlinks are discovery evidence only.** A competitor's old backlink does not prove the placement is currently reproducible.
 3. **Missing is not zero.** A failed lookup, blocked page, absent field, parser failure, 403, CAPTCHA, unsupported source, or provider no-coverage result must not become `0`, `无`, `Nofollow`, or `F`.
-4. **Preserve metric semantics.** Organic-search traffic, total monthly visits, and CrUX popularity are different metrics and must never overwrite or impersonate one another.
+4. **Preserve metric semantics.** Organic-search traffic, total monthly visits, and popularity evidence are different metrics and must never overwrite or impersonate one another.
 5. **Use current, direct evidence whenever possible.** Prefer first-party pages, actual forms, actual published examples, raw final HTML, official metric APIs, authoritative RDAP, and clearly documented provider APIs.
 6. **Do not use topical relevance.** This database is shared across outbound sites in different industries. There is no `相关度` field and relevance must not affect A/B/C/D/F.
 7. **Do not assign A/B/C/D before collecting available facts.** `F` may be assigned early only for a verified hard rejection defined below.
-8. **Traffic never independently causes F.** Low traffic, confirmed zero, unknown traffic, CrUX no coverage, or provider failure are not hard rejection reasons.
+8. **Traffic never independently causes F.** Low traffic, confirmed zero from a future provider with valid zero semantics, unknown traffic, no coverage, or provider failure are not hard rejection reasons.
 9. **Do not claim persistence succeeded unless the target system confirms the write.**
 
 ## Inputs
@@ -50,11 +63,12 @@ A domain-wide hard rejection can block every placement only when the evidence is
 
 ## Workflow
 
-### 1. Normalize and check existing records
+### 1. Normalize, deduplicate, and check existing records
 
 - Normalize the hostname to lowercase and remove a leading `www.` for the canonical database domain.
 - Preserve the original candidate URL as evidence.
-- Preserve the final URL origin separately when a provider is origin-scoped; canonical-domain normalization must not erase scheme/host distinctions required by CrUX.
+- Deduplicate domain-wide metric work before making provider calls.
+- Do **not** deduplicate placement records by domain alone; the placement identity remains `canonical_domain + placement_type + publish_entry_url`.
 - If an existing database is available, search it before doing expensive research.
 - If the exact placement already has a verified `F` hard-rejection record, reuse it unless the user explicitly requests revalidation.
 - If no database/persistence backend is accessible, continue with evidence collection but never pretend a lookup occurred.
@@ -127,28 +141,53 @@ Never infer WordPress comments are Nofollow, or a Web 2.0 network is Dofollow, w
 
 ### 6. Fetch Ahrefs DR from the project API
 
-Use the project service as the only DR source:
+Ahrefs is the only DR source.
+
+For one-off checks use:
 
 `GET https://backlink-metrics-api.vercel.app/api/dr?domain=<canonical_domain>`
 
-Required behavior:
+For normal batches, deduplicate domains first and call:
 
-- HTTP success + numeric `dr` -> record that value as `DR`
-- request/API failure -> `DR = 未确认`
+`POST https://backlink-metrics-api.vercel.app/api/dr/batch`
+
+with:
+
+```json
+{
+  "domains": ["example.com", "https://www.github.com/openai"]
+}
+```
+
+Batch rules:
+
+- one batch HTTP request accepts at most **20 unique normalized domains**
+- split a larger 100–1000-candidate run into sequential chunks of at most 20 unique domains
+- do not send one long request containing the entire run
+- the runtime paces Ahrefs requests conservatively and performs only bounded retries for temporary failures
+- one failed domain must not invalidate the other results in that batch
+- reuse one current DR observation for multiple placements on the same canonical domain
+
+DR evidence rules:
+
+- successful numeric `dr` -> record that value
+- request/provider failure -> `DR = 未确认`
+- result status `UNKNOWN` -> `DR = 未确认`
 - never substitute Semrush Authority Score or third-party cached DR
 - record `source=Ahrefs` and `checked_at` from the response in evidence
 
-A legitimate numeric DR of `0` is allowed only when the API successfully returns a numeric zero. A missing/invalid DR payload must not be converted to zero.
+A legitimate numeric DR of `0` is allowed only when the API successfully returns a numeric zero. Missing, invalid, failed, or throttled DR must never be converted to zero.
 
-### 7. Collect traffic evidence with a free-first layered strategy
+### 7. Collect traffic evidence only when it helps the decision
 
-Traffic is an **evidence system**, not one interchangeable number. Follow [references/traffic-evidence.md](references/traffic-evidence.md).
+Traffic is optional supporting evidence, not a mandatory lookup for every candidate. Follow [references/traffic-evidence.md](references/traffic-evidence.md).
 
-Required order:
+Current strategy:
 
-1. **CrUX popularity evidence** — bulk/cheap first-pass evidence when a Google Cloud/BigQuery setup is available. Use the exact relevant origin and keep CrUX rank as popularity evidence only. CrUX runtime is not implemented yet.
-2. **Numeric total-monthly-visits estimate** — use the project Crawlora adapter when additional numeric verification is justified: `GET https://backlink-metrics-api.vercel.app/api/traffic?domain=<canonical_domain>`. Crawlora is `PRODUCTION_APPROVED` only as a selective, medium-confidence single-domain fallback under the rules below; it is not the bulk-first layer.
-3. **Manual secondary checks** — traffic.cv and Ahrefs Traffic Checker may be used for important/ambiguous candidates when automation is unavailable or conflicting.
+1. **Do not query a traffic provider by default for every domain.** First collect the cheaper/current facts already needed for screening.
+2. **Crawlora numeric total-monthly-visits estimate** — use the project adapter selectively when a concrete traffic estimate materially helps an important, ambiguous, or higher-priority decision: `GET https://backlink-metrics-api.vercel.app/api/traffic?domain=<canonical_domain>`.
+3. **Manual secondary checks** — traffic.cv and Ahrefs Traffic Checker may be used for important/conflicting cases when the additional evidence justifies manual effort.
+4. **CrUX is optional future evidence.** It is not a current MVP dependency or blocker. If implemented later, its rank must remain `popularity_rank` evidence and must never be stored as monthly visits.
 
 Crawlora runtime rules:
 
@@ -165,15 +204,15 @@ Crawlora runtime rules:
 
 General traffic rules:
 
-- Keep `organic_search_traffic_estimate`, `total_monthly_visits_estimate`, and `popularity_rank` separate.
+- Keep `organic_search_traffic_estimate`, `total_monthly_visits_estimate`, and any future `popularity_rank` observation separate.
 - The compact visible field is named `月访问量`, not `月流量`. It is populated **only** by a numeric `total_monthly_visits_estimate`; otherwise use `未确认`.
-- CrUX rank never goes into `月访问量`.
+- Any future CrUX rank never goes into `月访问量`.
 - Ahrefs Traffic Checker organic traffic never goes into `月访问量`; it remains a separate evidence observation.
-- no CrUX row -> `NOT_COVERED`, not zero
+- no coverage from any provider is not zero
 - each provider observation keeps its own provider status; cross-provider disagreement is recorded separately as aggregate `traffic_review_status=CONFLICT` or `NEEDS_REVIEW`
 - traffic status by itself never produces `F`
 
-Cache traffic evidence using provider + metric type + domain/origin + period. Do not repeat an unchanged monthly lookup merely because the candidate is screened again.
+Cache/reuse traffic evidence by provider + metric type + domain/origin + period when appropriate. Do not repeat an unchanged monthly lookup merely because another placement on the same domain is screened.
 
 ### 8. Verify domain age
 
@@ -196,8 +235,8 @@ Important:
 - F is only a verified hard rejection, not a synonym for low quality.
 - Traffic is supporting evidence, not a black-box score and not an automatic threshold.
 - Traffic evidence is considered **when available**; unknown traffic does not lower a rating by itself.
-- Strong real-user/popularity evidence can support higher priority, including for credible Nofollow placements with referral/brand value.
-- DR/traffic/popularity contradictions trigger quality review; they do not automatically produce F.
+- Strong real-user/traffic evidence can support higher priority, including for credible Nofollow placements with referral/brand value.
+- DR/traffic contradictions trigger quality review; they do not automatically produce F.
 - Low DR, Nofollow, paid access, registration friction, or low/zero traffic do not independently justify F.
 
 ### 10. Build the database record
@@ -215,6 +254,8 @@ Target persistence is Feishu/Lark Base.
 - If a working Feishu/Lark write integration is available, upsert using the placement identity and confirm the returned record/update result.
 - If Feishu/Lark is not available, produce an import-ready structured record plus evidence record and mark persistence as pending.
 - Never say “已写入飞书” unless the write call actually succeeded.
+
+**Feishu/Lark automatic persistence is the remaining implementation gap for the current screening workflow.**
 
 The persistence adapter is intentionally replaceable; see [references/persistence-schema.md](references/persistence-schema.md).
 
@@ -252,7 +293,7 @@ Every decisive fact should be traceable. Keep, when applicable:
 - RDAP registration date/source
 - traffic observation(s): metric type, normalized value, optional raw provider value, source, provider status, period, provider snapshot date when available, checked_at, confidence, origin/domain, raw field used, and notes
 - aggregate traffic review status/conflict state when multiple observations exist
-- CrUX coverage/rank when queried
+- optional CrUX coverage/rank only if CrUX is actually queried in a future implementation
 - hard-rejection reason
 - verification date
 - concise notes about uncertainty, provider conflicts, or access blocks
@@ -262,17 +303,19 @@ Every decisive fact should be traceable. Keep, when applicable:
 Before completing a screening task, verify:
 
 - [ ] each placement was independently checked
+- [ ] domain-wide metric calls were normalized/deduplicated before repeated provider work
 - [ ] no missing data was turned into zero
 - [ ] current publishability has evidence or is explicitly `未确认`
 - [ ] link attribute comes from final same-type HTML or is `未确认`
 - [ ] DR comes only from the project Ahrefs API
+- [ ] normal multi-domain DR work uses bounded `/api/dr/batch` chunks rather than one unbounded request
 - [ ] traffic metrics preserve their type/source/provider-status and are not mixed
-- [ ] CrUX no-coverage is not interpreted as zero
 - [ ] `月访问量` contains only a total-monthly-visits estimate or `未确认`
 - [ ] Crawlora uses only positive current `Engagments.Visits` as a confirmed numeric value
 - [ ] Crawlora raw zero remains `UNKNOWN` and is never written as `月访问量=0`
 - [ ] provider errors/timeouts are not converted to zero or F
 - [ ] observation status is separate from aggregate conflict/review status
+- [ ] any future popularity rank is never converted into monthly visits
 - [ ] domain age is authoritative or `未确认`
 - [ ] no relevance field was added
 - [ ] F is supported by a hard-rejection reason
@@ -284,5 +327,5 @@ Before completing a screening task, verify:
 - Traffic evidence architecture and provider contracts: [references/traffic-evidence.md](references/traffic-evidence.md)
 - Visible/evidence schemas and Feishu adapter contract: [references/persistence-schema.md](references/persistence-schema.md)
 - Behavioral regression scenarios: [references/test-cases.md](references/test-cases.md)
-- Executable Crawlora adapter tests: `tests/crawlora-traffic.test.ts`
-- Crawlora live validation report: `docs/crawlora-live-validation-2026-08-15.md`
+- Executable metric-adapter tests live in the `pyxm1618/backlink-metrics-api` repository.
+- Crawlora live validation report lives in `backlink-metrics-api/docs/crawlora-live-validation-2026-08-15.md`.

@@ -1,319 +1,200 @@
 # BacklinkOS V3 Product Strategy
 
-# 1. Product Vision
+## 1. Product Vision
 
 BacklinkOS is a personal SEO Link Opportunity Intelligence System.
 
-It helps a solo SEO operator discover, evaluate, execute, and learn from high-value backlink opportunities.
+It helps a solo operator who manages multiple websites discover, evaluate, execute, record, and learn from backlink opportunities.
 
-The goal is not to collect more backlinks. The goal is to improve the quality and efficiency of backlink acquisition decisions.
+The goal is not to collect the largest backlink dataset. The goal is to make better acquisition decisions with less repeated work.
 
----
+## 2. Core Problem
 
-# 2. Core Problem
+Commercial SEO tools already expose large amounts of backlink data. The difficult parts for personal use are:
 
-The biggest bottleneck for personal SEO is not lack of backlink data.
+1. finding opportunities that may actually be reproducible
+2. verifying whether an opportunity still works today
+3. collecting trustworthy evidence without turning missing data into fake facts
+4. prioritizing limited execution time
+5. recording outcomes so the same research does not need to be repeated
 
-Commercial tools already provide large datasets. The difficult problems are:
+BacklinkOS should optimize judgment quality and execution efficiency rather than data volume.
 
-1. Finding opportunities worth pursuing.
-2. Judging true backlink value.
-3. Prioritizing limited execution time.
-4. Learning from previous successes and failures.
+## 3. Product Positioning
 
-BacklinkOS should optimize judgment quality rather than data volume.
+BacklinkOS is not:
 
----
+- an Ahrefs replacement
+- a massive backlink index
+- a spam automation system
+- a generic CRM
+- a SaaS product
 
-# 3. Product Positioning
+The long-term loop is:
 
-BacklinkOS = SEO Opportunity Intelligence System
-
-It is not:
-
-- An Ahrefs clone.
-- A backlink database.
-- A spam automation tool.
-- A generic CRM.
-
-The core loop:
-
-```
+```text
 Discover
   ↓
-Understand
+Screen
   ↓
 Decide
   ↓
 Act
   ↓
-Measure
+Record
   ↓
 Learn
 ```
 
----
+Discovery and screening are separate capabilities. A discovery source may produce a candidate; it does not prove that the candidate is currently usable.
 
-# 4. Target User Scenario
+## 4. Current User Scenario
 
-Target user:
+The system is for one person operating multiple websites.
 
-A person operating multiple websites who needs a repeatable backlink acquisition process.
+Typical screening input is roughly **100–1000 candidate URLs per run**. The system does not need 100K-scale ingestion, distributed workers, or a large crawler infrastructure.
 
-Typical workflow:
+A run may take several minutes or longer when external providers are rate-limited. That is acceptable for the current personal-use workflow.
 
-- Discover possible link sources.
-- Analyze whether they are valuable.
-- Decide whether to invest time.
-- Execute acquisition.
-- Record results.
-- Improve future decisions.
+## 5. Current Screening Evidence
 
----
+`screening-backlinks` evaluates already-discovered opportunities using current evidence such as:
 
-# 5. Core Workflow
+- whether the site/page still exists
+- whether an ordinary user can reach a real publishing path
+- whether that placement can create an external link
+- registration/login requirements
+- free/paid status
+- placement type
+- actual final-link `rel` attribute
+- Ahrefs DR
+- authoritative domain age when available
+- optional traffic evidence when it materially helps the decision
+- broader site/platform quality and spam/manipulation signals
 
-## Opportunity Capture
+### No topical relevance in the shared opportunity database
 
-Purpose:
+BacklinkOS is shared across multiple outbound websites and industries. Therefore topical relevance is **not an intrinsic property of an opportunity** and is not part of A/B/C/D/F screening.
 
-Collect possible backlink opportunities.
+The database may store the source site's broad `行业` classification, but there is no `相关度` field in the current screening schema.
 
-Sources:
+If project-specific relevance is ever needed, it belongs to a later **Project × Opportunity matching** step, not the reusable opportunity record itself.
 
-- Competitor analysis.
-- SERP research.
-- Resource pages.
-- Directories.
-- Manual discovery.
+## 6. Current Screening Decision Model
 
-Output:
+The current operational rating is A/B/C/D/F.
 
-Opportunity entity.
+- A/B/C/D are publishable opportunity priority grades based on evidence.
+- F is a verified hard rejection for a non-executable/unsafe opportunity, not a synonym for low quality.
+- Missing evidence is preserved as unknown rather than invented as zero/false/nofollow/F.
+- No weighted black-box score is used.
 
-## Evidence Collection
+## 7. Current Technical Architecture
 
-Purpose:
+BacklinkOS currently uses two GitHub repositories with explicit responsibilities.
 
-Build decision evidence instead of fake scoring.
+### `pyxm1618/BacklinkOS`
 
-Signals:
+Owns:
 
-- Topic relevance.
-- Domain quality.
-- Page quality.
-- Traffic indicators.
-- Outbound link patterns.
-- Spam signals.
+- product strategy
+- `screening-backlinks` Skill
+- evidence/rating rules
+- persistence contract
+- future `discovering-backlinks` Skill
+- future acquisition/learning workflows
 
-## Decision Support
+### `pyxm1618/backlink-metrics-api`
 
-Output:
+Owns deterministic provider integrations and Vercel runtime:
 
-- Pursue.
-- Review.
-- Reject.
+- Ahrefs DR single lookup
+- bounded Ahrefs DR batch lookup
+- selective Crawlora total-monthly-visits lookup
+- provider normalization/failure semantics
+- executable provider tests
 
-Every decision should explain why.
+Do not duplicate provider implementation code inside the Skill repository.
 
-## Acquisition Pipeline
+There is no current requirement to build a separate Web UI, Python backend, distributed worker system, or database server merely to satisfy the MVP. Those should be introduced only if real usage proves they are necessary.
 
-Track:
+## 8. Realistic Batch Strategy
 
-- Outreach.
-- Contacts.
-- Status.
-- Next actions.
+For a normal 100–1000-candidate screening run:
 
-## Learning Loop
+1. normalize inputs
+2. deduplicate domain-wide metric work
+3. query Ahrefs DR in bounded sequential chunks
+4. verify placement-specific facts independently
+5. use Crawlora only for the smaller subset where a concrete monthly-visits estimate helps the decision
+6. build auditable A/B/C/D/F records
+7. persist to Feishu/Lark once the integration is configured
 
-Record:
+This is deliberately simpler than a large-scale queue system.
 
-- Successful patterns.
-- Failed approaches.
-- Valuable domains.
-- Effective acquisition methods.
+## 9. Traffic Strategy
 
----
+Traffic is optional supporting evidence, not a mandatory lookup for every candidate.
 
-# 6. V3 Modules
+Current automated numeric source:
 
-## P0 Opportunity Intelligence Engine
+- Crawlora / SimilarWeb public surface, used selectively as a medium-confidence total-monthly-visits estimate
 
-The core capability.
+Important semantics:
 
-Transforms raw backlink candidates into actionable opportunities.
+- Crawlora positive current Visits may be confirmed evidence
+- Crawlora raw zero is unknown, not a real confirmed zero
+- organic-search traffic and total monthly visits remain separate metrics
+- traffic alone never causes F
 
-Includes:
+CrUX is an optional future enhancement if real usage shows that popularity evidence adds enough value. It is not a current MVP dependency or blocker.
 
-- Opportunity database.
-- Evidence collection.
-- AI-assisted analysis.
-- Decision support.
+## 10. Persistence
 
-## P1 Acquisition Pipeline
+Feishu/Lark Base is the current persistence target.
 
-Manages execution after a decision is made.
+The visible operational table stays compact, while supporting evidence may live in linked/separate evidence records.
 
-## P2 SEO Learning Database
+The remaining implementation gap for the current `screening-backlinks` workflow is automatic Feishu/Lark persistence.
 
-Creates long-term personal SEO intelligence.
+Until that integration is actually working, the Skill may prepare import-ready records but must never claim that data was written successfully.
 
----
+## 11. Future Modules
 
-# 7. Data Model
+Future work is intentionally separate from the current screening implementation:
 
-The system should be opportunity-centric, not backlink-centric.
+### `discovering-backlinks`
 
-## Website
+Find candidate opportunities from competitor backlinks, search results, directories, communities, resource pages, and other sources.
 
-Stores target websites and relationship history.
+Output candidates into `screening-backlinks`; do not merge discovery and screening into one monolithic Skill.
 
-## Opportunity
+### Acquisition / Learning
 
-Represents a possible backlink acquisition chance.
+Later stages may track execution, successful placements, failures, reusable patterns, and site-level history.
 
-Fields:
+These should be driven by actual usage rather than built speculatively.
 
-- Source URL.
-- Opportunity type.
-- Discovery source.
-- Status.
+## 12. What We Explicitly Do Not Build Now
 
-## Evidence
+- Ahrefs replacement
+- massive backlink crawler/index
+- 100K-scale processing infrastructure
+- distributed job system
+- automatic backlink spam system
+- black-box weighted SEO score
+- topical relevance inside the shared screening grade
+- unnecessary UI/backend layers before the workflow proves they are needed
 
-Stores facts supporting decisions.
+## 13. Current Roadmap
 
-## Decision
+1. Finish and verify realistic batch screening infrastructure.
+2. Configure and implement Feishu/Lark automatic persistence.
+3. Run a controlled small dry-run and audit the output.
+4. Use `screening-backlinks` on normal real batches.
+5. Build `discovering-backlinks` separately when needed.
+6. Add optional evidence/infrastructure only when real usage demonstrates a gap.
 
-Stores human or AI judgment.
+The V3 principle is simple:
 
-## Action
-
-Stores execution history.
-
-## Outcome
-
-Stores acquisition results.
-
-## Learning
-
-Stores reusable SEO knowledge.
-
----
-
-# 8. AI Strategy
-
-AI should act as a research and decision assistant.
-
-AI responsibilities:
-
-- Summarize pages.
-- Extract evidence.
-- Analyze opportunities.
-- Explain recommendations.
-- Find patterns from historical data.
-
-Human responsibilities:
-
-- Strategic judgment.
-- Final prioritization.
-- Relationship decisions.
-
----
-
-# 9. Technical Architecture
-
-Recommended architecture:
-
-```
-Simple Web UI
-      |
-Python Backend
-      |
-SQLite/PostgreSQL
-      |
-Workers
-      |
-Crawler + AI Services
-```
-
-Avoid:
-
-- SaaS architecture.
-- Multi-user systems.
-- Distributed crawling infrastructure.
-- Large backlink indexes.
-
-BacklinkOS is a personal productivity system, not a commercial SEO platform.
-
----
-
-# 10. MVP Roadmap
-
-## Phase 1
-
-Opportunity database.
-
-- Create opportunities.
-- Manage status.
-- Store evidence.
-
-## Phase 2
-
-Intelligence layer.
-
-- Crawling.
-- AI analysis.
-- Decision assistance.
-
-## Phase 3
-
-Acquisition workflow.
-
-- Outreach tracking.
-- Follow-up.
-- Outcome recording.
-
-## Phase 4
-
-Learning system.
-
-- Pattern discovery.
-- Strategy improvement.
-
----
-
-# 11. What We Explicitly Do Not Build
-
-- Ahrefs replacement.
-- Massive backlink crawler.
-- Automatic backlink spam system.
-- Black-box SEO score.
-- Complex CRM.
-
----
-
-# 12. Why This Is Better Than V1/V2
-
-V1 correctly identified backlink opportunity pipeline as the direction, but remained workflow-oriented.
-
-V2 improved the strategy by emphasizing decision quality, evidence, human-in-the-loop automation, and learning loops.
-
-V3 further narrows the product boundary:
-
-From:
-
-Personal SEO Operating System
-
-To:
-
-Personal Link Opportunity Intelligence System.
-
-The competitive advantage is not more data or more automation.
-
-It is:
-
-Better decisions.
-Faster execution.
-Accumulated SEO intelligence.
+> Better evidence, better decisions, less repeated work — without building infrastructure the personal workflow does not need.
