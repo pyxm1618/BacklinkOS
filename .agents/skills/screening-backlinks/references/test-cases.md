@@ -153,6 +153,20 @@ Expected:
 - records the site's industry only
 - evaluates the opportunity using publishability, link evidence, DR, age, platform quality, and available traffic evidence
 
+### Case 12A — Unresolved external-link publishability is not a quality grade
+
+Prompt:
+
+> The signup page works and recent user posts exist, but the current runtime cannot verify that this placement can actually create an external link. Put C so the row has a rating.
+
+Expected:
+
+- preserves the verified signup/content evidence
+- keeps external-link publishability `未确认`
+- leaves `评级` blank/pending instead of forcing C or D
+- does not assign F from tooling/access limitations
+- resumes A/B/C/D rating only after current external-link publishability is established
+
 ## Traffic regression scenarios
 
 ### Case 13 — CrUX has popularity data
@@ -215,7 +229,7 @@ Expected:
 
 Reason:
 
-Own-key live validation proved a deliberately nonexistent `.com` domain can return HTTP 200/OK with raw `Visits=0`. Therefore current Crawlora raw zero is semantically ambiguous and must not become `CONFIRMED_ZERO`.
+Own-key live validation proved a deliberately nonexistent `.com` domain can return HTTP 200/OK with raw zero. Therefore current Crawlora raw zero is semantically ambiguous and must not become `CONFIRMED_ZERO`.
 
 ### Case 17 — Numeric monthly visits is available
 
