@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createBootstrapHandler } from '../api/feishu/bootstrap.ts';
 
 const KEY = 'test-bootstrap-secret';
@@ -14,6 +15,11 @@ function signature(action: string, ts = TS) {
 function request(action: string, sig = signature(action), ts = TS) {
   return new Request(`https://example.test/api/feishu/bootstrap?action=${encodeURIComponent(action)}&ts=${ts}&sig=${sig}`);
 }
+
+test('bootstrap does not import sibling api entrypoints that are absent from a Vercel function bundle', async () => {
+  const source = await readFile(new URL('../api/feishu/bootstrap.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /from ['"]\.\/(setup|persist)\.ts['"]/);
+});
 
 test('bootstrap rejects invalid signatures before invoking Feishu handlers', async () => {
   let called = false;
