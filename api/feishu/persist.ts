@@ -1,8 +1,8 @@
-import { authorizeBacklinkOS, loadFeishuConfig } from '../../lib/feishu/config.ts';
-import { createFeishuClient, FeishuApiError } from '../../lib/feishu/client.ts';
-import { persistPlacement } from '../../lib/feishu/persistence.ts';
-import { PersistenceValidationError, validatePersistRequest } from '../../lib/feishu/validation.ts';
-import type { FeishuClientFactory } from '../../lib/feishu/types.ts';
+import { authorizeBacklinkOS, loadFeishuConfig } from '../../lib/feishu/config.js';
+import { createFeishuClient, FeishuApiError } from '../../lib/feishu/client.js';
+import { persistPlacement } from '../../lib/feishu/persistence.js';
+import { PersistenceValidationError, validatePersistRequest } from '../../lib/feishu/validation.js';
+import type { FeishuClientFactory } from '../../lib/feishu/types.js';
 
 type PersistDeps = {
   env?: NodeJS.ProcessEnv;
