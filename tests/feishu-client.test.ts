@@ -36,6 +36,55 @@ test('listFields uses bearer token and returns items', async () => {
   assert.equal(headers.get('authorization'), 'Bearer tenant-token');
 });
 
+test('hasAnyRecords ignores Feishu default rows whose cells are completely blank', async () => {
+  let count = 0;
+  const fetchImpl = async () => {
+    count += 1;
+    if (count === 1) return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant-token', expire: 7200 }));
+    return new Response(JSON.stringify({
+      code: 0,
+      data: {
+        items: [
+          { record_id: 'rec1', fields: { '文本': null } },
+          { record_id: 'rec2', fields: { '文本': '' } },
+          { record_id: 'rec3', fields: {} },
+        ],
+        has_more: false,
+      },
+    }));
+  };
+  const client = createFeishuClient(config, fetchImpl);
+  assert.equal(await client.hasAnyRecords('tbl_main'), false);
+});
+
+test('hasAnyRecords scans past blank pages and detects later meaningful data', async () => {
+  let count = 0;
+  const fetchImpl = async (input: string | URL | Request) => {
+    count += 1;
+    if (count === 1) return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tenant-token', expire: 7200 }));
+    const url = String(input);
+    if (!url.includes('page_token=next')) {
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          items: [{ record_id: 'rec1', fields: { '文本': '' } }],
+          has_more: true,
+          page_token: 'next',
+        },
+      }));
+    }
+    return new Response(JSON.stringify({
+      code: 0,
+      data: {
+        items: [{ record_id: 'rec2', fields: { '文本': 'real value' } }],
+        has_more: false,
+      },
+    }));
+  };
+  const client = createFeishuClient(config, fetchImpl);
+  assert.equal(await client.hasAnyRecords('tbl_main'), true);
+});
+
 test('Feishu envelope error is normalized without secret leakage', async () => {
   let count = 0;
   const fetchImpl = async () => {
