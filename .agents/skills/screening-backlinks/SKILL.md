@@ -247,17 +247,19 @@ For an `F` record, keep the visible row minimal: at minimum `URL`, `评级=F`, a
 
 For A/B/C/D, fill every field that has verified data and use `未确认` where a required fact remains unresolved.
 
-### 11. Persist or prepare for persistence
+### 11. Persist to Feishu or prepare a fallback record
 
-Target persistence is Feishu/Lark Base.
+The production persistence target is Feishu/Lark Base through the protected BacklinkOS persistence API.
 
-- If a working Feishu/Lark write integration is available, upsert using the placement identity and confirm the returned record/update result.
-- If Feishu/Lark is not available, produce an import-ready structured record plus evidence record and mark persistence as pending.
+- Upsert the main record by exact `placement_key` and evidence rows by exact `evidence_key`.
+- A successful write must return an explicit `created` or `updated` action plus a Feishu record ID.
+- Repeating the same logical placement must update the existing record rather than create a duplicate.
+- If the Feishu integration is temporarily unavailable in the current runtime, produce an import-ready structured main record plus evidence records and mark persistence as pending.
 - Never say “已写入飞书” unless the write call actually succeeded.
 
-**Feishu/Lark automatic persistence is the remaining implementation gap for the current screening workflow.**
+**Feishu/Lark automatic persistence is implemented and production-validated.** Live verification on 2026-08-16 created one main record and one evidence record, then updated those same record IDs on the second write.
 
-The persistence adapter is intentionally replaceable; see [references/persistence-schema.md](references/persistence-schema.md).
+The persistence adapter remains intentionally replaceable; see [references/persistence-schema.md](references/persistence-schema.md).
 
 ## Hard rejection (`F`)
 
@@ -320,6 +322,7 @@ Before completing a screening task, verify:
 - [ ] no relevance field was added
 - [ ] F is supported by a hard-rejection reason
 - [ ] persistence success is not claimed without confirmation
+- [ ] when Feishu persistence is used, the response confirms `created`/`updated` and returns record IDs
 
 ## Additional resources
 

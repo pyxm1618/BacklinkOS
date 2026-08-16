@@ -1,6 +1,6 @@
-import type { FeishuConfig } from './config.ts';
-import type { FeishuClient, FeishuRecord } from './types.ts';
-import type { EvidenceRecord, MainRecord, ValidatedPersistRequest } from './validation.ts';
+import type { FeishuConfig } from './config.js';
+import type { FeishuClient, FeishuRecord } from './types.js';
+import type { EvidenceRecord, MainRecord, ValidatedPersistRequest } from './validation.js';
 
 export type PersistAction = 'created' | 'updated' | 'conflict' | 'failed';
 

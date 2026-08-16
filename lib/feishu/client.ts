@@ -1,5 +1,5 @@
-import type { FeishuConfig } from './config.ts';
-import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuRecord } from './types.ts';
+import type { FeishuConfig } from './config.js';
+import type { FeishuClient, FeishuField, FeishuFieldInput, FeishuRecord } from './types.js';
 
 const FEISHU_BASE = 'https://open.feishu.cn/open-apis';
 
@@ -35,6 +35,18 @@ async function parseJson(response: Response): Promise<Record<string, unknown>> {
   } catch {
     throw new FeishuApiError('Feishu returned malformed JSON', response.status, null);
   }
+}
+
+function hasMeaningfulValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.some(hasMeaningfulValue);
+  if (typeof value === 'object') return Object.values(value as Record<string, unknown>).some(hasMeaningfulValue);
+  return true;
+}
+
+function recordHasMeaningfulData(record: FeishuRecord): boolean {
+  return Object.values(record.fields ?? {}).some(hasMeaningfulValue);
 }
 
 export function createFeishuClient(config: FeishuConfig, fetchImpl: FetchLike = fetch): FeishuClient {
@@ -117,11 +129,19 @@ export function createFeishuClient(config: FeishuConfig, fetchImpl: FetchLike = 
   }
 
   async function hasAnyRecords(tableId: string): Promise<boolean> {
-    const data = await requestData<{ items?: FeishuRecord[] }>(
-      `/bitable/v1/apps/${encodeURIComponent(config.appToken)}/tables/${encodeURIComponent(tableId)}/records/search?page_size=1`,
-      { method: 'POST', body: '{}' },
-    );
-    return Array.isArray(data.items) && data.items.length > 0;
+    let pageToken = '';
+    do {
+      const query = new URLSearchParams({ page_size: '100' });
+      if (pageToken) query.set('page_token', pageToken);
+      const data = await requestData<{ items?: FeishuRecord[]; has_more?: boolean; page_token?: string }>(
+        `/bitable/v1/apps/${encodeURIComponent(config.appToken)}/tables/${encodeURIComponent(tableId)}/records/search?${query}`,
+        { method: 'POST', body: '{}' },
+      );
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (items.some(recordHasMeaningfulData)) return true;
+      pageToken = data.has_more && typeof data.page_token === 'string' ? data.page_token : '';
+    } while (pageToken);
+    return false;
   }
 
   async function createField(tableId: string, body: FeishuFieldInput): Promise<FeishuField> {

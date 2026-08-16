@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/tests/*.test.js && rm -rf .test-dist",
     "typecheck": "tsc --noEmit",
     "build": "npm test && npm run typecheck"
   },
