@@ -1,7 +1,7 @@
-import { authorizeBacklinkOS, loadFeishuConfig } from '../../lib/feishu/config.ts';
-import { createFeishuClient, FeishuApiError } from '../../lib/feishu/client.ts';
-import { setupTable } from '../../lib/feishu/schema.ts';
-import type { FeishuClientFactory } from '../../lib/feishu/types.ts';
+import { authorizeBacklinkOS, loadFeishuConfig } from '../../lib/feishu/config.js';
+import { createFeishuClient, FeishuApiError } from '../../lib/feishu/client.js';
+import { setupTable } from '../../lib/feishu/schema.js';
+import type { FeishuClientFactory } from '../../lib/feishu/types.js';
 
 type SetupImpl = typeof setupTable;
 
