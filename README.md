@@ -52,28 +52,25 @@ FEISHU_EVIDENCE_TABLE_ID
 BACKLINKOS_API_KEY
 ```
 
-`/api/feishu/setup` is dry-run by default. Use `{ "apply": false }` to inspect planned changes and `{ "apply": true }` only after the dry-run is reviewed. Setup never deletes fields or records.
+`/api/feishu/setup` is dry-run by default. Use `{ "apply": false }` to inspect planned changes and `{ "apply": true }` only after the dry-run is reviewed. Setup never deletes fields or records. Blank default Feishu rows are treated as empty; cells containing real data still block unsafe primary-field renames.
 
 The persistence adapter validates the screening invariants before writing, including `Unknown != 0`, visible `月访问量` semantics, and the requirement for hard-rejection evidence when `评级=F`.
 
-**Rollout status:** code and automated tests are implemented on the Feishu feature branch. Production schema creation and live create/update verification must succeed before the Skill documentation is changed to call Feishu persistence production-verified.
+**Production status:** Feishu authentication, schema creation, live record creation, exact-key lookup, and update-without-duplication were production-verified on 2026-08-16. The live test created one main record and one evidence record, then updated those same record IDs on the second write.
 
 ## Current status
 
-Implemented for `screening-backlinks`:
+Implemented and production-validated for `screening-backlinks`:
 
 - screening/evidence/rating contract
 - Ahrefs DR single-domain runtime dependency
 - bounded batch DR runtime for realistic 100–1000-candidate workflows
 - selective Crawlora total-monthly-visits runtime dependency
 - explicit missing/unknown/error semantics; missing data is never silently converted to zero
-- Feishu persistence code with protected setup/upsert APIs and mocked automated tests
+- protected Feishu schema setup and deterministic main/evidence upsert
+- live Feishu create + update verification without duplicate records
 
-Production verification still required before closing the current screening workflow:
-
-- add `BACKLINKOS_API_KEY` to `backlink-os` Production
-- run Feishu schema dry-run and apply
-- verify one live create + read-back + update without duplication
+The current `screening-backlinks` implementation has no remaining engineering blocker. Running real screening batches is a separate operational step and has not been started merely by completing this implementation.
 
 Separate future work, not blockers for the current screening implementation:
 
