@@ -80,5 +80,5 @@ Separate future work, not blockers for the current screening implementation:
 ## Docs
 
 - [Repository architecture](docs/REPOSITORY_ARCHITECTURE.md)
-- [V3 product strategy](docs/V3_PRODUCT_STRATEGY.md)
+- [V4 product strategy](docs/V4_PRODUCT_STRATEGY.md)
 - [Feishu persistence design](docs/superpowers/specs/2026-08-16-feishu-persistence-design.md)
