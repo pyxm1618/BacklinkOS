@@ -1,4 +1,4 @@
-import type { FeishuConfig } from './config.ts';
+import type { FeishuConfig } from './config.js';
 
 export type FeishuFieldProperty = ({
   options?: Array<{ name: string; id?: string; color?: number; [key: string]: unknown }>;
