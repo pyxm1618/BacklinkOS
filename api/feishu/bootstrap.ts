@@ -1,6 +1,9 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { createSetupHandler } from './setup.ts';
-import { createPersistHandler } from './persist.ts';
+import { loadFeishuConfig } from '../../lib/feishu/config.ts';
+import { createFeishuClient, FeishuApiError } from '../../lib/feishu/client.ts';
+import { setupTable } from '../../lib/feishu/schema.ts';
+import { persistPlacement } from '../../lib/feishu/persistence.ts';
+import { PersistenceValidationError, validatePersistRequest } from '../../lib/feishu/validation.ts';
 
 type Handler = (request: Request) => Promise<Response>;
 
@@ -73,6 +76,83 @@ function testPayload(status: '未做' | '已验证') {
   };
 }
 
+function defaultSetupHandler(env: NodeJS.ProcessEnv): Handler {
+  return async (request: Request) => {
+    let config;
+    try {
+      config = loadFeishuConfig(env);
+    } catch (error) {
+      return json({ success: false, error: error instanceof Error ? error.message : 'Feishu configuration is incomplete' }, 503);
+    }
+
+    let apply = false;
+    try {
+      const payload = await request.json() as { apply?: unknown };
+      apply = payload.apply === true;
+    } catch {
+      return json({ success: false, error: 'Invalid bootstrap setup payload' }, 400);
+    }
+
+    const client = createFeishuClient(config);
+    try {
+      const opportunity = await setupTable(client, config.opportunityTableId, 'opportunity', apply);
+      const evidence = await setupTable(client, config.evidenceTableId, 'evidence', apply);
+      const tables = [opportunity, evidence];
+      const hasConflict = tables.some((table) =>
+        table.conflicts.length > 0 ||
+        (table.verification_conflicts?.length ?? 0) > 0 ||
+        (apply && (table.remaining_actions?.length ?? 0) > 0)
+      );
+      return json({ success: !hasConflict, apply, tables }, hasConflict ? 409 : 200);
+    } catch (error) {
+      if (error instanceof FeishuApiError) {
+        return json({ success: false, error: error.message, feishu_code: error.code, http_status: error.httpStatus }, 502);
+      }
+      return json({ success: false, error: error instanceof Error ? error.message : 'Feishu setup failed' }, 500);
+    }
+  };
+}
+
+function defaultPersistHandler(env: NodeJS.ProcessEnv): Handler {
+  return async (request: Request) => {
+    let config;
+    try {
+      config = loadFeishuConfig(env);
+    } catch (error) {
+      return json({ success: false, error: error instanceof Error ? error.message : 'Feishu configuration is incomplete' }, 503);
+    }
+
+    let payload: unknown;
+    try {
+      payload = await request.json();
+    } catch {
+      return json({ success: false, error: 'Invalid bootstrap persistence payload' }, 400);
+    }
+
+    let validated;
+    try {
+      validated = validatePersistRequest(payload);
+    } catch (error) {
+      if (error instanceof PersistenceValidationError || error instanceof Error) {
+        return json({ success: false, error: error.message }, 400);
+      }
+      return json({ success: false, error: 'Invalid persistence request' }, 400);
+    }
+
+    try {
+      const result = await persistPlacement(createFeishuClient(config), config, validated);
+      if (result.success) return json(result, 200);
+      const hasConflict = result.main.action === 'conflict' || result.evidence.some((item) => item.action === 'conflict');
+      return json(result, hasConflict ? 409 : 502);
+    } catch (error) {
+      if (error instanceof FeishuApiError) {
+        return json({ success: false, error: error.message, feishu_code: error.code, http_status: error.httpStatus }, 502);
+      }
+      return json({ success: false, error: error instanceof Error ? error.message : 'Feishu persistence failed' }, 500);
+    }
+  };
+}
+
 export function createBootstrapHandler(deps: BootstrapDeps = {}) {
   return async function GET(request: Request): Promise<Response> {
     const env = deps.env ?? process.env;
@@ -95,8 +175,8 @@ export function createBootstrapHandler(deps: BootstrapDeps = {}) {
       return json({ success: false, error: 'Unauthorized' }, 401);
     }
 
-    const setup = deps.setupHandler ?? createSetupHandler({ env });
-    const persist = deps.persistHandler ?? createPersistHandler({ env });
+    const setup = deps.setupHandler ?? defaultSetupHandler(env);
+    const persist = deps.persistHandler ?? defaultPersistHandler(env);
 
     if (action === 'dry-run' || action === 'apply') {
       return setup(internalRequest(request.url, apiKey, { apply: action === 'apply' }));
