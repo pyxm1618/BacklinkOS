@@ -108,6 +108,20 @@ The rating is evidence-based priority classification, not a weighted score. Do n
 
 Traffic modifies confidence/priority only **when usable evidence exists**. Unknown traffic is absence of evidence, not negative evidence.
 
+### Eligibility gate before A/B/C/D
+
+A/B/C/D are grades for opportunities whose **current external-link publishability has been established**. Seeing an active signup page, an editor, or recent user content is not enough by itself if the current run still cannot establish that the intended placement can actually produce an external link.
+
+If a decisive publishability fact is blocked, unavailable, or still unverified:
+
+- preserve the verified partial evidence
+- keep the unresolved fact as `未确认`
+- leave `评级` blank/pending rather than forcing C or D merely to fill the table
+- do not use F unless direct evidence proves a hard rejection
+- resume rating once external-link publishability is established
+
+`C` and `D` are quality grades, not uncertainty buckets.
+
 ### A — highest priority
 
 Typical pattern:
