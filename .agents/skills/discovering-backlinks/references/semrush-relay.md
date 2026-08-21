@@ -12,6 +12,12 @@ Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。**禁止**�
 
 不要在聊天里重新发明另一套请求参数、分页或 session key 获取办法；除非回归测试证明当前契约失效。
 
+完整事故复盘见：
+
+`incidents/2026-08-21-semrush-relay-debugging.md`
+
+后续改 runner / 契约前必须先读该文件。
+
 ## 已验证请求契约（2026-08-21）
 
 以下请求均已在真实 `sem.3ue.com` 登录会话中实际返回 HTTP 200，并核对响应结构。
@@ -98,6 +104,39 @@ refdomains.data[]
 - 因为 `performance=[]` 就重新让用户抓 Network、手抄 key 或猜参数。
 
 若所有自动恢复路径都失败，runner 只输出脱敏 diagnostic JSON 并停止。此时处理登录/会话问题，而不是重新猜接口。
+
+## Console 上下文规则
+
+Console 注入代码属于当前页面 JS context。**页面导航会销毁这个 context。**
+
+因此：
+
+- 不能“先安装 fetch/XHR hook，再导航到另一个 Backlink Analytics 页面”；
+- runner 必须直接在最终目标页面运行；
+- 如果需要跨导航捕获，必须使用正式持久化方案，不能靠临时 Console hook；
+- 不得再次把“导航后 hook 消失”误判成接口异常。
+
+## 历史证据复用规则
+
+任何异常出现时，先依次检查：
+
+1. 本文件的已验证契约；
+2. 当前正式 runner；
+3. 已保存的 sanitized capture / result JSON；
+4. 回归测试样例。
+
+只有这些证据确实不足或已经失效时，才允许做新的最小探测。**不得让用户重复已经做过的抓包/截图。**
+
+## 已验证与推断的边界
+
+只有精确请求实际 HTTP 200 + 响应结构符合预期，才能称“已验证”。
+
+- bundle 里的 endpoint 名称只是线索；
+- page0 成功不能自动推出 page1 已验证；
+- 分页只有在 page1+ 实际返回新数据且 offset/unique rows 推进后才算验证；
+- 完整抓取必须用 `reported total` 与本地 unique rows 对账。
+
+禁止把尚未实际验证的部分描述为“接口已经全部破解/解决”。
 
 ## 状态模型
 
