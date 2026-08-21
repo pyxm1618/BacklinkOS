@@ -1,0 +1,4 @@
+interface:
+  display_name: "筛外链"
+  short_description: "筛出当前真正可免费获得的 Follow 外链"
+  default_prompt: "帮我筛外链：按 BacklinkOS 规则审核候选，只把当前可免费获得的有效 Follow 外链放进正式总表。"

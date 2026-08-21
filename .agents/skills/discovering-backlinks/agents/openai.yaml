@@ -1,4 +1,4 @@
 interface:
   display_name: "抓外链"
-  short_description: "持续从近期成功项目中批量发现并扩展可复制的外链机会库"
-  default_prompt: "帮我抓外链：持续发现近期成功项目的外链来源，并扩展 BacklinkOS 外链机会库。"
+  short_description: "从近期成功项目批量发现真实外链候选"
+  default_prompt: "帮我抓外链：按 BacklinkOS 规则发现一批新的候选，并把真实采集事实交给筛外链。"
