@@ -2,17 +2,35 @@
 
 只在需要批量查询 Organic Traffic 或 Referring Domains 时读取本文件。
 
-## 已验证路线
+## 固定路线
 
-优先复用已经跑通的 `sem.3ue.com` 中转，不因为官方 Semrush API units 不足而停止。
-
-已验证过的中转页面/接口路线包括：
-
-- `/kwogw/v2/webapi`
-- `/analytics/organic/overview`
-- `/analytics/backlinks/refdomains`
+Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。**禁止**因为官方 Semrush API units 不足而停止，也**禁止**改走需要 API units 的官方 Semrush API/connector。
 
 历史批量运行已经成功完成约 100 个候选项目的 Organic Traffic 筛选，并对通过项目批量抓取 Referring Domains。
+
+## 已验证请求
+
+### Organic Traffic
+
+同源浏览器会话内请求：
+
+`/analytics/backlinks/webapi2/organic-traffic?domain=<DOMAIN>&type=organic-traffic`
+
+### Referring Domains
+
+同源浏览器会话内请求：
+
+`/analytics/backlinks/webapi2/?action=report&type=backlinks_refdomains&target=<DOMAIN>&target_type=root_domain&display_page=<PAGE>&sort_field=backlinksnum&sort_type=desc`
+
+- `display_page` 从 0 开始。
+- 每页通常返回 100 条。
+- 默认先抓 3 页，即最多 300 条；需要继续时再翻页。
+
+页面路线仍可用于人工核验：
+
+- `/analytics/organic/overview`
+- `/analytics/backlinks/refdomains`
+- `/kwogw/v2/webapi`
 
 ## 批量顺序
 
@@ -24,7 +42,11 @@
 
 ## 会话
 
-中转依赖已登录会话。会话失效时，只刷新登录/会话后继续，不改走需要额外 API units 的官方 API。
+中转依赖用户浏览器里已登录的 `sem.3ue.com` 同源会话。执行代码应直接在该页面 Console 中运行，通过同源 `fetch(..., {credentials: "include"})` 复用当前登录状态。
+
+若当前页面 URL 含 `__gmitm`，执行器只在内存里复用该值，不把它写入下载结果、Git、表格、日志或聊天回复。
+
+会话失效时，只刷新登录/会话后继续，不改走需要额外 API units 的官方 API。
 
 任何 key、cookie、session 参数、`__gmitm` 或类似凭证都不得写进 Git、表格、日志或聊天回复。
 
