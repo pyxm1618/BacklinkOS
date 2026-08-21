@@ -17,16 +17,27 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 4. Semrush 的 `is_follow` 只表示 Semrush 观察到的历史 backlink 属性，不能写成“当前免费渠道是 Follow”。
 5. `first_seen` 只表示 Semrush 首次观察时间，不是精确建链日期。
 6. **Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。禁止因为官方 Semrush API units 不足而停止，也禁止改走需要 API units 的官方 Semrush API/connector。** 中转会话失效时，只处理登录/会话问题后继续中转。
+7. **Semrush 正式批量必须使用 `scripts/semrush-relay-batch.js`。** 不得每次重新猜 endpoint、参数、分页或字段语义。
+8. Organic HTTP 200 但没有 `organic_traffic` 时必须记为 `no_data`，不是 0，也不是 API error。
+9. Referring Domains 是否完整必须由 `refdomains.total` 判断；若人为设置上限，只能输出 partial，不能伪装成完整抓取。
 
 ## 每批怎么跑
 
 1. 默认每批找 **100 个新的候选项目**；先与历史项目池去重，并给本批一个批次 ID。
 2. 优先从 Toolify、There’s An AI For That、TrustMRR 找近期项目；需要扩量时可以增加同类来源。
-3. 批量查 Semrush Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。
-4. 对通过项目抓 Referring Domains。先抓前 300；大项目继续分页，直到抓完或新增有效来源明显变少。
-5. 保存原始事实：来源项目、Organic Traffic、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
-6. 按 referring domain 聚合成功项目覆盖数和出现次数；记录它在 BacklinkOS 中是首次出现还是历史已见。
-7. 把候选交给 `screening-backlinks`。Discovery 到此结束。
+3. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner，先做双接口 Preflight。
+4. 批量查 Semrush Global Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。国家流量读取 `databases.<country>`。
+5. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
+6. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
+7. 按 referring domain 聚合成功项目覆盖数和出现次数；记录它在 BacklinkOS 中是首次出现还是历史已见。
+8. 把候选交给 `screening-backlinks`。Discovery 到此结束。
+
+## Semrush runner 的失败处理
+
+- Preflight 失败：整批停止；使用 runner 自动下载的 diagnostic JSON 排查，不让用户再手工截图、复制 Network 请求或逐个试参数。
+- `no_data`：保留为 Semrush 无 Organic 估值，不进入 errors，不进入 `>=500` 项目。
+- `http_error` / `schema_error` / `session_error`：作为真实错误记录并处理；不得与 `no_data` 混淆。
+- runner/契约如需更新，必须先用最小样例重新实际验证 HTTP 200 + 预期结构，再修改 `references/semrush-relay.md` 和回归测试。
 
 ## 输出
 
@@ -34,6 +45,10 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 `referring_domain | source_projects | successful_project_count | occurrence_count | source_project_organic_traffic | backlinks_num | domain_ascore | first_seen | last_seen | semrush_is_follow | discovery_source | batch_id | first_discovered_at | seen_before`
 
+项目层至少保留：
+
+`domain | organic_status | organic_traffic | organic_traffic_by_db | qualified | referring_domains_total | referring_domains_fetched | rd_complete`
+
 不知道的字段留空，不生成“可能”“大概”“推测”值。
 
-Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。回归要求见 [references/test-cases.md](references/test-cases.md)。
+Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。正式执行器见 [scripts/semrush-relay-batch.js](scripts/semrush-relay-batch.js)。回归要求见 [references/test-cases.md](references/test-cases.md)。
