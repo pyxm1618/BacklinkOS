@@ -1,55 +1,16 @@
 /* BacklinkOS verified Semrush relay runner
- * Runs inside an authenticated https://sem.3ue.com page.
- * Verified contracts recovered on 2026-08-21:
+ * Runs inside an authenticated https://sem.3ue.com Backlink Analytics page.
+ * Verified contracts (2026-08-21):
  *   Organic Traffic: GET /analytics/backlinks/webapi2/organic-traffic?domain=<domain>&key=<session>&_=<ts>
  *   Referring Domains: GET /analytics/backlinks/webapi2/?action=report&type=backlinks_refdomains&target=<domain>&target_type=root_domain&display_page=<n>&sort_field=domain_ascore&sort_type=desc&key=<session>&_=<ts>
  *
- * Security: session key / __gmitm are used only in memory and are never written to output.
+ * Security: key / cookies / __gmitm are used only in memory and never written to logs or output files.
  */
 
 (() => {
-  const VERSION = '2026-08-21.1';
-
+  const VERSION = '2026-08-21.2';
+  const KEY_RE = /^[a-f0-9]{32}$/i;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  function redactUrl(raw) {
-    try {
-      const u = new URL(raw, location.origin);
-      if (u.searchParams.has('key')) u.searchParams.set('key', '[REDACTED]');
-      if (u.searchParams.has('__gmitm')) u.searchParams.set('__gmitm', '[REDACTED]');
-      return u.pathname + u.search;
-    } catch {
-      return String(raw)
-        .replace(/([?&]key=)[^&]+/gi, '$1[REDACTED]')
-        .replace(/([?&]__gmitm=)[^&]+/gi, '$1[REDACTED]');
-    }
-  }
-
-  function findSessionKey() {
-    const entries = performance.getEntriesByType('resource');
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const raw = entries[i]?.name || '';
-      if (!raw.includes('/analytics/backlinks/webapi2')) continue;
-      try {
-        const u = new URL(raw, location.origin);
-        const key = u.searchParams.get('key');
-        if (key) return key;
-      } catch {}
-    }
-    return null;
-  }
-
-  function downloadJson(data, filename) {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 3000);
-  }
 
   function normalizeDomain(value) {
     return String(value || '')
@@ -66,6 +27,31 @@
     return [...new Set((domains || []).map(normalizeDomain).filter(Boolean))];
   }
 
+  function redactUrl(raw) {
+    try {
+      const u = new URL(raw, location.origin);
+      if (u.searchParams.has('key')) u.searchParams.set('key', '[REDACTED]');
+      if (u.searchParams.has('__gmitm')) u.searchParams.set('__gmitm', '[REDACTED]');
+      return u.pathname + u.search;
+    } catch {
+      return String(raw)
+        .replace(/([?&]key=)[^&]+/gi, '$1[REDACTED]')
+        .replace(/([?&]__gmitm=)[^&]+/gi, '$1[REDACTED]');
+    }
+  }
+
+  function downloadJson(data, filename) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+  }
+
   function toIsoOrNull(unixSeconds) {
     if (typeof unixSeconds !== 'number' || !Number.isFinite(unixSeconds)) return null;
     try {
@@ -75,40 +61,161 @@
     }
   }
 
+  function collectHex32(text, out) {
+    if (typeof text !== 'string' || !text) return;
+    const matches = text.match(/\b[a-f0-9]{32}\b/gi);
+    if (!matches) return;
+    for (const m of matches) out.add(m);
+  }
+
+  async function validateSessionKey(key, preflightDomain) {
+    if (!KEY_RE.test(String(key || ''))) return false;
+
+    const u = new URL('/analytics/backlinks/webapi2/organic-traffic', location.origin);
+    u.searchParams.set('domain', preflightDomain);
+    u.searchParams.set('key', key);
+    u.searchParams.set('_', String(Date.now()));
+
+    try {
+      const res = await fetch(u.toString(), {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!res.ok) return false;
+
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return false; }
+
+      return !!data && typeof data === 'object';
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveSessionKey(preflightDomain) {
+    if (KEY_RE.test(String(window.__BACKLINKOS_SEM_KEY || ''))) {
+      if (await validateSessionKey(window.__BACKLINKOS_SEM_KEY, preflightDomain)) {
+        return { key: window.__BACKLINKOS_SEM_KEY, source: 'window_cache' };
+      }
+      try { delete window.__BACKLINKOS_SEM_KEY; } catch {}
+    }
+
+    const candidates = new Set();
+
+    for (const entry of performance.getEntriesByType('resource')) {
+      const raw = entry?.name || '';
+      if (!raw.includes('/analytics/backlinks/webapi2')) continue;
+      try {
+        const u = new URL(raw, location.origin);
+        const key = u.searchParams.get('key');
+        if (KEY_RE.test(String(key || ''))) candidates.add(key);
+      } catch {}
+    }
+
+    for (let i = 0; i < localStorage.length; i++) {
+      collectHex32(localStorage.getItem(localStorage.key(i)), candidates);
+    }
+    for (let i = 0; i < sessionStorage.length; i++) {
+      collectHex32(sessionStorage.getItem(sessionStorage.key(i)), candidates);
+    }
+    collectHex32(document.cookie || '', candidates);
+    document.querySelectorAll('script:not([src])').forEach((s) => collectHex32(s.textContent || '', candidates));
+
+    const seen = new WeakSet();
+    let scanned = 0;
+    const MAX_OBJECTS = 30000;
+    const MAX_DEPTH = 4;
+
+    function walk(value, depth) {
+      if (scanned >= MAX_OBJECTS || depth > MAX_DEPTH) return;
+      if (typeof value === 'string') {
+        collectHex32(value, candidates);
+        return;
+      }
+      if (!value || (typeof value !== 'object' && typeof value !== 'function')) return;
+      if (typeof Node !== 'undefined' && value instanceof Node) return;
+
+      try {
+        if (seen.has(value)) return;
+        seen.add(value);
+      } catch {
+        return;
+      }
+
+      scanned++;
+      let keys;
+      try { keys = Object.getOwnPropertyNames(value); } catch { return; }
+
+      for (let i = 0; i < keys.length && i < 300; i++) {
+        let child;
+        try { child = value[keys[i]]; } catch { continue; }
+        if (typeof child === 'string') collectHex32(child, candidates);
+        else if (child && (typeof child === 'object' || typeof child === 'function')) walk(child, depth + 1);
+      }
+    }
+
+    walk(window, 0);
+
+    for (const candidate of candidates) {
+      if (await validateSessionKey(candidate, preflightDomain)) {
+        window.__BACKLINKOS_SEM_KEY = candidate;
+        return { key: candidate, source: 'verified_candidate_scan', candidate_count: candidates.size };
+      }
+    }
+
+    return { key: null, source: 'not_found', candidate_count: candidates.size, scanned_objects: scanned };
+  }
+
   async function runBacklinkOSSemrush(userConfig = {}) {
     if (location.hostname !== 'sem.3ue.com') {
-      throw new Error('必须在已经登录的 sem.3ue.com 页面运行。');
+      throw new Error('必须在已经登录的 sem.3ue.com Backlink Analytics 页面运行。');
     }
 
     const config = {
       batchId: userConfig.batchId || `B${new Date().toISOString().slice(0, 10).replaceAll('-', '')}`,
       domains: uniqueDomains(userConfig.domains),
       trafficMin: Number.isFinite(userConfig.trafficMin) ? userConfig.trafficMin : 500,
-      delayMs: Number.isFinite(userConfig.delayMs) ? userConfig.delayMs : 650,
+      delayMs: Number.isFinite(userConfig.delayMs) ? Math.max(0, userConfig.delayMs) : 650,
       preflightDomain: normalizeDomain(userConfig.preflightDomain || new URL(location.href).searchParams.get('q') || 'obby.fun'),
-      // null => fetch all pages reported by Semrush. Set a positive integer only for an intentional cap.
-      maxRdRowsPerProject: Number.isFinite(userConfig.maxRdRowsPerProject) && userConfig.maxRdRowsPerProject > 0
-        ? Math.floor(userConfig.maxRdRowsPerProject)
-        : null,
-      requestRetries: Number.isFinite(userConfig.requestRetries) ? Math.max(0, Math.floor(userConfig.requestRetries)) : 3,
+      maxRdRowsPerProject:
+        Number.isFinite(userConfig.maxRdRowsPerProject) && userConfig.maxRdRowsPerProject > 0
+          ? Math.floor(userConfig.maxRdRowsPerProject)
+          : null,
+      requestRetries: Number.isFinite(userConfig.requestRetries)
+        ? Math.max(0, Math.floor(userConfig.requestRetries))
+        : 3,
     };
 
     if (!config.domains.length) {
-      throw new Error('domains 为空。调用示例：runBacklinkOSSemrush({batchId:"B20260821-001", domains:["example.com"]})');
+      throw new Error('domains 为空。示例：runBacklinkOSSemrush({batchId:"B20260821-002", domains:["example.com"]})');
     }
 
-    const sessionKey = findSessionKey();
-    if (!sessionKey) {
+    console.clear();
+    console.log(`🚀 BacklinkOS Semrush Runner ${VERSION}`);
+    console.log(`Batch=${config.batchId} | candidates=${config.domains.length} | trafficMin=${config.trafficMin}`);
+
+    const session = await resolveSessionKey(config.preflightDomain);
+    if (!session.key) {
       const diagnostic = {
         kind: 'semrush_preflight_failure',
         runner_version: VERSION,
         generated_at: new Date().toISOString(),
+        batch_id: config.batchId,
         current_page: redactUrl(location.href),
-        reason: 'session_key_not_found',
+        reason: 'session_key_not_found_after_verified_recovery',
+        key_recovery: {
+          source: session.source,
+          candidate_count: session.candidate_count ?? 0,
+          scanned_objects: session.scanned_objects ?? null,
+        },
       };
       downloadJson(diagnostic, `BacklinkOS-${config.batchId}-semrush-diagnostic-${Date.now()}.json`);
-      throw new Error('没有找到 Backlink Analytics session key。诊断 JSON 已自动下载。');
+      throw new Error('未恢复到有效 Semrush session key。已下载脱敏诊断文件；不要手工猜 key。');
     }
+
+    const sessionKey = session.key;
 
     async function getJson(path, params, attempt = 0) {
       const u = new URL(path, location.origin);
@@ -122,7 +229,6 @@
         credentials: 'include',
         cache: 'no-store',
       });
-
       const text = await res.text();
       let data = text;
       try { data = JSON.parse(text); } catch {}
@@ -132,20 +238,14 @@
         return getJson(path, params, attempt + 1);
       }
 
-      return {
-        httpStatus: res.status,
-        ok: res.ok,
-        url: redactUrl(u.toString()),
-        data,
-      };
+      return { httpStatus: res.status, ok: res.ok, url: redactUrl(u.toString()), data };
     }
 
     async function queryOrganic(domain) {
       const r = await getJson('/analytics/backlinks/webapi2/organic-traffic', { domain });
-
       if (!r.ok) {
         return {
-          status: 'http_error',
+          status: r.httpStatus === 401 || r.httpStatus === 403 ? 'session_error' : 'http_error',
           domain,
           http_status: r.httpStatus,
           request_url: r.url,
@@ -165,13 +265,23 @@
         };
       }
 
-      // HTTP 200 without organic_traffic is a legitimate Semrush no-data response, not an API error.
+      if (r.data && typeof r.data === 'object') {
+        return {
+          status: 'no_data',
+          domain,
+          http_status: r.httpStatus,
+          organic_traffic: null,
+          databases: r.data.databases || null,
+        };
+      }
+
       return {
-        status: 'no_data',
+        status: 'schema_error',
         domain,
         http_status: r.httpStatus,
         organic_traffic: null,
-        databases: r.data?.databases || null,
+        databases: null,
+        error: 'HTTP 200 but response is not an object',
       };
     }
 
@@ -188,7 +298,7 @@
 
       if (!r.ok) {
         return {
-          status: 'http_error',
+          status: r.httpStatus === 401 || r.httpStatus === 403 ? 'session_error' : 'http_error',
           domain,
           page,
           http_status: r.httpStatus,
@@ -230,14 +340,9 @@
         detail,
       };
       downloadJson(diagnostic, `BacklinkOS-${config.batchId}-semrush-diagnostic-${Date.now()}.json`);
-      throw new Error(`Semrush preflight 失败：${reason}。诊断 JSON 已自动下载。`);
+      throw new Error(`Semrush preflight 失败：${reason}。已下载脱敏诊断 JSON。`);
     }
 
-    console.clear();
-    console.log(`🚀 BacklinkOS Semrush Runner ${VERSION}`);
-    console.log(`Batch: ${config.batchId} | candidates=${config.domains.length} | trafficMin=${config.trafficMin}`);
-
-    // Preflight: verify both real contracts before touching the whole batch.
     const preOrganic = await queryOrganic(config.preflightDomain);
     if (!['value', 'no_data'].includes(preOrganic.status)) {
       failPreflight('organic_contract_failed', preOrganic);
@@ -249,7 +354,7 @@
       failPreflight('refdomains_contract_failed', preRd);
     }
 
-    console.log(`✅ Preflight passed: organic=${preOrganic.status}, RD total=${preRd.total}`);
+    console.log(`✅ Preflight passed | keySource=${session.source} | organic=${preOrganic.status} | RD total=${preRd.total}`);
 
     const output = {
       batch_id: config.batchId,
@@ -259,8 +364,9 @@
         traffic_min: config.trafficMin,
         candidate_count: config.domains.length,
         max_rd_rows_per_project: config.maxRdRowsPerProject,
-        organic_traffic_semantics: 'global organic traffic',
+        organic_traffic_semantics: 'global / total across returned databases',
         country_traffic_semantics: 'response.databases[country]',
+        session_key_source: session.source,
       },
       precheck: {
         domain: config.preflightDomain,
@@ -271,18 +377,17 @@
       },
       projects: [],
       refdomain_rows: [],
+      refdomain_aggregates: [],
       errors: [],
       warnings: [],
     };
 
-    // Step 1: Organic Traffic
     for (let i = 0; i < config.domains.length; i++) {
       const domain = config.domains[i];
       console.log(`[Organic ${i + 1}/${config.domains.length}] ${domain}`);
 
       const organic = await queryOrganic(domain);
       const qualified = organic.status === 'value' && organic.organic_traffic >= config.trafficMin;
-
       const project = {
         domain,
         organic_status: organic.status,
@@ -299,7 +404,7 @@
       if (organic.status === 'value') {
         console.log(`  → Global=${organic.organic_traffic}, US=${organic.databases?.us ?? 'N/A'} ${qualified ? '✅ qualified' : '⏭️ below threshold'}`);
       } else if (organic.status === 'no_data') {
-        console.log('  → no_data（HTTP 200；Semrush 未给出 Organic Traffic，不计入 error）');
+        console.log('  → no_data（HTTP 200；Semrush 未给 Organic Traffic，不计入 error）');
       } else {
         output.errors.push({ stage: 'organic', domain, ...organic });
         console.warn(`  ❌ ${organic.status}: ${organic.error || ''}`);
@@ -311,7 +416,6 @@
     const qualifiedProjects = output.projects.filter((p) => p.qualified);
     console.log(`✅ Organic finished: qualified=${qualifiedProjects.length}/${output.projects.length}`);
 
-    // Step 2: Referring Domains, page until complete unless an explicit cap is configured.
     for (let i = 0; i < qualifiedProjects.length; i++) {
       const project = qualifiedProjects[i];
       const merged = new Map();
@@ -319,6 +423,7 @@
       let reportedTotal = null;
       let limit = 100;
       let stoppedByCap = false;
+      let previousOffset = -1;
 
       console.log(`[RD ${i + 1}/${qualifiedProjects.length}] ${project.domain}`);
 
@@ -337,12 +442,22 @@
         reportedTotal = rd.total;
         limit = rd.limit || 100;
 
+        if (page > 0 && rd.offset <= previousOffset) {
+          output.errors.push({
+            stage: 'refdomains',
+            domain: project.domain,
+            page,
+            status: 'pagination_error',
+            error: `offset did not advance: previous=${previousOffset}, current=${rd.offset}`,
+          });
+          break;
+        }
+        previousOffset = rd.offset;
+
         let added = 0;
         for (const row of rd.rows) {
           const refDomain = normalizeDomain(row?.domain);
-          if (!refDomain) continue;
-          if (merged.has(refDomain)) continue;
-
+          if (!refDomain || merged.has(refDomain)) continue;
           if (config.maxRdRowsPerProject && merged.size >= config.maxRdRowsPerProject) {
             stoppedByCap = true;
             break;
@@ -354,13 +469,13 @@
             source_project_us_organic_traffic: project.organic_traffic_by_db?.us ?? null,
             referring_domain: refDomain,
             backlinks_num: row.backlinks_num ?? null,
+            domain_ascore: row.domain_ascore ?? null,
             first_seen: row.first_seen ?? null,
             first_seen_iso: toIsoOrNull(row.first_seen),
             last_seen: row.last_seen ?? null,
             last_seen_iso: toIsoOrNull(row.last_seen),
             ip: row.ip ?? null,
             country: row.country ?? '',
-            domain_ascore: row.domain_ascore ?? null,
             category: row.category ?? '',
             lost: row.lost ?? false,
             new: row.new ?? false,
@@ -370,13 +485,19 @@
         }
 
         project.rd_pages_fetched++;
-        console.log(`  page ${page}: ${rd.rows.length} rows, +${added}, total=${reportedTotal}`);
+        console.log(`  page ${page}: rows=${rd.rows.length}, +${added}, offset=${rd.offset}, total=${reportedTotal}`);
 
         if (stoppedByCap) break;
         if (merged.size >= reportedTotal) break;
         if (rd.rows.length < limit) break;
         if (added === 0) {
-          output.warnings.push({ stage: 'refdomains', domain: project.domain, page, warning: 'no_new_rows_on_page' });
+          output.errors.push({
+            stage: 'refdomains',
+            domain: project.domain,
+            page,
+            status: 'pagination_error',
+            error: 'page returned no new referring domains',
+          });
           break;
         }
 
@@ -403,74 +524,84 @@
       await sleep(config.delayMs);
     }
 
-    // Aggregate referring domains across successful projects.
-    const aggregates = new Map();
+    const aggregateMap = new Map();
     for (const row of output.refdomain_rows) {
       const key = row.referring_domain;
-      if (!aggregates.has(key)) {
-        aggregates.set(key, {
+      if (!aggregateMap.has(key)) {
+        aggregateMap.set(key, {
           referring_domain: key,
-          source_projects: new Set(),
+          source_projects: [],
+          source_project_organic_traffic: {},
+          successful_project_count: 0,
           occurrence_count: 0,
-          max_as: null,
-          follow_count: 0,
-          new_link_count: 0,
-          earliest_seen: null,
-          example_projects: [],
+          backlinks_num: null,
+          domain_ascore: null,
+          first_seen: null,
+          last_seen: null,
+          follow_observation_count: 0,
+          nofollow_observation_count: 0,
+          semrush_is_follow: null,
+          discovery_source: 'Semrush Backlink Analytics via sem.3ue.com',
+          batch_id: config.batchId,
+          first_discovered_at: output.generated_at,
+          seen_before: null,
         });
       }
-      const a = aggregates.get(key);
-      a.source_projects.add(row.source_project);
+
+      const a = aggregateMap.get(key);
       a.occurrence_count++;
-      if (typeof row.domain_ascore === 'number') a.max_as = a.max_as === null ? row.domain_ascore : Math.max(a.max_as, row.domain_ascore);
-      if (row.is_follow === true) a.follow_count++;
-      if (row.new === true) a.new_link_count++;
-      if (typeof row.first_seen === 'number') a.earliest_seen = a.earliest_seen === null ? row.first_seen : Math.min(a.earliest_seen, row.first_seen);
-      if (!a.example_projects.includes(row.source_project) && a.example_projects.length < 5) a.example_projects.push(row.source_project);
+      if (!a.source_projects.includes(row.source_project)) a.source_projects.push(row.source_project);
+      a.source_project_organic_traffic[row.source_project] = row.source_project_organic_traffic;
+      a.successful_project_count = a.source_projects.length;
+      if (typeof row.backlinks_num === 'number') a.backlinks_num = Math.max(a.backlinks_num ?? 0, row.backlinks_num);
+      if (typeof row.domain_ascore === 'number') a.domain_ascore = Math.max(a.domain_ascore ?? 0, row.domain_ascore);
+      if (typeof row.first_seen === 'number') a.first_seen = a.first_seen == null ? row.first_seen : Math.min(a.first_seen, row.first_seen);
+      if (typeof row.last_seen === 'number') a.last_seen = a.last_seen == null ? row.last_seen : Math.max(a.last_seen, row.last_seen);
+      if (row.is_follow === true) a.follow_observation_count++;
+      if (row.is_follow === false) a.nofollow_observation_count++;
     }
 
-    output.refdomain_aggregates = [...aggregates.values()]
-      .map((a) => ({
-        referring_domain: a.referring_domain,
-        successful_project_count: a.source_projects.size,
-        occurrence_count: a.occurrence_count,
-        max_as: a.max_as,
-        follow_count: a.follow_count,
-        follow_rate: a.occurrence_count ? a.follow_count / a.occurrence_count : null,
-        new_link_count: a.new_link_count,
-        earliest_seen: a.earliest_seen,
-        earliest_seen_iso: toIsoOrNull(a.earliest_seen),
-        example_projects: a.example_projects,
-      }))
-      .sort((a, b) => b.successful_project_count - a.successful_project_count || b.occurrence_count - a.occurrence_count || (b.max_as || 0) - (a.max_as || 0));
+    for (const a of aggregateMap.values()) {
+      if (a.follow_observation_count && a.nofollow_observation_count) a.semrush_is_follow = 'mixed';
+      else if (a.follow_observation_count) a.semrush_is_follow = true;
+      else if (a.nofollow_observation_count) a.semrush_is_follow = false;
+      output.refdomain_aggregates.push(a);
+    }
 
-    const statusCounts = output.projects.reduce((acc, p) => {
-      acc[p.organic_status] = (acc[p.organic_status] || 0) + 1;
-      return acc;
-    }, {});
+    output.refdomain_aggregates.sort((a, b) =>
+      b.successful_project_count - a.successful_project_count ||
+      (b.domain_ascore ?? -1) - (a.domain_ascore ?? -1) ||
+      a.referring_domain.localeCompare(b.referring_domain)
+    );
+
+    const organicValue = output.projects.filter((p) => p.organic_status === 'value').length;
+    const organicNoData = output.projects.filter((p) => p.organic_status === 'no_data').length;
+    const rdComplete = output.projects.filter((p) => p.qualified && p.rd_complete).length;
+    const rdPartial = output.projects.filter((p) => p.qualified && !p.rd_complete).length;
 
     output.summary = {
       candidate_projects: output.projects.length,
-      organic_value: statusCounts.value || 0,
-      organic_no_data: statusCounts.no_data || 0,
-      organic_http_error: statusCounts.http_error || 0,
-      organic_schema_error: statusCounts.schema_error || 0,
+      organic_value: organicValue,
+      organic_no_data: organicNoData,
       qualified_projects: qualifiedProjects.length,
+      rd_complete_projects: rdComplete,
+      rd_partial_projects: rdPartial,
       raw_refdomain_rows: output.refdomain_rows.length,
-      unique_referring_domains: aggregates.size,
-      rd_projects_complete: qualifiedProjects.filter((p) => p.rd_complete).length,
-      rd_projects_partial: qualifiedProjects.filter((p) => !p.rd_complete).length,
-      errors: output.errors.length,
+      unique_referring_domains: output.refdomain_aggregates.length,
+      true_errors: output.errors.length,
       warnings: output.warnings.length,
     };
 
-    downloadJson(output, `BacklinkOS-${config.batchId}-semrush-${Date.now()}.json`);
-    console.log('✅ 全部完成，最终 JSON 已自动下载。');
+    const filename = `BacklinkOS-${config.batchId}-FINAL-${Date.now()}.json`;
+    downloadJson(output, filename);
+    console.log('====================================');
+    console.log(`✅ 完成并下载：${filename}`);
     console.table(output.summary);
+    console.log('====================================');
     return output;
   }
 
   window.runBacklinkOSSemrush = runBacklinkOSSemrush;
-  console.log(`✅ BacklinkOS Semrush Runner ${VERSION} loaded.`);
-  console.log('调用：runBacklinkOSSemrush({batchId:"B20260821-001", domains:["example.com"], trafficMin:500})');
+  console.log(`✅ BacklinkOS Semrush Runner ${VERSION} loaded`);
+  console.log('调用：runBacklinkOSSemrush({batchId:"B20260821-002", domains:["example.com"]})');
 })();
