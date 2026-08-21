@@ -17,15 +17,17 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 4. Semrush 的 `is_follow` 只表示 Semrush 观察到的历史 backlink 属性，不能写成“当前免费渠道是 Follow”。
 5. `first_seen` 只表示 Semrush 首次观察时间，不是精确建链日期。
 6. **Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。禁止因为官方 Semrush API units 不足而停止，也禁止改走需要 API units 的官方 Semrush API/connector。** 中转会话失效时，只处理登录/会话问题后继续中转。
-7. **Semrush 正式批量必须使用 `scripts/semrush-relay-batch.js`。** 不得每次重新猜 endpoint、参数、分页或字段语义。
-8. Organic HTTP 200 但没有 `organic_traffic` 时必须记为 `no_data`，不是 0，也不是 API error。
-9. Referring Domains 是否完整必须由 `refdomains.total` 判断；若人为设置上限，只能输出 partial，不能伪装成完整抓取。
+7. **Semrush 正式批量必须使用 `scripts/semrush-relay-batch.js`。** 不得每次重新猜 endpoint、参数、分页、字段语义或 session key 获取逻辑。
+8. runner 必须自动恢复并验证 session key；不能只依赖 `performance`。当 `performance=[]` 时继续走已验证的 32-hex 候选扫描和有界运行时扫描。不得让用户手抄 key，也不得用任意 storage 值乱试。
+9. Organic HTTP 200 但没有 `organic_traffic` 时必须记为 `no_data`，不是 0，也不是 API error。
+10. Referring Domains 是否完整必须由 `refdomains.total` 判断；若人为设置上限，只能输出 partial，不能伪装成完整抓取。
+11. 分页中 offset 不推进或下一页没有新增 domain 时，必须报分页错误，不能静默完成。
 
 ## 每批怎么跑
 
 1. 默认每批找 **100 个新的候选项目**；先与历史项目池去重，并给本批一个批次 ID。
 2. 优先从 Toolify、There’s An AI For That、TrustMRR 找近期项目；需要扩量时可以增加同类来源。
-3. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner，先做双接口 Preflight。
+3. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner；runner 自动恢复/验证 session key，再做双接口 Preflight。
 4. 批量查 Semrush Global Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。国家流量读取 `databases.<country>`。
 5. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
 6. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
@@ -34,9 +36,9 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 ## Semrush runner 的失败处理
 
-- Preflight 失败：整批停止；使用 runner 自动下载的 diagnostic JSON 排查，不让用户再手工截图、复制 Network 请求或逐个试参数。
+- Session key 自动恢复失败或 Preflight 失败：整批停止；使用 runner 自动下载的脱敏 diagnostic JSON 排查。不要再让用户手工截图、复制 Network 请求、粘贴 key 或逐个试参数。
 - `no_data`：保留为 Semrush 无 Organic 估值，不进入 errors，不进入 `>=500` 项目。
-- `http_error` / `schema_error` / `session_error`：作为真实错误记录并处理；不得与 `no_data` 混淆。
+- `http_error` / `schema_error` / `session_error` / `pagination_error`：作为真实错误记录并处理；不得与 `no_data` 混淆。
 - runner/契约如需更新，必须先用最小样例重新实际验证 HTTP 200 + 预期结构，再修改 `references/semrush-relay.md` 和回归测试。
 
 ## 输出
