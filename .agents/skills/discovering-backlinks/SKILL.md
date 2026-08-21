@@ -22,6 +22,9 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 9. Organic HTTP 200 但没有 `organic_traffic` 时必须记为 `no_data`，不是 0，也不是 API error。
 10. Referring Domains 是否完整必须由 `refdomains.total` 判断；若人为设置上限，只能输出 partial，不能伪装成完整抓取。
 11. 分页中 offset 不推进或下一页没有新增 domain 时，必须报分页错误，不能静默完成。
+12. **任何 Semrush runner/契约调试前必须先读 `references/incidents/2026-08-21-semrush-relay-debugging.md`。** 已保存成功证据能回答的问题，不得再次让用户抓 Network、截图、手抄 key 或重复试错。
+13. **Console 注入不跨页面导航。** 不能先装 hook 再让用户跳页；导航会销毁当前 JS context。需要跨导航时只能使用正式持久方案。
+14. 只有精确请求实际 HTTP 200 + 响应结构通过，才能称“已验证”。page0 成功不能自动扩展成“分页已验证”。
 
 ## 每批怎么跑
 
@@ -39,7 +42,7 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 - Session key 自动恢复失败或 Preflight 失败：整批停止；使用 runner 自动下载的脱敏 diagnostic JSON 排查。不要再让用户手工截图、复制 Network 请求、粘贴 key 或逐个试参数。
 - `no_data`：保留为 Semrush 无 Organic 估值，不进入 errors，不进入 `>=500` 项目。
 - `http_error` / `schema_error` / `session_error` / `pagination_error`：作为真实错误记录并处理；不得与 `no_data` 混淆。
-- runner/契约如需更新，必须先用最小样例重新实际验证 HTTP 200 + 预期结构，再修改 `references/semrush-relay.md` 和回归测试。
+- runner/契约如需更新，必须先复用历史成功证据；确有缺口时才用最小样例重新实际验证 HTTP 200 + 预期结构，再修改 `references/semrush-relay.md` 和回归测试。
 
 ## 输出
 
@@ -53,4 +56,4 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 不知道的字段留空，不生成“可能”“大概”“推测”值。
 
-Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。正式执行器见 [scripts/semrush-relay-batch.js](scripts/semrush-relay-batch.js)。回归要求见 [references/test-cases.md](references/test-cases.md)。
+Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。事故复盘见 [references/incidents/2026-08-21-semrush-relay-debugging.md](references/incidents/2026-08-21-semrush-relay-debugging.md)。正式执行器见 [scripts/semrush-relay-batch.js](scripts/semrush-relay-batch.js)。回归要求见 [references/test-cases.md](references/test-cases.md)。
