@@ -16,6 +16,7 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 3. **不做项目适配。** 不判断 Quick I Ching 或任何具体项目是否“有资格”做某条外链，也不做主题相关性评分。
 4. Semrush 的 `is_follow` 只表示 Semrush 观察到的历史 backlink 属性，不能写成“当前免费渠道是 Follow”。
 5. `first_seen` 只表示 Semrush 首次观察时间，不是精确建链日期。
+6. **Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。禁止因为官方 Semrush API units 不足而停止，也禁止改走需要 API units 的官方 Semrush API/connector。** 中转会话失效时，只处理登录/会话问题后继续中转。
 
 ## 每批怎么跑
 
