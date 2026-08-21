@@ -27,3 +27,11 @@
 23. runner 最终 summary 至少分别报告：`organic_value`、`organic_no_data`、真实错误数、合格项目数、RD complete/partial 项目数、raw RD rows、unique referring domains。
 24. 已验证结构样例：`obby.fun` 的 Organic 请求曾返回 Global 187 / US 139；其 Referring Domains 请求曾返回 total 115、page0 100 rows。该样例只用于结构回归，不作为永久业务数据。
 25. 已验证分页样例：`vectosolve.com` 在 2026-08-21 实际完成 5 页，`reported_total=484`、`fetched_unique=484`、`complete=true`。此结果用于证明自动分页链路，而不是固定业务常量。
+26. 如果当前页面 `performance=[]`，不得直接判定登录态/接口失效；必须继续走正式 session 恢复逻辑。
+27. 如果需要 Console hook，必须在最终目标页面安装并使用；测试不得设计成“安装 hook -> 导航 -> 期待 hook 仍存在”，因为导航会重建 JS context。
+28. 调试时必须先搜索仓库契约、runner、历史 sanitized capture/result；只要历史证据足够，就不得让用户重复抓 Network、截图或重新提供已经给过的数据。
+29. page0 真实 HTTP 200 只能证明 page0；在 page1+ 未实际返回新 rows/offset 推进前，不得宣称分页已验证。
+30. 临时探测代码不得直接扩展到整批。任何新请求形态必须先用 1 个域名做最小验证，确认 HTTP 200 + 结构后才能批量。
+31. 长 Console runner 在交给用户前必须至少通过 JS 语法检查与最小启动检查；不得把语法错误留给用户发现。
+32. 不得使用“接口已经全部破解/全部解决”这类表述，除非 method、参数、认证、响应结构、分页和完整性都已经分别实际验证。
+33. 2026-08-21 的调试事故规则以 `references/incidents/2026-08-21-semrush-relay-debugging.md` 为强制回归基线；后续修改不得删除这些约束，除非有新的真实证据替代。
