@@ -1,0 +1,35 @@
+name: BacklinkOS Screening Crawler
+
+on:
+  push:
+    paths:
+      - data/screening-candidates-current.csv
+  workflow_dispatch:
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Run regression tests
+        run: python -m unittest tests/test_screening_crawler.py -v
+
+      - name: Crawl pending backlink domains
+        run: python scripts/screening_crawler.py --input data/screening-candidates-current.csv --output screening-results.jsonl --workers 40 --timeout 8
+
+      - name: Upload screening results
+        uses: actions/upload-artifact@v4
+        with:
+          name: screening-results
+          path: |
+            screening-results.jsonl
+            screening-results.jsonl.summary.json
+          if-no-files-found: error
