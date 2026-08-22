@@ -1,5 +1,7 @@
 # BacklinkOS V1 Product Plan
 
+Status: Initial product definition.
+
 ## Product Positioning
 
 BacklinkOS is a Backlink Opportunity Pipeline, not a simple backlink publishing bot.
