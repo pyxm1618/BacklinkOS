@@ -3,7 +3,7 @@ name: BacklinkOS Screening Crawler
 on:
   push:
     paths:
-      - data/screening-candidates/**
+      - data/screening-candidates/RUN
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
       - name: Build candidate CSV
         run: |
           echo 'domain' > /tmp/screening-candidates.csv
-          cat data/screening-candidates/*.txt | sed '/^$/d' | sort -u >> /tmp/screening-candidates.csv
+          cat data/screening-candidates/[0-9][0-9][0-9].txt | sed '/^$/d' | sort -u >> /tmp/screening-candidates.csv
           echo "Candidates: $(($(wc -l < /tmp/screening-candidates.csv)-1))"
 
       - name: Crawl pending backlink domains
