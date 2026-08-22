@@ -6,6 +6,9 @@ on:
       - data/screening-candidates/**
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   screen:
     runs-on: ubuntu-latest
@@ -30,6 +33,17 @@ jobs:
 
       - name: Crawl pending backlink domains
         run: python scripts/screening_crawler.py --input /tmp/screening-candidates.csv --output screening-results.jsonl --workers 40 --timeout 8
+
+      - name: Persist results
+        run: |
+          mkdir -p data/screening-results
+          cp screening-results.jsonl data/screening-results/latest.jsonl
+          cp screening-results.jsonl.summary.json data/screening-results/latest.summary.json
+          git config user.name 'BacklinkOS Bot'
+          git config user.email 'backlinkos-bot@users.noreply.github.com'
+          git add data/screening-results/latest.jsonl data/screening-results/latest.summary.json
+          git diff --cached --quiet || git commit -m 'Update bulk screening crawl results'
+          git push
 
       - name: Upload screening results
         uses: actions/upload-artifact@v4
