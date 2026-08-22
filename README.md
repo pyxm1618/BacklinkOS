@@ -1,84 +1,101 @@
 # BacklinkOS
 
-BacklinkOS is the backlink product and orchestration repository.
+BacklinkOS is a personal backlink discovery and screening system for building a reusable database of **general-purpose backlink opportunities**.
 
-## Repository boundary
+The repository contains the product rules, the two canonical Agent Skills, operational helpers, and compatibility persistence code. Provider-specific metric integrations remain in `pyxm1618/backlink-metrics-api`.
 
-- Canonical screening Skill: `.agents/skills/screening-backlinks/`
-- Deterministic metrics runtime: `pyxm1618/backlink-metrics-api`
-- Production metrics endpoint: `https://backlink-metrics-api.vercel.app`
+## Source of truth
 
-BacklinkOS owns product logic, screening workflow, evidence/rating contracts, and Feishu persistence. Provider-specific metric code belongs in `backlink-metrics-api` rather than being duplicated here.
+Current operating behavior is defined in this order:
 
-## Current operating model
+1. `.agents/skills/discovering-backlinks/SKILL.md` and its `references/`
+2. `.agents/skills/screening-backlinks/SKILL.md` and its `references/`
+3. `docs/REPOSITORY_ARCHITECTURE.md`
+4. `docs/V4_PRODUCT_STRATEGY.md`
+5. historical plans/specs only for design history
 
-The personal-use screening workflow is designed for typical runs of roughly **100–1000 candidate URLs**, not 100K-scale processing.
+If an older document conflicts with a current Skill, **the current Skill wins**.
 
-For each run:
+The `.claude/skills/*` entries are compatibility symlinks to the canonical `.agents/skills/*` trees; they are not second editable copies.
 
-1. normalize candidate URLs/domains
-2. deduplicate domain-level work
-3. query Ahrefs DR through `backlink-metrics-api` in sequential chunks of at most 20 unique domains per batch request
-4. verify publishability, registration/pricing, link attribute, domain age, and other placement facts independently
-5. use Crawlora selectively when a concrete total-monthly-visits estimate materially helps the decision
-6. assign A/B/C/D/F from verified evidence
-7. persist verified main/evidence records to Feishu Base
-
-A run with hundreds of unique domains may take several minutes or longer because provider rate limits are intentionally respected. This is acceptable for a personal-use tool and avoids unnecessary queue/distributed-worker infrastructure.
-
-## Feishu persistence
-
-The repository contains protected TypeScript APIs for schema setup and record persistence:
+## Current workflow
 
 ```text
-POST /api/feishu/setup
-POST /api/feishu/persist
+Discover
+   ↓
+Screen
+   ↓
+Keep / reciprocal-link keep / paid exclusion / recycle / pending confirmation
+   ↓
+Operational persistence
 ```
 
-Both require the request header:
+### `discovering-backlinks`
+
+Discovery finds candidate referring domains and passes factual observations downstream. It does not decide whether a current public route is free, whether the resulting link is currently Follow, or whether a candidate is suitable for a particular promoted project.
+
+The current Semrush workflow uses the validated `sem.3ue.com` relay and the Skill-owned batch runner in `.agents/skills/discovering-backlinks/scripts/`.
+
+### `screening-backlinks`
+
+Screening answers one question: **can an ordinary user currently obtain an effective Follow backlink without paying?**
+
+The current business outcomes are:
+
+- `免费`
+- `免费换链`
+- `付费`
+- `不确定`
+
+Only confirmed `免费` and `免费换链` opportunities with a current executable route, a direct Follow external link, and an indexable final page belong in the formal backlink opportunity table. The current Screening Skill does **not** use A/B/C/D/F as an admission or priority system.
+
+## Runtime and compatibility components
+
+### Deterministic metric runtime
+
+Provider-specific metric code lives in `pyxm1618/backlink-metrics-api` rather than being duplicated here.
+
+Production endpoint:
 
 ```text
-X-BacklinkOS-Key: <BACKLINKOS_API_KEY>
+https://backlink-metrics-api.vercel.app
 ```
 
-Production variables belong in the Vercel project `backlink-os` only:
+### Bulk screening crawler
+
+`scripts/screening_crawler.py` and `.github/workflows/screening-crawler.yml` are active **bulk triage helpers**. They can cheaply classify large candidate sets into preliminary buckets and write snapshots under `data/screening-results/`.
+
+Those crawler buckets are **not final Screening decisions**. Absence of an automatically detected mechanism is not, by itself, the evidence standard required by the canonical Screening Skill. Final opportunity decisions must follow `.agents/skills/screening-backlinks/`.
+
+### Feishu persistence compatibility layer
+
+`api/feishu/` and `lib/feishu/` contain a production-validated persistence implementation created under an earlier screening record contract. It intentionally remains unchanged for compatibility and may still contain historical fields such as `评级`.
+
+That compatibility schema must not be used to infer current Screening business semantics. The current user-facing table contract is defined by `.agents/skills/screening-backlinks/references/output-schema.md`.
+
+## Repository layout
 
 ```text
-FEISHU_APP_ID
-FEISHU_APP_SECRET
-FEISHU_BITABLE_APP_TOKEN
-FEISHU_OPPORTUNITY_TABLE_ID
-FEISHU_EVIDENCE_TABLE_ID
-BACKLINKOS_API_KEY
+.agents/skills/
+  discovering-backlinks/       canonical Discovery Skill
+  screening-backlinks/         canonical Screening Skill
+.claude/skills/                compatibility symlinks
+.github/workflows/             operational automation
+api/feishu/                    compatibility persistence API
+lib/feishu/                    compatibility persistence implementation
+data/                          operational candidate/result snapshots
+docs/                          current architecture + historical records
+scripts/                       operational helper scripts
+tests/                         runtime/helper regression tests
 ```
 
-`/api/feishu/setup` is dry-run by default. Use `{ "apply": false }` to inspect planned changes and `{ "apply": true }` only after the dry-run is reviewed. Setup never deletes fields or records. Blank default Feishu rows are treated as empty; cells containing real data still block unsafe primary-field renames.
+## Documentation status
 
-The persistence adapter validates the screening invariants before writing, including `Unknown != 0`, visible `月访问量` semantics, and the requirement for hard-rejection evidence when `评级=F`.
+- `docs/REPOSITORY_ARCHITECTURE.md` — current architecture
+- `docs/V4_PRODUCT_STRATEGY.md` — current product strategy
+- `docs/V1_PRODUCT_PLAN.md` — historical
+- `docs/V2_PRODUCT_PLAN.md` — historical
+- `docs/superpowers/` — historical implementation plans/specs
+- `docs/live-runs/` — historical run records
 
-**Production status:** Feishu authentication, schema creation, live record creation, exact-key lookup, and update-without-duplication were production-verified on 2026-08-16. The live test created one main record and one evidence record, then updated those same record IDs on the second write.
-
-## Current status
-
-Implemented and production-validated for `screening-backlinks`:
-
-- screening/evidence/rating contract
-- Ahrefs DR single-domain runtime dependency
-- bounded batch DR runtime for realistic 100–1000-candidate workflows
-- selective Crawlora total-monthly-visits runtime dependency
-- explicit missing/unknown/error semantics; missing data is never silently converted to zero
-- protected Feishu schema setup and deterministic main/evidence upsert
-- live Feishu create + update verification without duplicate records
-
-The current `screening-backlinks` implementation has no remaining engineering blocker. Running real screening batches is a separate operational step and has not been started merely by completing this implementation.
-
-Separate future work, not blockers for the current screening implementation:
-
-- optional CrUX popularity evidence if it later proves useful
-- `discovering-backlinks` as a separate Skill
-
-## Docs
-
-- [Repository architecture](docs/REPOSITORY_ARCHITECTURE.md)
-- [V4 product strategy](docs/V4_PRODUCT_STRATEGY.md)
-- [Feishu persistence design](docs/superpowers/specs/2026-08-16-feishu-persistence-design.md)
+See `docs/README.md` for the documentation precedence rules.
