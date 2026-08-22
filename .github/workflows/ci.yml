@@ -1,0 +1,39 @@
+name: BacklinkOS CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Node dependencies
+        run: npm install --ignore-scripts
+
+      - name: Run TypeScript tests
+        run: npm test
+
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Run crawler regression tests
+        run: python -m unittest tests/test_screening_crawler.py -v
