@@ -1,0 +1,15 @@
+node_modules/
+.test-dist/
+__pycache__/
+*.py[cod]
+
+# Local crawler outputs. The workflow intentionally copies its canonical
+# compatibility snapshot into data/screening-results/, which remains tracked.
+/screening-results.jsonl
+/screening-results.jsonl.summary.json
+
+# Local secrets and OS/editor noise.
+.env
+.env.*
+!.env.example
+.DS_Store

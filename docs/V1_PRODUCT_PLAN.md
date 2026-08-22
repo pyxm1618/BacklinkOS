@@ -1,5 +1,7 @@
 # BacklinkOS V1 Product Plan
 
+> **Status: HISTORICAL.** This document preserves an early product direction and must not be used as the current operating contract. Current behavior is defined by the canonical Skills under `.agents/skills/`, then `REPOSITORY_ARCHITECTURE.md` and `V4_PRODUCT_STRATEGY.md`. Concepts below such as topical relevance, acquisition workflow, or older decision categories may intentionally differ from the current system.
+
 ## Product Positioning
 
 BacklinkOS is a Backlink Opportunity Pipeline, not a simple backlink publishing bot.
