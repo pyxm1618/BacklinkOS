@@ -2,7 +2,7 @@
 
 ## Boundary
 
-Discovery owns factual acquisition from project/SEO/backlink data. Screening owns current-opportunity judgment. Screening may request more Discovery facts, but Screening does not invent historical source pages and Discovery does not decide `免费 / 付费 / 回收 / 待确认`.
+Discovery owns factual acquisition from project/SEO/backlink data. Screening owns current-opportunity judgment. Screening may request more Discovery facts, but Screening does not invent historical source pages，**Discovery 不决定获取方式或处理结果**。
 
 ## Default handoff
 
