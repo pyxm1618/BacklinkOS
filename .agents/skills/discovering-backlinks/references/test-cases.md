@@ -35,3 +35,10 @@
 31. 长 Console runner 在交给用户前必须至少通过 JS 语法检查与最小启动检查；不得把语法错误留给用户发现。
 32. 不得使用“接口已经全部破解/全部解决”这类表述，除非 method、参数、认证、响应结构、分页和完整性都已经分别实际验证。
 33. 2026-08-21 的调试事故规则以 `references/incidents/2026-08-21-semrush-relay-debugging.md` 为强制回归基线；后续修改不得删除这些约束，除非有新的真实证据替代。
+34. 默认 100 个新项目只表示一个 Discovery 批次；用户要求继续扩库时达到 100 后停止并声称“找完”属于失败。
+35. 长期扩池必须记录种子来源分布；一个来源明显集中时，应优先使用已经批准的其他来源补充，不能为了方便无限单源深挖。
+36. Semrush 暂时不可用但项目官网已核实时，可以记录项目并标 `pending_semrush`；Organic、qualified、RD、Follow 等未知字段必须为空。
+37. Screening 返回 `source_url_enrichment_required` 时，Discovery 只对请求的 referring domain/source projects 补 exact source-page facts，不改变 Screening 的业务结论。
+38. source URL enrichment 可以使用已保存同源 capture/result 或允许的 Semrush 网站原生 Backlinks 导出；不得把尚未验证的 Backlinks endpoint/参数写成正式 relay 契约。
+39. `source_url`、`target_url`、`anchor`、`source_rel_observation` 等 enrichment 字段仍是历史发现事实；不能写成“当前免费路径已确认”。
+40. enrichment 失败或被外部会话阻塞时可以返回 `source_url_unavailable`，不能把缺失事实改写成 0、Nofollow、不可用或回收结论。

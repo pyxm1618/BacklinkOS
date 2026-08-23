@@ -7,7 +7,7 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 ## 目标
 
-从近期已经跑出 SEO 结果的项目反查真实 Referring Domains，并把**发现阶段亲自取得的事实**交给 `screening-backlinks`。
+从近期已经跑出 SEO 结果的项目反查真实 Referring Domains，并把**发现阶段亲自取得的事实**交给 `screening-backlinks`。Discovery 负责找事实，不负责判断当前机会是否免费、Follow、可索引或值得入正式机会库。
 
 ## 硬规则
 
@@ -25,17 +25,31 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 12. **任何 Semrush runner/契约调试前必须先读 `references/incidents/2026-08-21-semrush-relay-debugging.md`。** 已保存成功证据能回答的问题，不得再次让用户抓 Network、截图、手抄 key 或重复试错。
 13. **Console 注入不跨页面导航。** 不能先装 hook 再让用户跳页；导航会销毁当前 JS context。需要跨导航时只能使用正式持久方案。
 14. 只有精确请求实际 HTTP 200 + 响应结构通过，才能称“已验证”。page0 成功不能自动扩展成“分页已验证”。
+15. **100 是批次单位，不是停止条件。** 用户要求继续扩大外链库时，可以连续建立多个去重批次；不能因为单批达到 100 个项目就宣告 Discovery 完成。
+16. **控制来源集中度。** 记录项目种子的来源占比；当一个来源明显集中时，优先继续使用已经批准的其他来源（如 Toolify / There’s An AI For That / TrustMRR）补充，再考虑继续向单一来源深挖。
+17. **Semrush 暂时不可用时只积累项目事实。** 已核实真实官网的项目可以进入项目池并标记 `pending_semrush`；不得填造 Organic、qualified、RD 或 backlink 字段。
+18. **允许按需做 source URL enrichment。** Screening 若无法从 domain-level 事实闭环机制，可返回 `source_url_enrichment_required`；Discovery 只补精确历史来源页事实，不替 Screening 作最终判断。详细合同见 `references/screening-handoff.md`。
 
 ## 每批怎么跑
 
-1. 默认每批找 **100 个新的候选项目**；先与历史项目池去重，并给本批一个批次 ID。
-2. 优先从 Toolify、There’s An AI For That、TrustMRR 找近期项目；需要扩量时可以增加同类来源。
-3. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner；runner 自动恢复/验证 session key，再做双接口 Preflight。
-4. 批量查 Semrush Global Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。国家流量读取 `databases.<country>`。
-5. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
-6. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
-7. 按 referring domain 聚合成功项目覆盖数和出现次数；记录它在 BacklinkOS 中是首次出现还是历史已见。
-8. 把候选交给 `screening-backlinks`。Discovery 到此结束。
+1. 默认每批找 **100 个新的候选项目**；先与历史项目池去重，并给本批一个批次 ID。100 是工作批次大小，不限制后续继续扩批。
+2. 优先从 Toolify、There’s An AI For That、TrustMRR 找近期项目；需要扩量时可以增加同类来源。记录每个来源的新增量，避免长期由单一来源主导项目池。
+3. 如果 Semrush 当前不可用，可以继续核真实 Website 并写入 `pending_semrush` 项目；到这里停止该项目的 SEO/RD 推进，不生成未知字段。
+4. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner；runner 自动恢复/验证 session key，再做双接口 Preflight。
+5. 批量查 Semrush Global Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。国家流量读取 `databases.<country>`。
+6. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
+7. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
+8. 按 referring domain 聚合成功项目覆盖数和出现次数；记录它在 BacklinkOS 中是首次出现还是历史已见。
+9. 把 domain-level 候选交给 `screening-backlinks`。Discovery 的默认阶段到此结束。
+10. 如果 Screening 返回 `source_url_enrichment_required`，按 `references/screening-handoff.md` 仅对请求的 referring domain / source projects 补充精确来源页事实，再把事实返回 Screening。
+
+## Source URL enrichment
+
+按需 enrichment 可传递：
+
+`source_url | source_title | target_url | anchor | source_page_ascore | source_rel_observation | source_first_seen | source_last_seen`
+
+优先复用当前同源技术采集、已保存 sanitized capture/result 或允许的已登录 Semrush 网站原生 Backlinks 导出。**不得因为知道某个 Backlinks endpoint 名称，就把它写成已验证 relay 请求。** 只有 exact request 实际 HTTP 200、认证/参数/响应结构（以及需要时的分页）都验证后，才可升级 `references/semrush-relay.md` 的正式契约。
 
 ## Semrush runner 的失败处理
 
@@ -46,14 +60,20 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 ## 输出
 
-至少传递：
+Domain-level handoff 至少传递：
 
 `referring_domain | source_projects | successful_project_count | occurrence_count | source_project_organic_traffic | backlinks_num | domain_ascore | first_seen | last_seen | semrush_is_follow | discovery_source | batch_id | first_discovered_at | seen_before`
+
+按需 source-page enrichment 追加：
+
+`source_url | source_title | target_url | anchor | source_page_ascore | source_rel_observation | source_first_seen | source_last_seen`
 
 项目层至少保留：
 
 `domain | organic_status | organic_traffic | organic_traffic_by_db | qualified | referring_domains_total | referring_domains_fetched | rd_complete`
 
+Semrush 尚未执行的已核实项目使用 `pending_semrush`，其 Organic / qualification / RD 字段保持空白。
+
 不知道的字段留空，不生成“可能”“大概”“推测”值。
 
-Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。事故复盘见 [references/incidents/2026-08-21-semrush-relay-debugging.md](references/incidents/2026-08-21-semrush-relay-debugging.md)。正式执行器见 [scripts/semrush-relay-batch.js](scripts/semrush-relay-batch.js)。回归要求见 [references/test-cases.md](references/test-cases.md)。
+Semrush 中转细节见 [references/semrush-relay.md](references/semrush-relay.md)。Discovery→Screening 精确补证合同见 [references/screening-handoff.md](references/screening-handoff.md)。事故复盘见 [references/incidents/2026-08-21-semrush-relay-debugging.md](references/incidents/2026-08-21-semrush-relay-debugging.md)。正式执行器见 [scripts/semrush-relay-batch.js](scripts/semrush-relay-batch.js)。回归要求见 [references/test-cases.md](references/test-cases.md)。
