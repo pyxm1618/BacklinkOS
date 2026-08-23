@@ -27,14 +27,14 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 14. 只有精确请求实际 HTTP 200 + 响应结构通过，才能称“已验证”。page0 成功不能自动扩展成“分页已验证”。
 15. **100 是批次单位，不是停止条件。** 用户要求继续扩大外链库时，可以连续建立多个去重批次；不能因为单批达到 100 个项目就宣告 Discovery 完成。
 16. **控制来源集中度。** 记录项目种子的来源占比；当一个来源明显集中时，优先继续使用已经批准的其他来源（如 Toolify / There’s An AI For That / TrustMRR）补充，再考虑继续向单一来源深挖。
-17. **Semrush 暂时不可用时只积累项目事实。** 已核实真实官网的项目可以进入项目池并标记 `pending_semrush`；不得填造 Organic、qualified、RD 或 backlink 字段。
+17. **Semrush 暂时不可用时只积累项目事实。** 内部状态可记为 `pending_semrush`；当前 Google Sheet `项目池` 落表必须沿用既有 schema：`SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`。不得把字面值 `pending_semrush` 写进现有状态列，也不得填造 Organic、qualified、RD 或 backlink 字段。
 18. **允许按需做 source URL enrichment。** Screening 若无法从 domain-level 事实闭环机制，可返回 `source_url_enrichment_required`；Discovery 只补精确历史来源页事实，不替 Screening 作最终判断。详细合同见 `references/screening-handoff.md`。
 
 ## 每批怎么跑
 
 1. 默认每批找 **100 个新的候选项目**；先与历史项目池去重，并给本批一个批次 ID。100 是工作批次大小，不限制后续继续扩批。
 2. 优先从 Toolify、There’s An AI For That、TrustMRR 找近期项目；需要扩量时可以增加同类来源。记录每个来源的新增量，避免长期由单一来源主导项目池。
-3. 如果 Semrush 当前不可用，可以继续核真实 Website 并写入 `pending_semrush` 项目；到这里停止该项目的 SEO/RD 推进，不生成未知字段。
+3. 如果 Semrush 当前不可用，可以继续核真实 Website 并进入内部 `pending_semrush`；写入当前 `项目池` 时使用 `待Semrush` / `待Semrush筛选`，到这里停止该项目的 SEO/RD 推进，不生成未知字段。
 4. 在已登录 `sem.3ue.com` 的 Backlink Analytics 页面加载固定 runner；runner 自动恢复/验证 session key，再做双接口 Preflight。
 5. 批量查 Semrush Global Organic Traffic；默认 `>= 500` 才进入 Referring Domains 抓取。国家流量读取 `databases.<country>`。
 6. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
@@ -72,7 +72,7 @@ Domain-level handoff 至少传递：
 
 `domain | organic_status | organic_traffic | organic_traffic_by_db | qualified | referring_domains_total | referring_domains_fetched | rd_complete`
 
-Semrush 尚未执行的已核实项目使用 `pending_semrush`，其 Organic / qualification / RD 字段保持空白。
+Semrush 尚未执行的已核实项目内部使用 `pending_semrush`；当前 `项目池` 落表映射为 `SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`，Organic / qualification / RD 未知字段保持空白。
 
 不知道的字段留空，不生成“可能”“大概”“推测”值。
 
