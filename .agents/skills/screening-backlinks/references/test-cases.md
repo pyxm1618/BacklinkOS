@@ -32,3 +32,5 @@
 28. 包含 ARRAYFORMULA / 公式列 / 路由计算列的表不得整行清理，只清当前流程拥有的数据单元格。
 29. 迁移后必须重新核对总量、空状态和各处理结果集合；不能依赖公式优先级掩盖重复状态。
 30. A/B/C/D 可以作为内部解决路线帮助排序，但不能作为业务评级、正式机会准入或淘汰依据。
+31. **ToolIDX 冲突回归**：当前官方 Submit 宣传免费且 `Dofollow`，但当前第三方技术实测称 listing 为 `nofollow`；在未取得当前具体 listing DOM 前，必须保持 `待确认` 并优先核实际 anchor `rel`。官方 Dofollow 营销文案不能自动覆盖第三方当前 nofollow 技术证据，历史 Semrush 8/8 Follow 也不能直接决定结果。
+32. 若 ToolIDX 或同类案例后续取得当前具体 listing DOM：DOM 普通 Follow 且可索引则按当前免费机制进入正式机会；DOM `rel=nofollow/ugc/sponsored` 则回收。新的直接 DOM 证据覆盖此前冲突状态。
