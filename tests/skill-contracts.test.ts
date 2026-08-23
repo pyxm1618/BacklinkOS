@@ -27,6 +27,16 @@ test('discovering-backlinks exposes balanced seed expansion and source-url enric
   assert.match(cases, /source_url_enrichment_required/);
 });
 
+test('discovering-backlinks maps pending_semrush to the live project-pool schema instead of inventing a new sheet state', async () => {
+  const skill = await repoText('.agents/skills/discovering-backlinks/SKILL.md');
+  const cases = await repoText('.agents/skills/discovering-backlinks/references/test-cases.md');
+
+  assert.match(skill, /pending_semrush[^\n]*待Semrush|待Semrush[^\n]*pending_semrush/i);
+  assert.match(skill, /待Semrush筛选/);
+  assert.match(skill, /(项目池|sheet|落表)[^\n]*(待Semrush)/i);
+  assert.match(cases, /待Semrush/);
+});
+
 test('screening-backlinks separates evidence precedence, acquisition mode, and disposition', async () => {
   const skill = await repoText('.agents/skills/screening-backlinks/SKILL.md');
   const rules = await repoText('.agents/skills/screening-backlinks/references/screening-rules.md');
@@ -54,4 +64,17 @@ test('screening-backlinks separates evidence precedence, acquisition mode, and d
 
   assert.match(cases, /付费排除/);
   assert.match(cases, /source_url_enrichment_required/);
+});
+
+test('screening-backlinks uses fact-specific evidence precedence for technical rel observations', async () => {
+  const skill = await repoText('.agents/skills/screening-backlinks/SKILL.md');
+  const rules = await repoText('.agents/skills/screening-backlinks/references/screening-rules.md');
+  const cases = await repoText('.agents/skills/screening-backlinks/references/test-cases.md');
+
+  assert.match(skill, /(技术事实|technical)[^\n]*(DOM|结果页|result page)/i);
+  assert.match(rules, /(rel|Follow)[^\n]*(结果页|listing|DOM)[^\n]*(高于|优先|outrank)/i);
+  assert.match(rules, /(官方|official)[^\n]*(营销|宣传|marketing)[^\n]*(不能|不得|not)[^\n]*(覆盖|override)/i);
+  assert.match(cases, /ToolIDX|toolidx/i);
+  assert.match(cases, /(官方.*Dofollow.*第三方.*nofollow|third-party.*nofollow)/i);
+  assert.match(cases, /(待确认|DOM)/i);
 });
