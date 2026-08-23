@@ -39,16 +39,14 @@ Discovery 已经传来的技术事实直接使用，不重新查询或改写；S
 
 ## 证据优先级
 
-同一事实出现冲突时，按以下顺序使用证据；高层级且直接回答同一事实的证据覆盖低层级：
+证据优先级必须**按正在判断的事实类型**使用，不能把一个来源等级机械套到所有事实。
 
-1. 当前最终 listing/result 的实际 HTML / DOM；
-2. 当前官方 Submit / Pricing / FAQ / Terms 对同一机制的说明；
-3. 当前同一路径、同模板产生的公开样例；
-4. 可信的当前第三方实测，且能给出具体结果页证据；
-5. Discovery 传来的历史 Semrush 观察；
-6. 推断。
+- **获取方式 / 价格 / 资格条件**：当前实际提交流程优先，其次是当前官方 Submit / Pricing / FAQ / Terms；第三方与历史证据只作补充。
+- **技术事实（`href`、`rel`、Follow/Nofollow、`noindex`、canonical）**：当前具体 listing/result 结果页的实际 HTML / DOM 是最高证据；当前同一路径、同模板的实际结果页次之。
+- 对技术事实，能指向具体当前结果页并给出可复核 HTML/DOM 观察的第三方实测，可以高于泛化的官方营销/宣传文案；官方“Dofollow”宣传不能覆盖当前 listing 实测 `rel=nofollow`。
+- Discovery 传来的历史 Semrush 观察低于所有当前机制和当前结果页证据；推断最低。
 
-因此历史 `10/10 Follow` 不能覆盖当前 DOM 的 `rel=nofollow`；历史 `0 Follow` 也不能自动证明当前没有免费 Follow 路径。
+因此历史 `10/10 Follow` 不能覆盖当前 DOM 的 `rel=nofollow`；历史 `0 Follow` 也不能自动证明当前没有免费 Follow 路径。若官方宣传与当前第三方技术实测冲突、而当前 listing DOM 尚未取得，则保持 `待确认`，优先补当前结果页 DOM，不让任一低充分度证据强行胜出。
 
 ## 硬规则
 
@@ -77,7 +75,7 @@ Discovery 已经传来的技术事实直接使用，不重新查询或改写；S
 2. 优先识别可被同一证据覆盖的网络/域名家族，批量处理有闭环证据的 PBN、卖链、自动垃圾页、Nofollow 网络，减少逐站重复劳动。
 3. 对剩余独立候选找到当前真实操作入口。
 4. 判断获取方式：免费 / 免费换链 / 付费 / 不确定。
-5. 用**当前同一路径产生的公开页面**验证最终链接；按证据优先级解决冲突。
+5. 用**当前同一路径产生的公开页面**验证最终链接；先确定正在判断的是价格/资格还是 `rel`/indexability 等技术输出，再按对应证据优先级解决冲突。
 6. 如果 exact historical source page 是关键缺口，返回 `source_url_enrichment_required`；收到 Discovery 补证后继续本候选，不因等待补证而强判。
 7. 按 [references/screening-rules.md](references/screening-rules.md) 得出处理结果：正式机会 / 付费排除 / 回收 / 待确认。
 8. `正式机会` 写入“外链总表”；只有总表以前没有的机会才追加到“新增记录”。
