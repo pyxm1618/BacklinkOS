@@ -8,6 +8,10 @@ __pycache__/
 /screening-results.jsonl
 /screening-results.jsonl.summary.json
 
+# Local run artifacts (screenshots, xlsx exports, scratch scripts). These are
+# per-run scratch, not source; the repo tracks no binaries.
+/outputs/
+
 # Local secrets and OS/editor noise.
 .env
 .env.*
