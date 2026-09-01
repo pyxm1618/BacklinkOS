@@ -26,9 +26,11 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 13. **Console 注入不跨页面导航。** 不能先装 hook 再让用户跳页；导航会销毁当前 JS context。需要跨导航时只能使用正式持久方案。
 14. 只有精确请求实际 HTTP 200 + 响应结构通过，才能称“已验证”。page0 成功不能自动扩展成“分页已验证”。
 15. **100 是批次单位，不是停止条件。** 用户要求继续扩大外链库时，可以连续建立多个去重批次；不能因为单批达到 100 个项目就宣告 Discovery 完成。
-16. **控制来源集中度。** 记录项目种子的来源占比；当一个来源明显集中时，优先继续使用已经批准的其他来源（如 Toolify / There’s An AI For That / TrustMRR）补充，再考虑继续向单一来源深挖。
-17. **Semrush 暂时不可用时只积累项目事实。** 内部状态可记为 `pending_semrush`；当前 Google Sheet `项目池` 落表必须沿用既有 schema：`SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`。不得把字面值 `pending_semrush` 写进现有状态列，也不得填造 Organic、qualified、RD 或 backlink 字段。
-18. **允许按需做 source URL enrichment。** Screening 若无法从 domain-level 事实闭环机制，可返回 `source_url_enrichment_required`；Discovery 只补精确历史来源页事实，不替 Screening 作最终判断。详细合同见 `references/screening-handoff.md`。
+16. **控制来源集中度。** 记录项目种子的来源占比；当一个来源明显集中时，优先继续使用已经批准的其他来源（如 Toolify / There’s An AI For That / TrustMRR）补充，再考虑继续向单一来源深挖。Toolify 与 TAAFT 的列表页当前受 Cloudflare 挑战保护（首页 200、`/new` 403），脚本抓不动时改用浏览器自动化，或改用下列对普通请求开放的来源：Product Hunt（`/leaderboard/monthly/<年>/<月>`）、Indie Hackers（`/products`）、Futurepedia（`/ai-tools`）。量不够时可再补 MicroLaunch / Uneed / BetaList。这些站只作**发现来源**，它们自身是否是外链机会由 Screening 单独判定。
+17. **域名请求同时试裸域和 `www`。** 两者的 Cloudflare 策略常不一致（`toolify.ai` 裸域 403 / `www` 200，`medium.com` 相反）。只试一个会把可用来源误判成不可达。
+18. **Semrush 暂时不可用时只积累项目事实。** 内部状态可记为 `pending_semrush`；当前 Google Sheet `项目池` 落表必须沿用既有 schema：`SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`。不得把字面值 `pending_semrush` 写进现有状态列，也不得填造 Organic、qualified、RD 或 backlink 字段。
+19. **允许按需做 source URL enrichment。** Screening 若无法从 domain-level 事实闭环机制，可返回 `source_url_enrichment_required`；Discovery 只补精确历史来源页事实，不替 Screening 作最终判断。详细合同见 `references/screening-handoff.md`。
+20. **`successful_project_count` 只用于排序，不用于淘汰。** 覆盖项目多的候选先交 Screening，但只被 1 个项目引用的域名同样保留在候选池里——它可能就是一个还没被用烂的好机会。任何阶段都不因为这个数字丢弃候选。
 
 ## 每批怎么跑
 
