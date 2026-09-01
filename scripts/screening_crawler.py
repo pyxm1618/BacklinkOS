@@ -27,7 +27,7 @@ SPAM_PATTERNS = [r'\bbuy backlinks?\b', r'\bpremium pbn\b', r'\bpbn network\b', 
                  r'\bbacklink packages?\b', r'\bbulk guest posts?\b', r'\bsitewide links?\b',
                  r'\bhigh quality dofollow backlinks?\b', r'\bseo backlink packages?\b', r'\bblack hat seo\b']
 DISCOVERY_HINTS = re.compile(r'(directory|catalog|listing|submit|startup|product|tool|launch|profile|community|forum|blog|news|media|press|wiki|link|bookmark|social|author|guest)', re.I)
-COMMON_PATHS = ['/submit','/submit-site','/submit-website','/submit-tool','/submit-product','/add-site','/add-website','/add-listing','/claim','/write-for-us','/guest-post','/contribute']
+COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool','/submit-ai-tool','/submit-product','/add-site','/add-website','/add-listing','/claim','/write-for-us','/guest-post','/contribute']
 
 class Parser(HTMLParser):
     def __init__(self):
@@ -88,7 +88,7 @@ def analyze_html(raw_html, base_url):
 class Redirects(HTTPRedirectHandler): pass
 OPENER=build_opener(Redirects())
 
-def fetch_page(url, timeout=8):
+def fetch_page(url, timeout=8, _retry=True):
     req=Request(url, headers={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'})
     try:
         with OPENER.open(req, timeout=timeout) as resp:
@@ -103,25 +103,42 @@ def fetch_page(url, timeout=8):
     except HTTPError as e:
         return {'url':url,'final_url':getattr(e,'url',url),'status':e.code,'error':f'HTTP {e.code}'}
     except (URLError, socket.timeout, TimeoutError, ssl.SSLError) as e:
+        # "Can't assign requested address" 是本机临时端口被我们自己打满，
+        # 不是站点的问题。退避后重试一次，否则会把上千个正常站点误记成不可达。
+        if _retry and "assign requested address" in str(e):
+            time.sleep(1.5)
+            return fetch_page(url, timeout, _retry=False)
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}
     except Exception as e:
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}
 
 def classify_probe(probe):
+    # bucket 语义（对应 screening-backlinks 的处理结果）：
+    #   dead       已确认淘汰——有闭环负面证据，不会再被捞回
+    #   paid       付费排除
+    #   pending    待确认——发现机制但差最后一步证据
+    #   unverified 未验证——没找到入口。按 SKILL 硬规则 11「缺失事实不是负面事实」，
+    #              这不是淘汰，下一轮必须重新参与筛选。
     h=probe.get('home') or {}
     status=int(h.get('status') or 0)
     allpages=[h]+list(probe.get('pages') or [])
-    if status in (404,410): return {'bucket':'recycle','reason_code':'inactive_404','reason':'主页返回 404/410，当前入口失效'}
+    if status in (404,410): return {'bucket':'dead','reason_code':'inactive_404','reason':'主页返回 404/410，当前入口失效'}
     err=' '.join(probe.get('errors') or [])+' '+str(h.get('error') or '')
     if status==0 and re.search(r'(Name or service not known|Temporary failure in name resolution|nodename nor servname|No address associated|NXDOMAIN)', err, re.I):
-        return {'bucket':'recycle','reason_code':'inactive_dns','reason':'DNS 当前无法解析，候选站点不可达'}
+        return {'bucket':'dead','reason_code':'inactive_dns','reason':'DNS 当前无法解析，候选站点不可达'}
     if status==0 or status in (401,403,407,408,409,425,429) or status>=500:
         return {'bucket':'pending','reason_code':'blocked_or_uncertain','reason':'当前抓取被阻止/超时/服务器异常，无法闭环关键事实'}
-    if any(p.get('noindex') for p in allpages if p.get('status')==200):
-        return {'bucket':'recycle','reason_code':'noindex','reason':'当前候选入口/页面明确 noindex'}
+    # noindex 只在能代表站点的页面上成立。盲探 COMMON_PATHS 命中的多是 SPA 软 404 /
+    # 登录墙，它们的 noindex 不能证明站点不可索引（hashnode.com 曾因此被误杀）。
+    if h.get('status')==200 and h.get('noindex'):
+        return {'bucket':'dead','reason_code':'noindex','reason':'当前站点首页明确 noindex'}
+    def _textual(p):  # 'path:' 是探测到入口路径时注入的伪信号，不算文案证据
+        return [s for s in (p.get('mechanism_signals') or []) if not str(s).startswith('path:')]
+    if any(p.get('noindex') and _textual(p) for p in (probe.get('pages') or []) if p.get('status')==200):
+        return {'bucket':'dead','reason_code':'noindex','reason':'当前可执行入口页明确 noindex'}
     spam=[x for p in allpages if p.get('status')==200 for x in (p.get('spam_signals') or [])]
     if spam:
-        return {'bucket':'recycle','reason_code':'spam_or_link_network','reason':'当前页面出现明确卖链/PBN/批量SEO链接网络信号'}
+        return {'bucket':'dead','reason_code':'spam_or_link_network','reason':'当前页面出现明确卖链/PBN/批量SEO链接网络信号'}
     mech=[p for p in allpages if p.get('status')==200 and p.get('mechanism_signals')]
     if mech:
         paid=[x for p in mech for x in (p.get('paid_signals') or [])]
@@ -129,33 +146,52 @@ def classify_probe(probe):
         if paid and not free:
             return {'bucket':'paid','reason_code':'paid_mechanism','reason':'当前提交/发布入口出现明确付费信号，未发现免费层证据'}
         return {'bucket':'pending','reason_code':'mechanism_needs_link_verification','reason':'发现当前可执行提交/发布/claim机制，但免费性或最终 Follow/可索引属性尚需同路径闭环'}
-    return {'bucket':'recycle','reason_code':'no_generic_mechanism','reason':'当前站点可访问；标准化探测未发现普通用户可执行的通用提交/发布/claim入口'}
-
-def should_probe_common(domain, home):
-    text=' '.join([domain, home.get('title',''), home.get('text_excerpt','')[:2000]])
-    return bool(DISCOVERY_HINTS.search(text) or home.get('mechanism_signals'))
+    return {'bucket':'unverified','reason_code':'no_generic_mechanism','reason':'当前站点可访问；标准化探测未发现通用提交/发布/claim入口。这是证据缺失，不是淘汰结论'}
 
 def probe_domain(item, timeout=8):
     domain=item['domain'].strip().lower()
     out={'domain':domain,'input':item,'home':None,'pages':[],'errors':[]}
-    home=None
-    for scheme in ('https','http'):
-        h=fetch_page(f'{scheme}://{domain}/',timeout)
-        if h.get('status') not in (0,495,496): home=h; break
-        home=h
+    # 裸域和 www 都试：不少站只在其中一个上放行（toolify.ai 裸域 403 / www 200，
+    # medium.com 正好相反）。取最好的一次结果。
+    hosts=[domain] if domain.startswith('www.') else [domain,'www.'+domain]
+    attempts=[]
+    for host in hosts:
+        for scheme in ('https','http'):
+            h=fetch_page(f'{scheme}://{host}/',timeout)
+            attempts.append(h)
+            if h.get('status')==200: break
+        if attempts[-1].get('status')==200: break
+    home=next((a for a in attempts if a.get('status')==200), None) \
+         or next((a for a in attempts if a.get('status') not in (0,495,496)), None) \
+         or attempts[0]
     out['home']=home
     if home.get('error'): out['errors'].append(home['error'])
-    if home.get('status')==200 and not home.get('spam_signals') and not home.get('noindex') and should_probe_common(domain,home):
+    # 不再用首页文案做守卫。旧的 should_probe_common() 让 99% 的"无机制"判定
+    # 只看过首页，softwaretestinghelp.com/add 这类真实入口因此被漏掉。
+    if home.get('status')==200 and not home.get('spam_signals') and not home.get('noindex'):
         urls=[]
         host=(urlparse(home.get('final_url') or f'https://{domain}/').hostname or domain).lower()
-        for u in home.get('candidate_urls',[]):
+        # 首页链接只取前 6 条，给 COMMON_PATHS 留出名额：旧的 urls[:10] 会被
+        # 首页链接占满，导致 /submit 之类的常见入口根本没被试过。
+        for u in home.get('candidate_urls',[])[:6]:
             if (urlparse(u).hostname or '').lower()==host and u not in urls: urls.append(u)
         base=home.get('final_url') or f'https://{domain}/'
+        common=set()
         for path in COMMON_PATHS:
             u=urljoin(base,path)
+            common.add(u)
             if u not in urls: urls.append(u)
-        for u in urls[:10]:
+        for u in urls[:20]:
             p=fetch_page(u,timeout)
+            # COMMON_PATHS 上真实存在的 200 页面本身就是入口证据，不要求页面文案
+            # 再次命中机制正则（heykuki.com/submit 只有免费措辞，旧逻辑会漏掉）。
+            # 但 noindex 的页面不注入：SPA 对不存在的路径常返回软 200 + noindex
+            # （dev.to/submit），注入后会被误判成"入口页 noindex"而淘汰整个域名。
+            if (p.get('status')==200 and u in common and not p.get('mechanism_signals')
+                    and not p.get('noindex')
+                    and p.get('final_url','').rstrip('/')==u.rstrip('/')
+                    and not re.search(r'\b(404|not found|page not found)\b', p.get('title',''), re.I)):
+                p['mechanism_signals']=['path:'+urlparse(u).path]
             if p.get('status')==200 and (p.get('mechanism_signals') or p.get('spam_signals') or p.get('noindex')):
                 out['pages'].append(p)
             elif p.get('status') in (401,403,429) and len(out['pages'])<3:
