@@ -8,8 +8,7 @@ Chromium，分析和判定仍复用 screening_crawler 的 analyze_html / classif
 
 只提取 rel / noindex / 链接字段，不截图、不落 HTML。
 """
-import argparse, json, os, re, sys, threading
-import concurrent.futures
+import argparse, json, multiprocessing, os, re, shutil, sys, threading, time
 from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -104,60 +103,208 @@ def probe(ctx, domain, max_paths):
     return out
 
 
-def worker(domains, max_paths, progress):
-    results = []
+def _new_browser(p):
+    b = p.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
+    ctx = b.new_context(user_agent=UA, viewport={'width': 1280, 'height': 800})
+    ctx.route('**/*', block_heavy)
+    ctx.set_default_timeout(20000)
+    return b, ctx
+
+
+def _stub(domain, reason_code, reason, err=''):
+    """抓取失败一律落 pending，不落 dead。
+
+    抓不到是证据缺失，不是淘汰结论（screening-backlinks 硬规则 11）。
+    """
+    return {'domain': domain, 'input': {'domain': domain}, 'home': {'status': 0},
+            'pages': [], 'errors': [err[:160]] if err else [], 'via': 'browser',
+            'decision': {'bucket': 'pending', 'reason_code': reason_code, 'reason': reason}}
+
+
+def worker(domains, max_paths, shard_path, cur_path):
+    """一个独立进程跑一批域名，边跑边把结果 append 进自己的 shard。
+
+    必须用进程而不是线程：Playwright 的 sync API 基于 greenlet，在非主线程里
+    调用 sync_playwright() 会直接挂住（3 个域名跑 7 分钟不返回）。
+
+    进程还有第二个作用：超时只能靠父进程 kill。page.goto 的 timeout 管不住
+    route 拦截和 page.content()，实测有域名挂 6 分钟以上；SIGALRM 也没用——
+    sync API 阻塞在 greenlet 的 C 调用里，信号处理函数根本轮不到执行。
+    所以这里每跑一个域名先把域名写进 cur_path，父进程发现卡住就 kill 并据此
+    记录是哪个域名超时。shard 逐条 flush，被 kill 也不会丢已完成的。
+    """
     with sync_playwright() as p:
-        b = p.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
-        ctx = b.new_context(user_agent=UA, viewport={'width': 1280, 'height': 800})
-        ctx.route('**/*', block_heavy)
-        ctx.set_default_timeout(20000)
-        for d in domains:
+        b, ctx = _new_browser(p)
+        with open(shard_path, 'a', encoding='utf-8') as fh:
+            for d in domains:
+                with open(cur_path, 'w', encoding='utf-8') as cf:
+                    cf.write(d)  # 在飞的域名，供父进程超时归因
+                try:
+                    r = probe(ctx, d, max_paths)
+                except Exception as e:
+                    r = _stub(d, 'browser_exception', '浏览器抓取异常，关键事实未闭环',
+                              type(e).__name__ + ': ' + str(e))
+                fh.write(json.dumps(r, ensure_ascii=False) + '\n')
+                fh.flush()
+        try:
+            b.close()
+        except Exception:
+            pass
+
+
+def _shard_done(shard_path):
+    """读回一个 shard 已完成的域名（顺序保留）。"""
+    done = []
+    if not os.path.exists(shard_path):
+        return done
+    with open(shard_path, encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                results.append(probe(ctx, d, max_paths))
-            except Exception as e:
-                results.append({'domain': d, 'input': {'domain': d}, 'home': {'status': 0},
-                                'pages': [], 'errors': [str(e)[:160]], 'via': 'browser',
-                                'decision': {'bucket': 'pending', 'reason_code': 'browser_exception',
-                                             'reason': '浏览器抓取异常，关键事实未闭环'}})
-            progress()
-        b.close()
-    return results
+                done.append(json.loads(line)['domain'])
+            except (json.JSONDecodeError, KeyError):
+                continue  # 被 kill 时可能留下半行
+    return done
+
+
+def supervise(slots, max_paths, budget, poll=5):
+    """跑所有分片，卡住就杀掉重启。
+
+    一个 slot = (域名列表, shard 路径, cur 路径)。父进程只看 shard 行数：
+    超过 budget 秒没有新行，就认为在飞的那个域名挂死了，kill 掉进程，把它记成
+    browser_timeout，然后用剩下的域名重启这个 slot。
+    """
+    procs = {}
+
+    def spawn(i):
+        domains, shard, cur = slots[i]
+        remaining = [d for d in domains if d not in set(_shard_done(shard))]
+        if not remaining:
+            return None
+        p = multiprocessing.Process(target=worker, args=(remaining, max_paths, shard, cur))
+        p.daemon = True
+        p.start()
+        return {'p': p, 'n': len(_shard_done(shard)), 'ts': time.time()}
+
+    for i in range(len(slots)):
+        st = spawn(i)
+        if st:
+            procs[i] = st
+
+    while procs:
+        time.sleep(poll)
+        for i in list(procs):
+            st = procs[i]
+            domains, shard, cur = slots[i]
+            n = len(_shard_done(shard))
+            if n > st['n']:
+                st['n'], st['ts'] = n, time.time()
+            if not st['p'].is_alive():
+                # 正常跑完，或者浏览器自己崩了——还有剩就重启
+                nxt = spawn(i)
+                if nxt:
+                    procs[i] = nxt
+                else:
+                    del procs[i]
+                continue
+            if time.time() - st['ts'] > budget:
+                stuck = ''
+                try:
+                    with open(cur, encoding='utf-8') as cf:
+                        stuck = cf.read().strip()
+                except OSError:
+                    pass
+                st['p'].kill()
+                st['p'].join(10)
+                if stuck and stuck not in set(_shard_done(shard)):
+                    with open(shard, 'a', encoding='utf-8') as fh:
+                        fh.write(json.dumps(
+                            _stub(stuck, 'browser_timeout',
+                                  f'浏览器抓取超过 {budget}s 预算，关键事实未闭环'),
+                            ensure_ascii=False) + '\n')
+                    print(f'  超时跳过 {stuck}', flush=True)
+                nxt = spawn(i)
+                if nxt:
+                    procs[i] = nxt
+                else:
+                    del procs[i]
+
+
+def load_shards(shard_dir):
+    """读回已完成的 shard，用于进度显示和断点续跑。"""
+    done = {}
+    if not os.path.isdir(shard_dir):
+        return done
+    for name in os.listdir(shard_dir):
+        if not name.endswith('.jsonl'):
+            continue
+        with open(os.path.join(shard_dir, name), encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # 中断时可能留下半行
+                done[r['domain']] = r
+    return done
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True, help='crawler 输出的 jsonl')
     ap.add_argument('--output', required=True, help='合并后的 jsonl')
-    ap.add_argument('--workers', type=int, default=5, help='并行浏览器数，别开太高')
+    ap.add_argument('--workers', type=int, default=5, help='并行浏览器进程数，别开太高')
     ap.add_argument('--max-paths', type=int, default=5)
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--shard-dir', default='', help='断点目录，默认 <output>.shards')
+    ap.add_argument('--fresh', action='store_true', help='忽略已有断点，从头跑')
+    ap.add_argument('--budget', type=int, default=75, help='单域名墙钟预算（秒）')
     a = ap.parse_args()
 
     records = [json.loads(l) for l in open(a.input, encoding='utf-8') if l.strip()]
     stuck = [r['domain'] for r in records
-             if r.get('decision', {}).get('reason_code') in ('blocked_or_uncertain', 'browser_exception')]
+             if r.get('decision', {}).get('reason_code') in ('blocked_or_uncertain', 'browser_exception', 'browser_timeout')]
     if a.limit:
         stuck = stuck[:a.limit]
-    print(f'需要浏览器兜底：{len(stuck)}', flush=True)
-    if not stuck:
-        return
 
-    state = {'n': 0}
-    lock = threading.Lock()
+    shard_dir = a.shard_dir or (a.output + '.shards')
+    if a.fresh and os.path.isdir(shard_dir):
+        shutil.rmtree(shard_dir)
+    os.makedirs(shard_dir, exist_ok=True)
 
-    def progress():
-        with lock:
-            state['n'] += 1
-            if state['n'] % 25 == 0:
-                print(f"{state['n']}/{len(stuck)}", flush=True)
+    fixed = load_shards(shard_dir)
+    todo = [d for d in stuck if d not in fixed]
+    print(f'需要浏览器兜底：{len(stuck)}（已完成 {len(stuck) - len(todo)}，本次跑 {len(todo)}）', flush=True)
 
-    chunks = [stuck[i::a.workers] for i in range(a.workers)]
-    fixed = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = [ex.submit(worker, c, a.max_paths, progress) for c in chunks if c]
-        for f in concurrent.futures.as_completed(futs):
-            for r in f.result():
-                fixed[r['domain']] = r
+    if todo:
+        chunks = [todo[i::a.workers] for i in range(a.workers)]
+        slots = [(c, os.path.join(shard_dir, f'w{i}.jsonl'), os.path.join(shard_dir, f'w{i}.cur'))
+                 for i, c in enumerate(chunks) if c]
+
+        stop = threading.Event()
+
+        def tick():
+            # 只数 shard 行数报进度，不碰浏览器
+            t0 = time.time()
+            base = len(stuck) - len(todo)
+            while not stop.wait(30):
+                n = len(load_shards(shard_dir))
+                el = time.time() - t0
+                rate = (n - base) / el if el else 0
+                eta = (len(todo) - (n - base)) / rate / 60 if rate > 0 else 0
+                print(f'  {n}/{len(stuck)}  已跑 {el/60:.1f} 分钟，预计还要 {eta:.0f} 分钟', flush=True)
+
+        mon = threading.Thread(target=tick, daemon=True)
+        mon.start()
+        try:
+            supervise(slots, a.max_paths, a.budget)
+        finally:
+            stop.set()
+        fixed = load_shards(shard_dir)
 
     counts = {}
     with open(a.output, 'w', encoding='utf-8') as out:
@@ -167,7 +314,7 @@ def main():
             b = r['decision']['bucket']
             counts[b] = counts.get(b, 0) + 1
     recovered = sum(1 for d, r in fixed.items()
-                    if r['decision']['reason_code'] not in ('blocked_or_uncertain', 'browser_exception'))
+                    if r['decision']['reason_code'] not in ('blocked_or_uncertain', 'browser_exception', 'browser_timeout'))
     print(json.dumps(counts, ensure_ascii=False))
     print(f'浏览器兜底救回 {recovered}/{len(stuck)} 条 -> {a.output}')
 
