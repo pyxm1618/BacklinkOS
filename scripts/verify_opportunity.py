@@ -36,17 +36,26 @@ def same_site(url, domain):
 
 
 def pick_entry(rec):
-    """候选的操作入口页。"""
+    """候选的操作入口页。
+
+    返回 (url, is_real_entry)。is_real_entry 表示这个 URL 真的是一个用户可提交
+    的入口（路径本身像投稿入口），而不是退而求其次拿到的首页或列表页。
+
+    这个区分很重要：退化来的首页不能当入口用。首页上写着 "free" 不代表存在
+    免费的投稿机制——`edmontonhomesales.ca/blog/`（房产中介博客）、
+    `ubi-interactive.com/category/latest-news/`（公司新闻分类页）都曾因此
+    被判成正式机会，实际上这些站根本没有对外投稿入口。
+    """
     domain = rec['domain']
     pages = [p for p in (rec.get('pages') or [])
              if p.get('status') == 200 and same_site(p.get('final_url'), domain)]
     for p in pages:
         if ENTRY_HINT.search(p.get('final_url', '')):
-            return p.get('final_url')
+            return p.get('final_url'), True
     if pages:
-        return pages[0].get('final_url')
+        return pages[0].get('final_url'), False
     home = (rec.get('home') or {}).get('final_url')
-    return home if same_site(home, domain) else None
+    return (home, False) if same_site(home, domain) else (None, False)
 
 
 AGGREGATE_HINT = re.compile(r'/(category|categories|sub-category|tag|tags|topic|topics|t|c|author|page|search|archive|feed)(/|$)', re.I)
@@ -94,7 +103,7 @@ def acquisition_mode(rec, entry_page):
 
 def verify(rec, timeout=10):
     domain = rec['domain']
-    entry = pick_entry(rec)
+    entry, real_entry = pick_entry(rec)
     sample_url = pick_sample(rec, entry)
     if not entry:
         return {'Domain': domain, '操作入口': '', '获取方式': UNKNOWN, '处理结果': PENDING,
@@ -113,6 +122,14 @@ def verify(rec, timeout=10):
 
     if mode == PAID:
         row.update({'处理结果': PAID_OUT, '已确认事实': mode_why})
+        return row
+
+    # 没定位到真正的投稿入口就不能给正式机会。首页/列表页上的 "free" 措辞
+    # 说明不了存在免费的投稿机制，拿它当证据会产出一批"点进去不知道在哪提交"
+    # 的假机会。这里落待确认——是证据缺失，不是淘汰。
+    if not real_entry:
+        row.update({'获取方式': UNKNOWN, '处理结果': PENDING,
+                    '缺失事实': '未定位到用户可提交的入口页（当前只拿到首页或列表页），无法确认存在对外投稿机制'})
         return row
 
     if not sample_url:
