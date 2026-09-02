@@ -27,22 +27,56 @@ SPAM_PATTERNS = [r'\bbuy backlinks?\b', r'\bpremium pbn\b', r'\bpbn network\b', 
                  r'\bbacklink packages?\b', r'\bbulk guest posts?\b', r'\bsitewide links?\b',
                  r'\bhigh quality dofollow backlinks?\b', r'\bseo backlink packages?\b', r'\bblack hat seo\b']
 DISCOVERY_HINTS = re.compile(r'(directory|catalog|listing|submit|startup|product|tool|launch|profile|community|forum|blog|news|media|press|wiki|link|bookmark|social|author|guest)', re.I)
-COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool','/submit-ai-tool','/submit-product','/add-site','/add-website','/add-listing','/claim','/write-for-us','/guest-post','/contribute']
+# 比 DISCOVERY_HINTS 严格得多：这些词几乎只出现在真正的投稿/收录入口上。
+# DISCOVERY_HINTS 太宽（blog/product/tool 都算），命中的链接会把 candidate_urls
+# 占满，真正的 /submit 反而挤不进前几名。分成强弱两档就是为了排序。
+ENTRY_HINTS = re.compile(
+    r'\b(submit|add[-_\s]?(?:your|a|new|site|website|tool|listing|url|link|product)'
+    r'|write[-_\s]for[-_\s]us|guest[-_\s]?post|contribute|become[-_\s]an?[-_\s]author'
+    r'|get[-_\s]listed|list[-_\s]your|claim|suggest)', re.I)
+# 登录/注册墙。这些页面 noindex 是理所当然的，不能当成"入口页不可索引"。
+AUTH_PATH_RE = re.compile(r'/(log[-_]?in|sign[-_]?in|sign[-_]?up|register|auth|account|my-account)(/|$)', re.I)
+# 按命中概率排序：probe 有请求预算，靠前的先试。
+COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool','/submit-ai-tool',
+                '/submit-product','/add-site','/add-website','/add-listing','/claim','/write-for-us',
+                '/guest-post','/contribute',
+                # 以下是重筛 unverified 时补的：上一轮 2426 条「没找到入口」里，
+                # 很多站的入口就在这些路径上，只是不在原来的 14 条里。
+                '/submit-startup','/submit-your-tool','/submit-a-tool','/submit-link','/submit-url',
+                '/submit-article','/submit-blog','/submit-news','/add-url','/add-your-business',
+                '/list-your-business','/get-listed','/suggest','/new','/publish','/write-for-us/',
+                '/advertise','/partners','/tools/submit','/directory/submit','/submit.html',
+                '/become-a-contributor','/guest-posting','/free-listing']
 
 class Parser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.title=[]; self.in_title=False; self.text=[]; self.links=[]; self.metas=[]
+        self._a=None; self._atext=[]
     def handle_starttag(self, tag, attrs):
         d={k.lower():(v or '') for k,v in attrs}
-        if tag.lower()=='title': self.in_title=True
-        elif tag.lower()=='a': self.links.append((d.get('href',''), d.get('rel',''), d.get('title','')))
-        elif tag.lower()=='meta': self.metas.append(d)
+        t=tag.lower()
+        if t=='title': self.in_title=True
+        elif t=='a':
+            self._flush_a()  # 上一个 <a> 没闭合就先收掉，别把锚文本串到下一条
+            self._a=(d.get('href',''), d.get('rel',''), d.get('title',''))
+            self._atext=[]
+        elif t=='meta': self.metas.append(d)
     def handle_endtag(self, tag):
-        if tag.lower()=='title': self.in_title=False
+        t=tag.lower()
+        if t=='title': self.in_title=False
+        elif t=='a': self._flush_a()
     def handle_data(self, data):
         if self.in_title: self.title.append(data)
+        if self._a is not None: self._atext.append(data)
         self.text.append(data)
+    def _flush_a(self):
+        if self._a is None: return
+        href, rel, atitle = self._a
+        self.links.append((href, rel, atitle, ' '.join(self._atext).strip()[:200]))
+        self._a=None; self._atext=[]
+    def close(self):
+        super().close(); self._flush_a()
 
 def _hits(text, patterns):
     out=[]
@@ -62,27 +96,32 @@ def analyze_html(raw_html, base_url):
     noindex='noindex' in robots
     host=(urlparse(base_url).hostname or '').lower()
     ext_follow=ext_nofollow=0
-    candidate=[]
-    for href, rel, atitle in p.links:
+    strong=[]; weak=[]
+    for href, rel, atitle, atext in p.links:
         if not href or href.startswith(('#','mailto:','tel:','javascript:')): continue
         u=urljoin(base_url, href)
         pu=urlparse(u)
         if pu.scheme not in ('http','https'): continue
-        ltxt=(href+' '+atitle).lower()
-        if any(re.search(x, ltxt, re.I) for x in MECHANISM_PATTERNS) or DISCOVERY_HINTS.search(ltxt):
-            if (pu.hostname or '').lower()==host and u not in candidate:
-                candidate.append(u)
+        # 锚文本必须参与匹配。"Submit a tool" 这种入口常常只在可见文字里，
+        # href 是 /s/new 之类看不出意图的路径——只看 href+title 会整条漏掉。
+        ltxt=(href+' '+atitle+' '+atext).lower()
+        if (pu.hostname or '').lower()==host:
+            if any(re.search(x, ltxt, re.I) for x in MECHANISM_PATTERNS) or ENTRY_HINTS.search(ltxt):
+                if u not in strong: strong.append(u)
+            elif DISCOVERY_HINTS.search(ltxt):
+                if u not in weak: weak.append(u)
         if pu.hostname and pu.hostname.lower()!=host:
             tokens=set((rel or '').lower().split())
             if tokens & {'nofollow','ugc','sponsored'}: ext_nofollow+=1
             else: ext_follow+=1
+    candidate=strong+[w for w in weak if w not in strong]
     full=(title+' '+norm)
     return {
         'title': title, 'noindex': noindex, 'mechanism_signals': _hits(full, MECHANISM_PATTERNS),
         'free_signals': _hits(full, FREE_PATTERNS), 'paid_signals': _hits(full, PAID_PATTERNS),
         'spam_signals': _hits(full, SPAM_PATTERNS),
         'external_follow_count': ext_follow, 'external_nofollow_count': ext_nofollow,
-        'candidate_urls': candidate[:8], 'text_excerpt': norm[:500]
+        'candidate_urls': candidate[:12], 'text_excerpt': norm[:500]
     }
 
 class Redirects(HTTPRedirectHandler): pass
@@ -134,7 +173,39 @@ def classify_probe(probe):
         return {'bucket':'dead','reason_code':'noindex','reason':'当前站点首页明确 noindex'}
     def _textual(p):  # 'path:' 是探测到入口路径时注入的伪信号，不算文案证据
         return [s for s in (p.get('mechanism_signals') or []) if not str(s).startswith('path:')]
-    if any(p.get('noindex') and _textual(p) for p in (probe.get('pages') or []) if p.get('status')==200):
+    def _bare(u):
+        # 注意别用 lstrip('www.')——那是按字符集剥，'wow.com' 会变成 'o.com'
+        hn=(urlparse(u or '').hostname or '').lower()
+        return hn[4:] if hn.startswith('www.') else hn
+    site_host=_bare(h.get('final_url'))
+    def _same_host(p):
+        # 跨站页面不能代表本站。实测有域名是被 tally.so 的表单页、甚至另一个
+        # 域名的页面 noindex 判死的（aitools.fyi、aicloudbase.com）。
+        ph=_bare(p.get('final_url'))
+        return bool(ph) and bool(site_host) and ph==site_host
+    def _usable_noindex(p):
+        """这一页的 noindex 能不能拿来淘汰整个域名。"""
+        req=p.get('url') or ''; fu=p.get('final_url') or ''
+        # 登录/注册墙的 noindex 是理所当然的，它不是入口页本身。而且被跳到
+        # 登录页恰恰说明投稿机制存在（callbackUrl 里就写着 /submit），
+        # 这种情况应该留在 pending 让人去确认，绝不能判死。
+        if AUTH_PATH_RE.search(urlparse(fu).path or ''): return False
+        # 跟着跳转跑到别的页面去了，那个 noindex 属于跳转目标，不属于这个入口
+        if req and fu and (urlparse(req).path or '/').rstrip('/')!=(urlparse(fu).path or '/').rstrip('/'):
+            return False
+        # 目录站的每个页面都在导航/页脚里写着 "Submit your tool"，所以页面文案
+        # 命中机制正则根本不能说明这一页就是入口。只有路径本身像投稿入口才算。
+        # 否则 /category/news/、/products、/forum 这类正常 noindex 的归档页
+        # 会把整个域名判死（kulfiy.com、topreviewed.ai、promoteproject.com）。
+        if not ENTRY_HINTS.search(urlparse(fu).path or ''): return False
+        return True
+    # 盲探 COMMON_PATHS 命中的页面一律不作淘汰依据，哪怕它有文案信号。
+    # SPA 对任意不存在的路径返回软 200 + noindex，壳里的文案还可能撞上机制正则
+    # （polymarket.com 的 /submit /add /submit-site 全是这样，差点被判死）。
+    # 只有站点自己在页面上链出来的入口才算能代表站点。
+    if any(p.get('noindex') and _textual(p) and not p.get('blind_probe')
+           and _same_host(p) and _usable_noindex(p)
+           for p in (probe.get('pages') or []) if p.get('status')==200):
         return {'bucket':'dead','reason_code':'noindex','reason':'当前可执行入口页明确 noindex'}
     spam=[x for p in allpages if p.get('status')==200 for x in (p.get('spam_signals') or [])]
     if spam:
@@ -148,7 +219,7 @@ def classify_probe(probe):
         return {'bucket':'pending','reason_code':'mechanism_needs_link_verification','reason':'发现当前可执行提交/发布/claim机制，但免费性或最终 Follow/可索引属性尚需同路径闭环'}
     return {'bucket':'unverified','reason_code':'no_generic_mechanism','reason':'当前站点可访问；标准化探测未发现通用提交/发布/claim入口。这是证据缺失，不是淘汰结论'}
 
-def probe_domain(item, timeout=8):
+def probe_domain(item, timeout=8, max_probes=20):
     domain=item['domain'].strip().lower()
     out={'domain':domain,'input':item,'home':None,'pages':[],'errors':[]}
     # 裸域和 www 都试：不少站只在其中一个上放行（toolify.ai 裸域 403 / www 200，
@@ -181,8 +252,11 @@ def probe_domain(item, timeout=8):
             u=urljoin(base,path)
             common.add(u)
             if u not in urls: urls.append(u)
-        for u in urls[:20]:
+        for u in urls[:max_probes]:
             p=fetch_page(u,timeout)
+            # 标记这一页是盲探来的：它不是站点自己链出来的入口，不能代表站点，
+            # classify_probe 据此拒绝拿它的 noindex 淘汰整个域名。
+            if u in common: p['blind_probe']=True
             # COMMON_PATHS 上真实存在的 200 页面本身就是入口证据，不要求页面文案
             # 再次命中机制正则（heykuki.com/submit 只有免费措辞，旧逻辑会漏掉）。
             # 但 noindex 的页面不注入：SPA 对不存在的路径常返回软 200 + noindex
@@ -216,12 +290,12 @@ def load_input(path):
     return items
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--input',required=True); ap.add_argument('--output',default='screening-results.jsonl'); ap.add_argument('--workers',type=int,default=40); ap.add_argument('--timeout',type=int,default=8)
+    ap=argparse.ArgumentParser(); ap.add_argument('--input',required=True); ap.add_argument('--output',default='screening-results.jsonl'); ap.add_argument('--workers',type=int,default=40); ap.add_argument('--timeout',type=int,default=8); ap.add_argument('--max-probes',type=int,default=20,help='每个域名最多探测多少个子页面')
     a=ap.parse_args(); items=load_input(a.input)
     print(f'BacklinkOS crawler: {len(items)} domains, workers={a.workers}', flush=True)
     done=0; counts={}
     with open(a.output,'w',encoding='utf-8') as out, concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs={ex.submit(probe_domain,item,a.timeout):item for item in items}
+        futs={ex.submit(probe_domain,item,a.timeout,a.max_probes):item for item in items}
         for fut in concurrent.futures.as_completed(futs):
             item=futs[fut]
             try: r=fut.result()

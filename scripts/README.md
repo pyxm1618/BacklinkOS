@@ -32,6 +32,23 @@ Important boundary:
 - **裸域和 `www` 都要试。** `toolify.ai` 裸域 403 / `www` 200，`medium.com` 相反。
 - **不要用首页文案给子页探测加守卫。** 旧的 `should_probe_common()` 让 99% 的"无机制"判定只看过首页，`softwaretestinghelp.com/add` 这类真实入口因此被漏掉。
 
+一个子页的 noindex 想淘汰整个域名，必须同时满足下面四条。每条都对应实测到的误杀，
+实跑 4180 条时这组守卫把 66 条 noindex 判死收敛到 23 条，救回 43 条：
+
+1. **不是盲探来的。** SPA 对任意不存在路径返回软 200 + noindex，壳里的文案还可能撞上机制正则——`polymarket.com` 的 `/submit`、`/add`、`/submit-site` 全是这样。
+2. **和站点同源。** `aitools.fyi` 曾被第三方表单站 `tally.so` 的页面判死，`aicloudbase.com` 被另一个域名的页面判死。判同源要按前缀剥 `www.`，**不能用 `lstrip('www.')`**——那是按字符集剥，`wow.com` 会变成 `o.com`。
+3. **不是登录墙、也不是跳转后的落地页。** 登录页 noindex 天经地义；而且跳转参数里写着 `redirectTo=/submit` 恰恰证明投稿机制存在，这种必须留 `pending`（`peerpush.com`、`whatlaunched.today`）。
+4. **路径本身像投稿入口。** 目录站每个页面的导航/页脚都写着 "Submit your tool"，所以页面文案命中机制正则根本说明不了这一页是入口。只看路径才能把 `/submit/`、`/claim-your-tool/` 和 `/category/news/`、`/products`、`/forum` 分开（`kulfiy.com`、`topreviewed.ai`、`promoteproject.com` 都是这样被误杀的，其中 `promoteproject.com` 救回后成了已确认的正式机会）。
+
+已知仍会误判的一例：`timothe.ai/tools/pdf-add-link` 是个 PDF 工具页，路径里的 `add-link` 命中了入口词。子页 noindex 判死目前保留在契约里（`test_noindex_on_real_entry_page_is_dead`）；要不要收紧成"只有首页 noindex 才判死"是一次显式的契约变更，不要顺手改。
+
+入口链接的识别与排序：
+
+- **锚文本必须参与匹配。** 入口常常只在可见文字里表明意图（`<a href="/s/new">Submit a tool</a>`），href 和 title 都看不出来。只匹配 href+title 会整条漏掉这类入口。
+- **强弱两档排序。** `DISCOVERY_HINTS` 太宽（`blog`/`product`/`tool`/`news` 都算），命中的泛导航链接会把候选列表占满，真正的 `/submit` 挤不进 probe 的请求预算。`ENTRY_HINTS` 只收几乎必然是投稿入口的词，排在前面。
+- **`ENTRY_HINTS` 必须带词边界。** `disclaimer` 里含 `claim`——实测没有 `\b` 时，新增命中里有 4/10 是 `/disclaimer`，纯属浪费预算。
+- 每个域名的探测预算由 `--max-probes` 控制（默认 20）。`COMMON_PATHS` 按命中概率排序，靠前的先试。
+
 ## `verify_opportunity.py`
 
 把爬虫留下的 `mechanism_needs_link_verification` 候选推过最后一公里：抓一个**用户产出的详情页**，确认最终外链的 `rel`、页面可索引性和免费/付费信号，产出 `data/opportunities/`。

@@ -89,6 +89,9 @@ def probe(ctx, domain, max_paths):
                     urls.append(u)
             for u in urls[:max_paths + 3]:
                 pg = grab(page, u, timeout=15000)
+                # 与 screening_crawler 保持一致：盲探来的页面不能代表站点
+                if u in common:
+                    pg['blind_probe'] = True
                 if (pg.get('status') == 200 and u in common and not pg.get('mechanism_signals')
                         and not pg.get('noindex')
                         and pg.get('final_url', '').rstrip('/') == u.rstrip('/')):
