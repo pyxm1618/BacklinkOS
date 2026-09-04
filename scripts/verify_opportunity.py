@@ -193,6 +193,21 @@ def next_action(r):
 ORDER = {OPPORTUNITY: 0, PENDING: 1, UNVERIFIED: 2, PAID_OUT: 3, DEAD: 4}
 
 
+def load_status_rows(path):
+    rows = {}
+    if not path or not os.path.exists(path):
+        return rows
+    with open(path, newline='', encoding='utf-8-sig') as fh:
+        for row in csv.DictReader(fh):
+            domain = (row.get('Domain') or '').strip().lower()
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            if domain:
+                row['Domain'] = domain
+                rows[domain] = row
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', default='data/screening-results/latest.jsonl')
@@ -200,7 +215,16 @@ def main():
     ap.add_argument('--workers', type=int, default=30)
     ap.add_argument('--timeout', type=int, default=10)
     ap.add_argument('--limit', type=int, default=0, help='只处理前 N 条，用于试跑')
+    ap.add_argument('--existing-status', default='', help='已有深入筛选状态 CSV；默认复用')
+    ap.add_argument('--recheck-existing-status', action='store_true', help='明确要求重查已有状态')
+    ap.add_argument('--fresh', action='store_true', help='忽略全部已有深入状态')
     a = ap.parse_args()
+
+    os.makedirs(a.out_dir, exist_ok=True)
+    internal = os.path.join(a.out_dir, 'internal-status.csv')
+    formal = os.path.join(a.out_dir, 'opportunities.csv')
+    existing_path = a.existing_status or internal
+    existing = {} if a.fresh else load_status_rows(existing_path)
 
     records = []
     with open(a.input, encoding='utf-8') as f:
@@ -211,9 +235,13 @@ def main():
             d = json.loads(line)
             if d.get('decision', {}).get('reason_code') == 'mechanism_needs_link_verification':
                 records.append(d)
+    reused = 0
+    if not a.recheck_existing_status:
+        reused = sum(1 for r in records if r.get('domain', '').lower().removeprefix('www.') in existing)
+        records = [r for r in records if r.get('domain', '').lower().removeprefix('www.') not in existing]
     if a.limit:
         records = records[:a.limit]
-    print(f'待推进候选：{len(records)}', flush=True)
+    print(f'已有深入状态复用 {reused}；本次待推进 {len(records)}', flush=True)
 
     rows, done = [], 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as ex:
@@ -223,12 +251,13 @@ def main():
             if done % 50 == 0:
                 print(f'{done}/{len(records)}', flush=True)
 
-    os.makedirs(a.out_dir, exist_ok=True)
-    internal = os.path.join(a.out_dir, 'internal-status.csv')
-    formal = os.path.join(a.out_dir, 'opportunities.csv')
-
     for r in rows:
         r['下一步'] = next_action(r)
+
+    merged = dict(existing)
+    for row in rows:
+        merged[row['Domain'].lower().removeprefix('www.')] = row
+    rows = list(merged.values())
 
     cols = ['Domain', '下一步', '操作入口', '获取方式', '处理结果', '已确认事实', '缺失事实', '证据URL', '证据日期', '外链形式', 'DR', '成功项目数']
     with open(internal, 'w', newline='', encoding='utf-8-sig') as f:
@@ -253,7 +282,7 @@ def main():
         counts[r['处理结果']] = counts.get(r['处理结果'], 0) + 1
     print(json.dumps(counts, ensure_ascii=False))
     print(f'正式机会 {len(wins)} 条 -> {formal}')
-    print(f'全部状态 {len(rows)} 条 -> {internal}')
+    print(f'全部状态 {len(rows)} 条（复用 {len(existing)}，本次处理 {done}）-> {internal}')
 
 
 if __name__ == '__main__':

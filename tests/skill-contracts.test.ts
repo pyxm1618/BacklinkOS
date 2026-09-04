@@ -37,6 +37,16 @@ test('discovering-backlinks maps pending_semrush to the live project-pool schema
   assert.match(cases, /待Semrush/);
 });
 
+test('discovering-backlinks requires a reconciled incremental handoff before screening', async () => {
+  const skill = await repoText('.agents/skills/discovering-backlinks/SKILL.md');
+
+  assert.match(skill, /prepare_screening_input\.py/);
+  assert.match(skill, /(旧候选|历史候选|existing pool)[^\n]*(发现结果|Discovery|discovery)/i);
+  assert.match(skill, /(去重|deduplicat)[^\n]*(合并|union)|合并[^\n]*(去重|deduplicat)/i);
+  assert.match(skill, /(核对|对账|reconcil)[^\n]*(总数|数量|count)/i);
+  assert.match(skill, /(不得|禁止|不能)[^\n]*(固定旧名单|旧候选文件|old candidate)/i);
+});
+
 test('screening-backlinks separates evidence precedence, acquisition mode, and disposition', async () => {
   const skill = await repoText('.agents/skills/screening-backlinks/SKILL.md');
   const rules = await repoText('.agents/skills/screening-backlinks/references/screening-rules.md');
@@ -77,4 +87,15 @@ test('screening-backlinks uses fact-specific evidence precedence for technical r
   assert.match(cases, /ToolIDX|toolidx/i);
   assert.match(cases, /(官方.*Dofollow.*第三方.*nofollow|third-party.*nofollow)/i);
   assert.match(cases, /(待确认|DOM)/i);
+});
+
+test('screening-backlinks reuses prior work and only spends quota on unreviewed candidates', async () => {
+  const skill = await repoText('.agents/skills/screening-backlinks/SKILL.md');
+
+  assert.match(skill, /prepare_screening_input\.py/);
+  assert.match(skill, /(已有粗筛|existing results)[^\n]*(复用|reuse)/i);
+  assert.match(skill, /(已有深筛|existing status)[^\n]*(复用|reuse)/i);
+  assert.match(skill, /(只处理|only process)[^\n]*unreviewed/i);
+  assert.match(skill, /(fresh|全量重跑|重新检查)[^\n]*(明确要求|explicit)/i);
+  assert.match(skill, /(核对|对账|reconcil)[^\n]*(approved|deferred|confirmed_reject|triaged_only|unreviewed)/i);
 });

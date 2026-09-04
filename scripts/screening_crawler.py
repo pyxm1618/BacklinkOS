@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, concurrent.futures, csv, json, re, socket, ssl, time
+import argparse, concurrent.futures, csv, json, os, re, socket, ssl, time
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -289,21 +289,120 @@ def load_input(path):
                 if row.get('domain'): items.append(row)
     return items
 
+def normalize_domain(value):
+    raw=str(value or '').strip().lower()
+    if not raw: return ''
+    if '://' not in raw: raw='//'+raw
+    host=(urlparse(raw).hostname or '').rstrip('.')
+    return host[4:] if host.startswith('www.') else host
+
+def unique_input(items):
+    """按规范化域名去重，同时保留本轮最新的输入事实。"""
+    merged={}
+    order=[]
+    for item in items:
+        domain=normalize_domain(item.get('domain'))
+        if not domain: continue
+        normalized=dict(item); normalized['domain']=domain
+        if domain not in merged: order.append(domain)
+        merged[domain]=normalized
+    return [merged[domain] for domain in order]
+
+def load_existing_results(path):
+    results={}
+    if not path or not os.path.exists(path): return results
+    with open(path,encoding='utf-8') as f:
+        for line_number,line in enumerate(f,start=1):
+            line=line.strip()
+            if not line: continue
+            try: row=json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'已有结果第 {line_number} 行不是有效 JSON：{path}') from exc
+            domain=normalize_domain(row.get('domain'))
+            if domain and isinstance(row.get('decision'),dict): results[domain]=row
+    return results
+
+def existing_status_placeholder(item):
+    return {
+        'domain':item['domain'],
+        'input':item,
+        'home':{'status':0},
+        'pages':[],
+        'errors':[],
+        'decision':{
+            'bucket':'status_reused',
+            'reason_code':'existing_status_reused',
+            'reason':'总账已有深入筛选状态，本轮不重复抓取',
+        },
+    }
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--input',required=True); ap.add_argument('--output',default='screening-results.jsonl'); ap.add_argument('--workers',type=int,default=40); ap.add_argument('--timeout',type=int,default=8); ap.add_argument('--max-probes',type=int,default=20,help='每个域名最多探测多少个子页面')
-    a=ap.parse_args(); items=load_input(a.input)
-    print(f'BacklinkOS crawler: {len(items)} domains, workers={a.workers}', flush=True)
-    done=0; counts={}
-    with open(a.output,'w',encoding='utf-8') as out, concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs={ex.submit(probe_domain,item,a.timeout,a.max_probes):item for item in items}
-        for fut in concurrent.futures.as_completed(futs):
-            item=futs[fut]
-            try: r=fut.result()
-            except Exception as e: r={'domain':item.get('domain',''),'input':item,'home':{'status':0},'pages':[],'errors':[str(e)],'decision':{'bucket':'pending','reason_code':'crawler_exception','reason':'抓取器异常，关键事实未闭环'}}
-            out.write(json.dumps(r,ensure_ascii=False)+'\n'); out.flush(); done+=1
-            b=r['decision']['bucket']; counts[b]=counts.get(b,0)+1
-            if done%100==0: print(f'{done}/{len(items)} {counts}', flush=True)
-    with open(a.output+'.summary.json','w',encoding='utf-8') as f: json.dump({'total':len(items),'counts':counts,'generated_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())},f,ensure_ascii=False,indent=2)
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--input',required=True)
+    ap.add_argument('--output',default='screening-results.jsonl')
+    ap.add_argument('--workers',type=int,default=40)
+    ap.add_argument('--timeout',type=int,default=8)
+    ap.add_argument('--max-probes',type=int,default=20,help='每个域名最多探测多少个子页面')
+    ap.add_argument('--existing-results',default='',help='已有 crawler JSONL；默认复用，不重复抓取')
+    ap.add_argument('--fresh',action='store_true',help='明确要求全部重新抓取')
+    a=ap.parse_args(); items=unique_input(load_input(a.input))
+
+    existing={}
+    if not a.fresh:
+        existing.update(load_existing_results(a.existing_results))
+        if os.path.exists(a.output) and os.path.abspath(a.output)!=os.path.abspath(a.existing_results or ''):
+            existing.update(load_existing_results(a.output))
+
+    results={}
+    todo=[]
+    reused_existing_results=0
+    skipped_existing_status=0
+    allowed_queue_states={'approved','deferred','confirmed_reject','triaged_only','unreviewed'}
+    for item in items:
+        domain=item['domain']
+        queue_state=(item.get('queue_state') or '').strip()
+        if queue_state and queue_state not in allowed_queue_states:
+            raise ValueError(f'未知 queue_state：{queue_state}（{domain}）')
+        if domain in existing:
+            reused=dict(existing[domain])
+            reused['domain']=domain
+            reused['input']=item
+            results[domain]=reused
+            reused_existing_results+=1
+        elif queue_state and queue_state!='unreviewed':
+            results[domain]=existing_status_placeholder(item)
+            skipped_existing_status+=1
+        else:
+            todo.append(item)
+
+    print(f'BacklinkOS crawler: 总数 {len(items)}，复用 {len(results)}，本次抓取 {len(todo)}，workers={a.workers}', flush=True)
+    done=0
+    with open(a.output,'w',encoding='utf-8') as out:
+        for item in items:
+            if item['domain'] in results:
+                out.write(json.dumps(results[item['domain']],ensure_ascii=False)+'\n')
+        out.flush()
+        if todo:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=a.workers) as ex:
+                futs={ex.submit(probe_domain,item,a.timeout,a.max_probes):item for item in todo}
+                for fut in concurrent.futures.as_completed(futs):
+                    item=futs[fut]
+                    try: r=fut.result()
+                    except Exception as e: r={'domain':item.get('domain',''),'input':item,'home':{'status':0},'pages':[],'errors':[str(e)],'decision':{'bucket':'pending','reason_code':'crawler_exception','reason':'抓取器异常，关键事实未闭环'}}
+                    results[item['domain']]=r
+                    out.write(json.dumps(r,ensure_ascii=False)+'\n'); out.flush(); done+=1
+                    if done%100==0: print(f'{done}/{len(todo)} 本轮新增', flush=True)
+
+    if len(results)!=len(items):
+        raise RuntimeError(f'结果数量无法对齐：候选 {len(items)}，结果 {len(results)}')
+    counts={}
+    for r in results.values():
+        b=r['decision']['bucket']; counts[b]=counts.get(b,0)+1
+    summary={'total':len(items),'reused':len(items)-len(todo),'processed_this_run':len(todo),
+             'reused_existing_results':reused_existing_results,
+             'skipped_existing_status':skipped_existing_status,
+             'counts':counts,'generated_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+    with open(a.output+'.summary.json','w',encoding='utf-8') as f: json.dump(summary,f,ensure_ascii=False,indent=2)
     print(json.dumps(counts), flush=True)
 
 if __name__=='__main__': main()

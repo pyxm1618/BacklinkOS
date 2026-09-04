@@ -26,16 +26,25 @@ jobs:
           python-version: '3.13'
 
       - name: Run triage regression tests
-        run: python -m unittest tests/test_screening_crawler.py -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
-      - name: Build candidate CSV
-        run: |
-          echo 'domain' > /tmp/screening-candidates.csv
-          cat data/screening-candidates/[0-9][0-9][0-9].txt | sed '/^$/d' | sort -u >> /tmp/screening-candidates.csv
-          echo "Candidates: $(($(wc -l < /tmp/screening-candidates.csv)-1))"
+      - name: Build deduplicated incremental input
+        run: >-
+          python scripts/prepare_screening_input.py
+          --candidate-dir data/screening-candidates
+          --existing-results data/screening-results/latest.jsonl
+          --existing-status data/opportunities/internal-status.csv
+          --output /tmp/screening-candidates.csv
+          --manifest screening-input-manifest.json
 
       - name: Crawl candidate domains for preliminary triage
-        run: python scripts/screening_crawler.py --input /tmp/screening-candidates.csv --output screening-results.jsonl --workers 40 --timeout 8
+        run: >-
+          python scripts/screening_crawler.py
+          --input /tmp/screening-candidates.csv
+          --output screening-results.jsonl
+          --existing-results data/screening-results/latest.jsonl
+          --workers 40
+          --timeout 8
 
       - name: Persist latest triage snapshot
         run: |
@@ -55,4 +64,5 @@ jobs:
           path: |
             screening-results.jsonl
             screening-results.jsonl.summary.json
+            screening-input-manifest.json
           if-no-files-found: error

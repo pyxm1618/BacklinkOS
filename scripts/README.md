@@ -2,11 +2,41 @@
 
 Scripts in this directory are executable helpers. They do not automatically define BacklinkOS business semantics.
 
+## `prepare_screening_input.py`
+
+所有正式批量必须先走这个入口。它逐个读取候选文件，合并 Discovery 的
+`refdomain_aggregates`，按规范化域名去重，并根据历史初筛结果与
+`internal-status.csv` 生成完整状态账本。不要再用 `cat 001.txt 002.txt ...` 拼文件；
+任一文件缺少末尾换行都会把两个域名粘成一个。
+
+```bash
+python scripts/prepare_screening_input.py \
+  --candidate-dir data/screening-candidates \
+  --discovery-json outputs/backlinkos-run/02-semrush-01.json \
+  --existing-results data/screening-results/latest.jsonl \
+  --existing-status data/opportunities/internal-status.csv \
+  --output outputs/backlinkos-run/screening-input.csv \
+  --manifest outputs/backlinkos-run/screening-input.manifest.json
+```
+
+账本中的 `approved / deferred / confirmed_reject / triaged_only / unreviewed`
+必须合计为 `combined_unique`。只有 `unreviewed` 进入新的 crawler 请求。
+
 ## `screening_crawler.py`
 
 This crawler is currently used by `.github/workflows/screening-crawler.yml` for large-batch **triage**.
 
 It intentionally performs cheap machine checks and emits preliminary buckets. Those buckets are useful for reducing follow-up work, but they are not equivalent to the final decisions required by the canonical `screening-backlinks` Skill.
+
+正式运行必须传入已有结果；同一域名默认复用，只有明确要求重新抓取时才使用
+`--fresh`：
+
+```bash
+python scripts/screening_crawler.py \
+  --input outputs/backlinkos-run/screening-input.csv \
+  --output outputs/backlinkos-run/screening-results.jsonl \
+  --existing-results data/screening-results/latest.jsonl
+```
 
 Buckets, and what each one is allowed to mean:
 
@@ -57,6 +87,22 @@ Important boundary:
 
 它同样不是最终决策引擎：`处理结果=正式机会` 表示机器已闭环 Follow + 可索引 + 免费措辞，仍应按 Skill 复核后才写入正式外链总表。
 
-The crawler and its regression tests are retained unchanged during repository hygiene cleanup because the GitHub Actions workflow actively depends on them.
+浏览器兜底与最终核验也必须复用已有深入状态。默认不重查
+`internal-status.csv` 里已经有记录的域名；只有显式传
+`--recheck-existing-status` 才重新处理：
+
+```bash
+python scripts/browser_probe.py \
+  --input outputs/backlinkos-run/screening-results.jsonl \
+  --output outputs/backlinkos-run/browser-results.jsonl \
+  --existing-status data/opportunities/internal-status.csv
+
+python scripts/verify_opportunity.py \
+  --input outputs/backlinkos-run/browser-results.jsonl \
+  --out-dir data/opportunities \
+  --existing-status data/opportunities/internal-status.csv
+```
+
+The crawler remains an operational helper used by GitHub Actions; its incremental reuse behavior is covered by regression tests.
 
 Any future change that makes crawler output authoritative must be treated as a separate behavior change with explicit regression tests and a corresponding Screening Skill update.
