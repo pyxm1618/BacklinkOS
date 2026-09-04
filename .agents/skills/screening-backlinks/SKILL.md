@@ -68,19 +68,25 @@ Discovery 已经传来的技术事实直接使用，不重新查询或改写；S
 11. **缺失事实不是负面事实。** “没找到入口/页面”本身不等于回收；AS=0、历史 0 Follow、历史 100% Follow 都不能单独决定当前处理结果。详见 `references/screening-rules.md`。
 12. 如果 domain-level 事实不足、但精确历史来源页可能帮助识别机制，返回 `source_url_enrichment_required` 给 `discovering-backlinks`，写明 `referring_domain | source_projects | reason`。Screening 不自己猜历史 source URL。
 13. 迁移运行表数据时遵守 target-first 安全写入：目标写入 → 回读确认 → 再清源数据；不得破坏 ARRAYFORMULA/公式列。详见 `references/screening-rules.md`。
+14. **正式批量只能从增量总账开始。** 先用仓库根目录的 `scripts/prepare_screening_input.py` 合并旧候选、本次发现、已有粗筛结果和已有深筛状态。固定的旧候选文件不是当前待处理清单，不能直接拿来重跑。
+15. **默认复用已有结果。** 已有粗筛结果必须复用，已有深筛状态必须复用；旧结论保留原证据和日期。新请求只处理当前总账中 `queue_state=unreviewed` 的候选，其他候选不得再次消耗网络请求和工具额度。
+16. **重新检查必须由用户明确要求。** `--fresh`、全量重跑、对已有状态重新检查，都不能作为默认动作；用户没有明确要求时，不得为了“保险”重复处理。
+17. **运行前后都要对账。** 核对 `approved + deferred + confirmed_reject + triaged_only + unreviewed = 合并后总数`；任何条目都不能因缺证据、没进保留名单或本轮未复查而被当成回收。数量不平就停止并修正总账。
 
 ## 流程
 
-1. 按“网站 + 外链形式 + 操作入口”去重；同一网站不同入口可以是不同机会。
-2. 优先识别可被同一证据覆盖的网络/域名家族，批量处理有闭环证据的 PBN、卖链、自动垃圾页、Nofollow 网络，减少逐站重复劳动。
-3. 对剩余独立候选找到当前真实操作入口。
-4. 判断获取方式：免费 / 免费换链 / 付费 / 不确定。
-5. 用**当前同一路径产生的公开页面**验证最终链接；先确定正在判断的是价格/资格还是 `rel`/indexability 等技术输出，再按对应证据优先级解决冲突。
-6. 如果 exact historical source page 是关键缺口，返回 `source_url_enrichment_required`；收到 Discovery 补证后继续本候选，不因等待补证而强判。
-7. 按 [references/screening-rules.md](references/screening-rules.md) 得出处理结果：正式机会 / 付费排除 / 回收 / 待确认。
-8. `正式机会` 写入“外链总表”；只有总表以前没有的机会才追加到“新增记录”。
-9. `付费排除`、`回收`、`待确认` 分开保留，不互相冒充，也不混进正式外链总表。
-10. 每轮写入后重新统计 `待筛选`；全量模式下若仍大于 0，继续下一批，不把“本轮写入成功”当成任务完成。
+1. 用 `scripts/prepare_screening_input.py` 生成增量总账和对账清单；只在数量完全对平后继续。
+2. 向粗筛程序传入已有粗筛结果，向浏览器复核和最终判定程序传入已有深筛状态；默认复用，不重查。
+3. 只取 `queue_state=unreviewed` 的候选作为本轮新任务，再按“网站 + 外链形式 + 操作入口”去重；同一网站不同入口可以是不同机会。
+4. 优先识别可被同一证据覆盖的网络/域名家族，批量处理有闭环证据的 PBN、卖链、自动垃圾页、Nofollow 网络，减少逐站重复劳动。
+5. 对剩余独立候选找到当前真实操作入口。
+6. 判断获取方式：免费 / 免费换链 / 付费 / 不确定。
+7. 用**当前同一路径产生的公开页面**验证最终链接；先确定正在判断的是价格/资格还是 `rel`/indexability 等技术输出，再按对应证据优先级解决冲突。
+8. 如果 exact historical source page 是关键缺口，返回 `source_url_enrichment_required`；收到 Discovery 补证后继续本候选，不因等待补证而强判。
+9. 按 [references/screening-rules.md](references/screening-rules.md) 得出处理结果：正式机会 / 付费排除 / 回收 / 待确认。
+10. `正式机会` 写入“外链总表”；只有总表以前没有的机会才追加到“新增记录”。
+11. `付费排除`、`回收`、`待确认` 分开保留，不互相冒充，也不混进正式外链总表。
+12. 每轮写入后重新生成状态统计并对账；全量模式下若 `unreviewed` 仍大于 0，继续下一批，不把“本轮写入成功”当成任务完成。
 
 ## 正式结果
 

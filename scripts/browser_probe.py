@@ -8,13 +8,11 @@ Chromium，分析和判定仍复用 screening_crawler 的 analyze_html / classif
 
 只提取 rel / noindex / 链接字段，不截图、不落 HTML。
 """
-import argparse, json, multiprocessing, os, re, shutil, sys, threading, time
+import argparse, csv, json, multiprocessing, os, re, shutil, sys, threading, time
 from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from screening_crawler import analyze_html, classify_probe, COMMON_PATHS
-
-from playwright.sync_api import sync_playwright
 
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
@@ -136,6 +134,8 @@ def worker(domains, max_paths, shard_path, cur_path):
     所以这里每跑一个域名先把域名写进 cur_path，父进程发现卡住就 kill 并据此
     记录是哪个域名超时。shard 逐条 flush，被 kill 也不会丢已完成的。
     """
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         b, ctx = _new_browser(p)
         with open(shard_path, 'a', encoding='utf-8') as fh:
@@ -256,6 +256,21 @@ def load_shards(shard_dir):
     return done
 
 
+def load_status_domains(path):
+    """已有深入筛选状态的域名默认不再跑浏览器。"""
+    domains = set()
+    if not path or not os.path.exists(path):
+        return domains
+    with open(path, newline='', encoding='utf-8-sig') as fh:
+        for row in csv.DictReader(fh):
+            domain = (row.get('Domain') or '').strip().lower()
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            if domain:
+                domains.add(domain)
+    return domains
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True, help='crawler 输出的 jsonl')
@@ -266,20 +281,27 @@ def main():
     ap.add_argument('--shard-dir', default='', help='断点目录，默认 <output>.shards')
     ap.add_argument('--fresh', action='store_true', help='忽略已有断点，从头跑')
     ap.add_argument('--budget', type=int, default=75, help='单域名墙钟预算（秒）')
+    ap.add_argument('--existing-status', default='', help='已有深入筛选状态 CSV；其中域名默认跳过')
+    ap.add_argument('--recheck-existing-status', action='store_true', help='明确要求重查已有深入状态')
     a = ap.parse_args()
 
     records = [json.loads(l) for l in open(a.input, encoding='utf-8') if l.strip()]
-    stuck = [r['domain'] for r in records
-             if r.get('decision', {}).get('reason_code') in ('blocked_or_uncertain', 'browser_exception', 'browser_timeout')]
+    stuck_all = [r['domain'] for r in records
+                 if r.get('decision', {}).get('reason_code') in ('blocked_or_uncertain', 'browser_exception', 'browser_timeout')]
+    status_domains = set() if a.recheck_existing_status else load_status_domains(a.existing_status)
+    skipped_status = [d for d in stuck_all if d in status_domains]
+    stuck = [d for d in stuck_all if d not in status_domains]
     if a.limit:
         stuck = stuck[:a.limit]
+    print(f'已有深入状态跳过 {len(skipped_status)}', flush=True)
 
     shard_dir = a.shard_dir or (a.output + '.shards')
     if a.fresh and os.path.isdir(shard_dir):
         shutil.rmtree(shard_dir)
     os.makedirs(shard_dir, exist_ok=True)
 
-    fixed = load_shards(shard_dir)
+    stuck_set = set(stuck)
+    fixed = {d: r for d, r in load_shards(shard_dir).items() if d in stuck_set}
     todo = [d for d in stuck if d not in fixed]
     print(f'需要浏览器兜底：{len(stuck)}（已完成 {len(stuck) - len(todo)}，本次跑 {len(todo)}）', flush=True)
 
@@ -307,7 +329,7 @@ def main():
             supervise(slots, a.max_paths, a.budget)
         finally:
             stop.set()
-        fixed = load_shards(shard_dir)
+        fixed = {d: r for d, r in load_shards(shard_dir).items() if d in stuck_set}
 
     counts = {}
     with open(a.output, 'w', encoding='utf-8') as out:

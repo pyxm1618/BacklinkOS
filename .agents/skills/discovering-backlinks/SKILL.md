@@ -31,6 +31,7 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 18. **Semrush 暂时不可用时只积累项目事实。** 内部状态可记为 `pending_semrush`；当前 Google Sheet `项目池` 落表必须沿用既有 schema：`SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`。不得把字面值 `pending_semrush` 写进现有状态列，也不得填造 Organic、qualified、RD 或 backlink 字段。
 19. **允许按需做 source URL enrichment。** Screening 若无法从 domain-level 事实闭环机制，可返回 `source_url_enrichment_required`；Discovery 只补精确历史来源页事实，不替 Screening 作最终判断。详细合同见 `references/screening-handoff.md`。
 20. **`successful_project_count` 只用于排序，不用于淘汰。** 覆盖项目多的候选先交 Screening，但只被 1 个项目引用的域名同样保留在候选池里——它可能就是一个还没被用烂的好机会。任何阶段都不因为这个数字丢弃候选。
+21. **交给 Screening 前必须建立增量总账。** 用仓库根目录的 `scripts/prepare_screening_input.py` 把旧候选库与本次 Discovery 发现结果合并去重，同时读取已有粗筛结果和已有深筛状态；核对总数满足“旧库 + 新发现 - 重叠 = 合并后总数”，且各状态数量之和等于合并后总数，才允许开始 Screening。不得跳过这一步后直接拿固定旧名单、旧候选文件或本次发现文件单独开跑。
 
 ## 每批怎么跑
 
@@ -42,8 +43,9 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 6. 对通过项目抓 Referring Domains；默认根据 `refdomains.total` 自动分页抓完整。如果明确配置了抓取上限，必须保留 complete/partial 状态。
 7. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
 8. 按 referring domain 聚合成功项目覆盖数和出现次数；记录它在 BacklinkOS 中是首次出现还是历史已见。
-9. 把 domain-level 候选交给 `screening-backlinks`。Discovery 的默认阶段到此结束。
-10. 如果 Screening 返回 `source_url_enrichment_required`，按 `references/screening-handoff.md` 仅对请求的 referring domain / source projects 补充精确来源页事实，再把事实返回 Screening。
+9. 用 `scripts/prepare_screening_input.py` 合并旧候选库、本次 domain-level 发现结果、已有粗筛结果和已有深筛状态；保存完整 CSV 与对账清单。对账不平时停止并修正输入，不得启动 Screening。
+10. 只把对账通过的增量总账交给 `screening-backlinks`。Discovery 的默认阶段到此结束。
+11. 如果 Screening 返回 `source_url_enrichment_required`，按 `references/screening-handoff.md` 仅对请求的 referring domain / source projects 补充精确来源页事实，再把事实返回 Screening。
 
 ## Source URL enrichment
 

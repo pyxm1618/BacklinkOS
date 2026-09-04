@@ -22,7 +22,7 @@ jobs:
           node-version: '22'
 
       - name: Install Node dependencies
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
 
       - name: Run TypeScript tests
         run: npm test
@@ -36,4 +36,4 @@ jobs:
           python-version: '3.13'
 
       - name: Run crawler regression tests
-        run: python -m unittest tests/test_screening_crawler.py -v
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
