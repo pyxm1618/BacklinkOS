@@ -22,7 +22,7 @@ jobs:
           node-version: '22'
 
       - name: Install Node dependencies
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts --registry=https://registry.npmjs.org
 
       - name: Run TypeScript tests
         run: npm test
