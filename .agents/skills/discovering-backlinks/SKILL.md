@@ -42,20 +42,27 @@ backlink-autofill
 2. **唯一控制面与总表 Upsert 契约。** 控制面以 `@外链管理总控表` 为唯一准绳。平台级唯一事实库为 `外链总表`（基础状态仅有：`候选`、`已排除`、`失效`）。
    - 每发现一个 referring domain，先 canonicalize（剥离 http/https、www、小写、剥离 trailing slash 及 path/query）。
    - **外链ID = canonical domain，平台域名 = canonical domain**（外链ID 是稳定 join key）。
+   - **`upsert_master_rows` 彻底禁止写入提交入口**：只负责平台域名与来源 provenance 合并；新行 `提交入口` 默认必为空，已有行绝不更新 `提交入口`。提交入口严格只能由真实 Entry Enrichment orchestration 核验成功后写入。
    - 若域名不存在：新增记录，`基础状态=候选`，记录真实发现来源与时间，实测字段留空。
    - 若域名已存在：**不得重复创建**，不得覆盖已有真实执行字段，**绝不得将`已排除`或`失效`重新改成`候选`**，新发现只能补充安全的 provenance 信息。
 3. **硬黑名单直接来自外链总表。** 若发现 domain 查询显示 `基础状态=已排除` 或 `基础状态=失效`，则视为历史已知硬负例：不重复研究，不重新进入项目执行队列，不覆盖排除原因，记录历史事实即可。不再维护第二套独立黑名单数据库。
 4. **最低限度 Submission Entry Enrichment。** 对于 `基础状态=候选` 的平台，在进入项目执行队列前确认真实可执行入口：
    - 严格区分两层：**Live Evidence（真实打开页面检测到实际机制文案/控件，或首页明确 CTA） → Candidate URL → Policy Guard 校验 → 写入 Sheet**。
    - **禁止 URL path 单独升级为入口：** 仅凭路径类似 `/submit` 且 HTTP 200 绝不足以成为有效入口，页面必须有实际提交/收录/建链机制文案（`mechanism_signals`）。普通文章或空白页坚决拒绝。
-   - **登录/注册墙 noindex 防误杀：** 复用 `AUTH_PATH_RE`；若页面属于登录/注册墙（如 `/login`, `/auth`），其带 noindex 是正常现象，只要具备机制文案或登录跳转特征，绝不误杀。
+   - **Entry 表单与首页不因 noindex 筛掉：** Entry discovery 不以 indexability 淘汰。表单页或首页带 noindex 绝不阻断后续真实机制入口的发现。
+   - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（`AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时，认定为有效入口。
+     - **来源证明严格要求：** 页面缺少机制文案时，必须要求具备真实页面 CTA/link 发现依据（`ENTRY_HINTS` 只能用于探测，绝不得作为来源证据）；
+     - **历史 Master Entry 不默认放行：** 默认未经来源证明，不能因为跳转 `/login?redirect=/submit` 自动升级；
+     - **保留原始稳定 Submission URL：** `VerifiedEntry.url` 记录原始稳定的 entry URL，而不是带有会话参数的 `/login?...` 临时 URL，证据摘要不记录完整 query/token；
+     - **Callback 同源校验：** callback 若为绝对 URL，必须验证 hostname 与平台同源；外部跨域 callback 坚决拒绝。
    - 严禁乱填：pricing、terms、privacy、category、SEO report、普通 article、自动统计页、unrelated landing page 绝不能冒充提交入口。
    - 平台首页：只有真实确认首页存在明确的提交/收录/建链 CTA 时（如 Submit your product, Create profile, Sign up to list, Add your site）才允许作为提交入口；否则绝不能拿首页填空。
    - **找不到入口时：提交入口继续为空，候选继续保留。绝对不因为找不到入口而把候选标记为已排除！**
    - 严禁在这个阶段提前根据 Follow/Nofollow/DR/免费性等淘汰候选。
 5. **项目执行行 Materialization 契约。** Discovery 必须运行在**明确项目上下文**中（例如 `当前项目 = quick-iching`）：
-   - **已有历史提交入口不得绕过核验：** 总表现存历史 `提交入口` 必须通过 Live Verification 产生/确认的 `VerifiedEntry`，才能建立项目待提交行；现场核验不通过则不 materialize，保持候选，且不随意替换原 URL。
-   - 仅当满足：`外链总表.基础状态 == 候选` AND `具备现场核验通过的 VerifiedEntry` AND `当前 project_id + backlink_id 尚不存在` 时，才在 `外链管理` 创建待提交行。
+   - **内部 Live Verification 流程驱动：** 生产队列 Materialization 必须由内部 live verification 流程驱动，严禁外部调用者手造 `VerifiedEntry` 绕过现场核验；
+   - **已有历史提交入口不得绕过核验：** 总表现存历史 `提交入口` 必须通过内部 Live Verification 现场核验产生真实证据，才能建立项目待提交行；现场核验不通过则不 materialize，保持候选，且不随意替换原 URL。
+   - 仅当满足：`外链总表.基础状态 == 候选` AND `经由内部核验产生真实证据` AND `当前 project_id + backlink_id 尚不存在` 时，才在 `外链管理` 创建待提交行。
    - 待提交行默认值：`项目ID=当前项目ID`、`外链ID=canonical domain`、`外链域名=canonical domain`、`状态=待提交`、`尝试次数=0`、`目标URL=空（除非明确指定深链）`、其他结果字段留空。
    - **绝对不能创建重复项目行：** `project_id + backlink_id` 唯一。若已存在（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用 任何一种），绝不重新创建或重置为待提交。Quick I Ching 已有历史记录必须优先保护。
 6. **存量池严格双边界 Bounded Batch Hydration。** 支持对总表存量候选池按批次进行 Hydration：

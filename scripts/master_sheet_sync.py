@@ -254,13 +254,16 @@ def check_auth_wall_callback_evidence(
     """检查是否属于真实合法的 /submit -> /login 重定向证据链。
     
     必须满足以下完整事实链条：
-    1. 原始请求 req_url 必须通过 Policy Guard，且具有入口依据：
-       - 来自平台 CTA / 页面链接（is_discovered_candidate=True）
-       - 或其 path 命中 ENTRY_HINTS（如 /submit, /add-tool 等）；
+    1. 原始请求 req_url 必须通过 Policy Guard，且必须具备真实页面发现的 candidate/CTA 来源证据
+       （严格执行：ENTRY_HINTS 仅能作为 probe hint，绝不得单独充当来源证据！必须 is_discovered_candidate=True）；
     2. 跳转后的 final_url 必须通过 Policy Guard，且属于同平台（canonical_domain 一致）；
     3. final_url 的 path 命中 AUTH_PATH_RE（登录/注册/认证墙）；
     4. final_url 的 query 参数中明确包含指向提交流程的回调/跳转参数（如 redirect=/submit, next=/add 等）；
-    5. 重定向目标参数解析出的路径本身必须通过 Policy Guard 且包含提交机制意图（非 pricing 等排除路径）。
+    5. 重定向目标参数：
+       - 若为绝对 URL，必须严格校验 callback hostname 与平台同源；外部跨域 callback 坚决拒绝；
+       - 若为相对 URL，按平台路径处理；
+       - 该 callback 路径必须通过 Policy Guard 且包含提交机制意图（非 pricing 等排除路径）；
+    6. 证据摘要仅记录目标回调路径，严禁记录敏感 query/token。
     """
     cd = canonical_domain(domain)
     if not cd:
@@ -270,10 +273,10 @@ def check_auth_wall_callback_evidence(
     if not req_ok:
         return False, f"原始请求未通过 Policy Guard: {req_reason}"
         
-    req_path = (urlparse(req_url).path or "/").strip()
-    is_hint_path = bool(ENTRY_HINTS.search(req_path))
-    if not is_discovered_candidate and not is_hint_path:
-        return False, "原始请求缺乏入口来源证据（非发现候选且非提示路径）"
+    # 严格规则：页面无 mechanism 时，必须有真实页面发现的 candidate/CTA 来源证据！
+    # ENTRY_HINTS 只能用于探测，绝不得充当来源证据！
+    if not is_discovered_candidate:
+        return False, "缺乏真实页面发现的 candidate/CTA 来源证据（禁止仅凭 URL 路径猜测）"
         
     final_ok, final_reason = submission_entry_policy_guard(final_url, domain=cd)
     if not final_ok:
@@ -284,24 +287,40 @@ def check_auth_wall_callback_evidence(
     if not AUTH_PATH_RE.search(final_path):
         return False, f"最终跳转路径非认证墙: {final_path}"
         
+    req_path = (urlparse(req_url).path or "/").strip()
     qs = parse_qs(parsed_final.query)
     found_valid_callback = False
-    callback_val = ""
+    callback_path = ""
     
     for k, vals in qs.items():
         k_lower = k.lower()
         if k_lower in AUTH_REDIRECT_PARAMS or "redirect" in k_lower or "return" in k_lower or "next" in k_lower:
             for v in vals:
                 decoded = unquote(v).strip()
-                dec_path = urlparse(decoded).path if "://" in decoded else decoded.split("?")[0]
-                if dec_path:
+                parsed_cb = urlparse(decoded)
+                
+                # 校验绝对 URL vs 相对 URL
+                if parsed_cb.scheme or parsed_cb.netloc:
+                    cb_host = (parsed_cb.hostname or "").lower()
+                    if cb_host.startswith("www."):
+                        cb_host = cb_host[4:]
+                    # 必须同源，拒绝外部第三方 URL
+                    if cb_host != cd and not cb_host.endswith("." + cd):
+                        return False, f"认证跳转回调跨域外部域名: {cb_host} != {cd}"
+                    cb_path = (parsed_cb.path or "/").strip()
+                else:
+                    cb_path = decoded.split("?")[0].strip()
+                    if not cb_path.startswith("/"):
+                        cb_path = "/" + cb_path
+                
+                if cb_path:
                     # 检查是否命中排除路径（比如 redirect=/pricing 绝对不行）
                     for p in INVALID_ENTRY_PATH_PATTERNS:
-                        if p.search(dec_path):
-                            return False, f"认证跳转回调指向排除路径: {dec_path}"
-                    if ENTRY_HINTS.search(dec_path) or (req_path != "/" and req_path in dec_path):
+                        if p.search(cb_path):
+                            return False, f"认证跳转回调指向排除路径: {cb_path}"
+                    if ENTRY_HINTS.search(cb_path) or (req_path != "/" and req_path in cb_path):
                         found_valid_callback = True
-                        callback_val = decoded
+                        callback_path = cb_path
                         break
         if found_valid_callback:
             break
@@ -309,13 +328,15 @@ def check_auth_wall_callback_evidence(
     if not found_valid_callback:
         return False, "认证跳转页面未包含明确返回提交流程的回调参数"
         
-    return True, f"访问提交入口触发平台认证墙，回调参数明确返回提交流程 ({callback_val}): {final_url}"
+    # 证据摘要仅记录目标回调路径与认证墙路径，绝不记录完整 query/token
+    return True, f"访问提交入口触发平台认证墙，登录后重定向回提交流程 ({callback_path}): {final_path}"
 
 
 def verify_submission_entry(
     domain: str,
     entry_url: str,
     fetcher: Callable[[str], dict] | None = None,
+    is_discovered_candidate: bool = False,
 ) -> tuple[VerifiedEntry | None, str]:
     """对已有（例如历史存量或指定）的 entry_url 进行现场真实页面证据核验（Live Verification）。
     
@@ -324,9 +345,10 @@ def verify_submission_entry(
     2. 现场打开页面：
        - 检查 final_url 是否依然通过 Policy Guard（P0-3 必须验证 redirect 后 final_url，防止逃逸到 pricing 或跨域）；
        - 若是首页，必须通过 verify_homepage_as_entry（页面内有明确 CTA 机制证据）；
-       - 若触发认证墙跳转（如 /submit -> /login?redirect=/submit），检查合法的回调证据链（P1-5）；
-       - 若是子页面，必须具备明确机制信号（mechanism_signals）；单纯 HTTP 200 + URL 路径含 submit 绝不足以成为证据（P0-1）；
-       - noindex 处理：提交入口页面本身不因 noindex 筛掉，只要机制真实且符合 Guard（P1-4）；
+       - 若触发认证墙跳转（如 /submit -> /login?redirect=/submit），严格要求已证实来源证据（默认 is_discovered_candidate=False，历史存量未经证明不得盲目升级）；
+         核验成功时 VerifiedEntry.url 保留原始稳定 entry_url，不写入带会话参数的 /login URL；
+       - 若是子页面，必须具备明确机制信号（mechanism_signals）；单纯 HTTP 200 + URL 路径含 submit 绝不足以成为证据；
+       - noindex 处理：提交入口页面本身不因 noindex 筛掉，只要机制真实且符合 Guard；
     3. 验证成功返回 (VerifiedEntry, 成功说明)；
     4. 验证失败返回 (None, 失败理由)。
     """
@@ -364,33 +386,43 @@ def verify_submission_entry(
             ), cta_reason
         return None, f"首页未包含有效机制 CTA: {cta_reason}"
 
-    # P1-5 修复：支持真实 /submit -> /login?redirect=/submit 的认证墙回调证据
-    is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
-        req_url=entry_url,
-        final_url=final_url,
-        domain=cd,
-        is_discovered_candidate=True,
-    )
-    if is_auth_callback:
-        return VerifiedEntry(
-            url=final_url,
-            domain=cd,
-            evidence_type="auth_wall_submission",
-            evidence_summary=auth_reason,
-        ), "现场核验通过 (认证墙回调证据)"
-
-    # P0-1 核心守卫：非认证墙回调的子页面必须有真实机制文案/控件（mechanism_signals）
+    is_auth_wall = bool(AUTH_PATH_RE.search(path))
     has_mech = bool(res.get("mechanism_signals"))
+
+    if is_auth_wall:
+        is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
+            req_url=entry_url,
+            final_url=final_url,
+            domain=cd,
+            is_discovered_candidate=is_discovered_candidate,
+        )
+        if is_auth_callback:
+            # 保留原始稳定 submission URL，而不是带 token 或 query 的 /login URL
+            return VerifiedEntry(
+                url=entry_url,
+                domain=cd,
+                evidence_type="auth_wall_submission",
+                evidence_summary=auth_reason,
+            ), "现场核验通过 (认证墙回调证据)"
+        elif has_mech:
+            return VerifiedEntry(
+                url=final_url,
+                domain=cd,
+                evidence_type="auth_wall_submission",
+                evidence_summary=f"现场核验通过: 机制信号 {res.get('mechanism_signals')}",
+            ), "现场核验通过"
+        else:
+            return None, auth_reason
+
+    # P0-1 核心守卫：非认证墙普通子页面必须有真实机制文案/控件（mechanism_signals）
     if not has_mech:
         return None, "页面虽返回 200 但未检测到实际提交/收录/建链机制文案（拒绝仅凭 URL 路径臆想）"
         
     # P1-4 修复：页面本身无论是否标记 noindex，只要机制真实且符合 Guard，均不被误杀
-    is_auth_wall = bool(AUTH_PATH_RE.search(path))
-    evidence_type = "auth_wall_submission" if is_auth_wall else "subpage_mechanism"
     return VerifiedEntry(
         url=final_url,
         domain=cd,
-        evidence_type=evidence_type,
+        evidence_type="subpage_mechanism",
         evidence_summary=f"现场核验通过: 机制信号 {res.get('mechanism_signals')}",
     ), "现场核验通过"
 
@@ -404,11 +436,12 @@ def discover_and_verify_entry(
     
     流程：
     1. 访问首页（裸域/www 双试，由 fetch_page/probe 处理）；
+       - 删除 homepage noindex 阻断逻辑：entry discovery 不以 indexability 淘汰；
     2. 获取首页 candidate_urls（按 strong/weak 排序）与 COMMON_PATHS；
     3. 访问子页面，寻找包含真实 mechanism 信号或合法 auth wall 回调的页面：
        - 严格执行 P0-1：只有返回 200 且真正包含 mechanism_signals 或合法 auth wall 回调才算真入口；单纯路径像 submit 坚决不通过；
        - 严格执行 P1-4：Entry 页面本身不因 noindex 筛掉；
-       - 严格执行 P1-5：支持真实 /submit -> /login?redirect=/submit 回调证据链；
+       - 严格执行 P1-5：支持真实 /submit -> /login?redirect=/submit 回调证据链，auth wall 成功时保留原始稳定 target_url；
        - 严格执行 P0-3：任何最终跳转 URL 必须重新通过 Policy Guard；
     4. 对候选 URL 跑 submission_entry_policy_guard；
     5. 若找到真实子页面入口，返回 (VerifiedEntry, 成功理由)；
@@ -440,8 +473,7 @@ def discover_and_verify_entry(
     if not home or home.get("status") != 200:
         return None, f"站点首页不可达 (HTTP {home.get('status') if home else 0})"
         
-    if home.get("noindex"):
-        return None, "首页标记 noindex"
+    # 删除原先的 if home.get("noindex"): return None 逻辑，entry discovery 不受 homepage noindex 阻断
 
     base_url = home.get("final_url") or f"https://{cd}/"
     candidate_urls = list(home.get("candidate_urls") or [])
@@ -486,8 +518,9 @@ def discover_and_verify_entry(
             is_discovered_candidate=is_from_candidate_list,
         )
         if is_auth_callback:
+            # 保留原始稳定 target_url，而不是带 token 或 query 的 final_url
             return VerifiedEntry(
-                url=final_url,
+                url=target_url,
                 domain=cd,
                 evidence_type="auth_wall_submission",
                 evidence_summary=auth_reason,
@@ -590,19 +623,14 @@ def upsert_master_rows(
         discovery_source = str(item.get("discovery_source") or item.get("发现来源") or "").strip()
         discovery_time = str(item.get("discovery_time") or item.get("发现时间") or now_iso).strip()
         
-        # P0-1 严格守卫：普通新 discovery 写入总表，提交入口必须默认保持空！
-        # 坚决禁止任何未经现场真实核验（Live Verification）的普通字符串 URL 写入提交入口。
-        # 只有在显式提供了合法且域匹配的 VerifiedEntry 凭据对象时，才允许记录提交入口。
-        submit_entry = ""
-        v_entry = item.get("verified_entry")
-        if isinstance(v_entry, VerifiedEntry) and canonical_domain(v_entry.domain) == cid and v_entry.url:
-            submit_entry = v_entry.url
-        
+        # 彻底禁止从 new_discoveries 的普通字符串或 VerifiedEntry 写提交入口！
+        # upsert_master_rows 只负责平台域名与来源 provenance 合并。
+        # 提交入口只能由真实 Entry Enrichment orchestration 核验成功后写入。
         if cid not in master_map:
             new_row = {col: "" for col in MASTER_HEADER}
             new_row["外链ID"] = cid
             new_row["平台域名"] = cid
-            new_row["提交入口"] = submit_entry
+            new_row["提交入口"] = ""
             new_row["发现来源"] = discovery_source
             new_row["发现时间"] = discovery_time
             new_row["基础状态"] = MASTER_STATUS_CANDIDATE
@@ -625,9 +653,6 @@ def upsert_master_rows(
                 updated = True
             if not existing.get("发现时间") and discovery_time:
                 existing["发现时间"] = discovery_time
-                updated = True
-            if not existing.get("提交入口") and submit_entry:
-                existing["提交入口"] = submit_entry
                 updated = True
                 
             if updated:

@@ -73,14 +73,14 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 ### 如果域名不存在
 - 新增行：`外链ID=canonical domain`、`平台域名=canonical domain`、`基础状态=候选`、`发现来源=本次真实来源`、`发现时间=本次时间`。
-- **提交入口默认保持为空**：禁止任何未经 Live Verification 的普通字符串 URL 直接写入总表 `提交入口`。只有在通过现场真实核验（Live Verification）产出凭据时才允许记录。
+- **提交入口严格保持为空**：`upsert_master_rows` 彻底禁止写入提交入口（无论普通字符串还是 VerifiedEntry），纯粹负责 domain 和 provenance upsert。提交入口只能由真实 Entry Enrichment orchestration 核验成功后写入。
 - 其余未知字段及 5 个实测事实字段严格留空。
 
 ### 如果域名已存在
 - **绝不重复创建新行**；
 - **绝不覆盖已有真实执行字段**（`实测免费`、`实测需登录`、`实测登录方式`、`实测限制`、`实测链接属性`、`最后验证时间`）；
 - **绝不得把`已排除`或`失效`重新改成`候选`**；
-- 仅允许补充安全的 provenance 信息（如原有发现来源为空时补充），禁止普通字符串覆盖或写入 `提交入口`。
+- 仅允许补充安全的 provenance 信息（如原有发现来源为空时补充），绝不更新 `提交入口`。
 
 ### 硬黑名单机制
 如果查询发现总表中域名的 `基础状态 == 已排除` 或 `基础状态 == 失效`：
@@ -98,8 +98,12 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 1. **Live Evidence（真实页面证据）**：
    - 实际请求目标页面（HTTP 200，同源）；
    - **禁止 URL path 单独升级为入口：** 仅凭路径含 submit 且 HTTP 200 绝不足以成为有效入口，页面内必须实际包含机制文案/交互控件（`mechanism_signals` 如 "submit your tool", "add website", "write for us"）。普通页面或空白页断然拒绝；
-   - **Entry 页面本身不因 noindex 筛掉：** 提交入口表单是否 indexable 不属于价值判断条件（Indexability 属于最终建链上线结果页的验证职责）。只要机制文案真实且符合 Policy Guard，即使标记了 `noindex`，也认定为有效 Verified Entry；
-   - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（命中 `AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时（如 `redirect=/submit`, `next=%2Fsubmit` 等），认定为合法 `auth_wall_submission`；但无回调参数的盲猜跳转坚决拒绝；
+   - **Entry 表单与首页不因 noindex 筛掉：** Entry discovery 不以 indexability 淘汰。表单页或首页带 noindex 绝不阻断后续真实机制入口的发现；
+   - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（`AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时，认定为有效入口。
+     - **来源证明严格要求：** 页面缺少机制文案时，必须要求具备真实页面 CTA/link 发现依据（`ENTRY_HINTS` 只能用于探测，绝不得作为来源证据）；
+     - **历史 Master Entry 不默认放行：** 默认未经来源证明，不能因为跳转 `/login?redirect=/submit` 自动升级；
+     - **保留原始稳定 Submission URL：** `VerifiedEntry.url` 记录原始稳定的 entry URL，而不是带有会话参数的 `/login?...` 临时 URL，证据摘要不记录完整 query/token；
+     - **Callback 同源校验：** callback 若为绝对 URL，必须验证 hostname 与平台同源；外部跨域 callback 坚决拒绝；
    - 首页必须确认页面本身具有明确的机制 CTA 文案（如 "Submit your tool", "Create profile to list"），不能无证据拿首页填空。
 2. **Policy Guard（政策守卫拦截与 Redirect 验证）**：
    - 必须是 http/https 且同源；

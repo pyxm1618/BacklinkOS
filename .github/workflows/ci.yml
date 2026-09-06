@@ -35,5 +35,5 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Run crawler regression tests
-        run: python -m unittest tests/test_screening_crawler.py -v
+      - name: Run Python regression tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

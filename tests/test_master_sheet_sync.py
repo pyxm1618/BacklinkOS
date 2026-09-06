@@ -74,6 +74,28 @@ class MasterSheetUpsertTests(unittest.TestCase):
             "禁止任何未经 live verification 的字符串 URL 进入提交入口！"
         )
 
+    def test_forged_verified_entry_cannot_write_submission_entry_via_upsert(self):
+        # 回归测试：即便外部手工伪造 VerifiedEntry 传入 new_items，upsert 也绝对不写入提交入口！
+        forged_entry = VerifiedEntry(
+            url="https://forged.com/submit",
+            domain="forged.com",
+            evidence_type="subpage_mechanism",
+            evidence_summary="forged",
+        )
+        existing = []
+        new_items = [{
+            "referring_domain": "forged.com",
+            "verified_entry": forged_entry,
+            "submission_entry": "https://forged.com/submit",
+            "discovery_source": "toolify",
+        }]
+        merged, stats = upsert_master_rows(existing, new_items)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(
+            merged[0]["提交入口"], "",
+            "upsert_master_rows 彻底禁止写入提交入口，即便是 VerifiedEntry 也必须保持为空！"
+        )
+
     def test_existing_domain_not_duplicated(self):
         existing = [{
             "外链ID": "existing.com",
@@ -305,6 +327,7 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
     def test_p1_5_auth_wall_submission_with_redirect_callback_is_verified(self):
         # P1-5: 请求 example.com/submit，跳到 example.com/login?redirect=/submit
         # 登录页本身未再写机制文案，但保留了原始 candidate 请求 + auth wall + 回调参数的完整事实链
+        # 验证保留原始稳定 submission URL（不是带 query 的 login URL）
         def fake_fetch(url):
             return {
                 "status": 200,
@@ -312,11 +335,121 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
                 "mechanism_signals": [],  # 登录页通常仅有 Sign In 文案
                 "noindex": True,
             }
-        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        entry_obj, reason = verify_submission_entry(
+            "example.com",
+            "https://example.com/submit",
+            fetcher=fake_fetch,
+            is_discovered_candidate=True,
+        )
         self.assertIsNotNone(entry_obj, "包含明确回跳提交参数的认证墙应当作为有效入口核验通过！")
-        self.assertEqual(entry_obj.url, "https://example.com/login?redirect=%2Fsubmit")
+        self.assertEqual(entry_obj.url, "https://example.com/submit", "必须保留原始稳定 submission URL！")
         self.assertEqual(entry_obj.evidence_type, "auth_wall_submission")
-        self.assertIn("认证墙回调", reason)
+        self.assertIn("认证墙", reason)
+
+    def test_guessed_submit_with_auth_callback_is_rejected_without_candidate_evidence(self):
+        # 盲猜 /submit（无页面 CTA/link 发现证据），即使触发 auth callback 也坚决拒绝！
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://guessed.com/login?redirect=%2Fsubmit",
+                "mechanism_signals": [],
+            }
+        entry_obj, reason = verify_submission_entry(
+            "guessed.com",
+            "https://guessed.com/submit",
+            fetcher=fake_fetch,
+            is_discovered_candidate=False,
+        )
+        self.assertIsNone(entry_obj, "盲猜 /submit 触发 auth callback 仍然不够，必须拒绝！")
+        self.assertIn("缺乏真实页面发现", reason)
+
+    def test_discovered_candidate_submit_with_auth_callback_is_verified(self):
+        # 真实 homepage 发现的 candidate /submit + auth callback 可以通过
+        def fake_fetch(url):
+            if url == "https://discovered-site.com/":
+                return {
+                    "status": 200,
+                    "final_url": "https://discovered-site.com/",
+                    "candidate_urls": ["https://discovered-site.com/submit"],
+                    "mechanism_signals": [],
+                }
+            if url == "https://discovered-site.com/submit":
+                return {
+                    "status": 200,
+                    "final_url": "https://discovered-site.com/login?redirect=%2Fsubmit",
+                    "mechanism_signals": [],
+                }
+            return {"status": 404}
+
+        entry_obj, reason = discover_and_verify_entry("discovered-site.com", fetcher=fake_fetch)
+        self.assertIsNotNone(entry_obj, "首页真实链接发现的 /submit 遭遇 auth wall callback 应该通过！")
+        self.assertEqual(entry_obj.evidence_type, "auth_wall_submission")
+        self.assertEqual(entry_obj.url, "https://discovered-site.com/submit")
+
+    def test_auth_callback_with_external_url_is_rejected(self):
+        # external callback URL 拒绝：跳转到 /login?redirect=https://external-phishing.com/submit
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://safe-domain.com/login?redirect=https%3A%2F%2Fexternal-phishing.com%2Fsubmit",
+                "mechanism_signals": [],
+            }
+        entry_obj, reason = verify_submission_entry(
+            "safe-domain.com",
+            "https://safe-domain.com/submit",
+            fetcher=fake_fetch,
+            is_discovered_candidate=True,
+        )
+        self.assertIsNone(entry_obj, "指向外部域名的 callback 必须坚决拒绝！")
+        self.assertIn("跨域外部域名", reason)
+
+    def test_auth_wall_verified_entry_retains_original_submission_url_not_login_query(self):
+        # auth wall 不把 login query URL 写入入口，而是保留原始 entry URL；且 evidence 不记录完整 query/token
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://myplatform.com/login?redirect=%2Fsubmit&session_token=secret123&nonce=456",
+                "mechanism_signals": [],
+            }
+        entry_obj, reason = verify_submission_entry(
+            "myplatform.com",
+            "https://myplatform.com/submit",
+            fetcher=fake_fetch,
+            is_discovered_candidate=True,
+        )
+        self.assertIsNotNone(entry_obj)
+        self.assertEqual(
+            entry_obj.url, "https://myplatform.com/submit",
+            "VerifiedEntry.url 必须保留原始稳定 submission URL，而不是带 session/query 的 /login URL！"
+        )
+        self.assertNotIn("secret123", entry_obj.evidence_summary, "evidence 严禁泄露完整 query 或 token！")
+        self.assertNotIn("nonce", entry_obj.evidence_summary)
+        self.assertIn("/submit", entry_obj.evidence_summary)
+
+    def test_homepage_noindex_does_not_block_entry_discovery(self):
+        # homepage noindex 不阻断后续 entry discovery
+        def fake_fetch(url):
+            if url == "https://noindex-home.com/":
+                return {
+                    "status": 200,
+                    "final_url": "https://noindex-home.com/",
+                    "candidate_urls": ["https://noindex-home.com/add-tool"],
+                    "mechanism_signals": [],
+                    "noindex": True,  # 首页标记为 noindex！
+                }
+            if url == "https://noindex-home.com/add-tool":
+                return {
+                    "status": 200,
+                    "final_url": "https://noindex-home.com/add-tool",
+                    "mechanism_signals": ["submit your product"],
+                    "noindex": False,
+                }
+            return {"status": 404}
+
+        entry_obj, reason = discover_and_verify_entry("noindex-home.com", fetcher=fake_fetch)
+        self.assertIsNotNone(entry_obj, "首页 noindex 绝不应阻断后续子页面真实入口的发现！")
+        self.assertEqual(entry_obj.url, "https://noindex-home.com/add-tool")
+        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
 
     def test_p1_5_auth_wall_submission_without_callback_is_rejected(self):
         # 任意未知路径跳到纯 /login（无 callback 参数）-> 拒绝，防止盲猜
