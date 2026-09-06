@@ -285,6 +285,31 @@ def analyze_html(raw_html, base_url):
         form_text = ' '.join(form.get('text') or []).lower()
         controls = form.get('controls') or []
 
+        # 提取 LOCAL submission context (表单 action 路径、当前页面路径、表单局部文本)
+        # 绝不允许使用 full body 的宽泛文案救活 plain submit
+        action_path = (action_parsed.path or '').lower()
+        page_path = (parsed_base.path or '').lower()
+
+        local_checker_hit = bool(
+            CHECKER_INTENT_RE.search(action_path) or
+            CHECKER_INTENT_RE.search(page_path) or
+            CHECKER_INTENT_RE.search(form_text)
+        )
+        local_submit_intent = (
+            not local_checker_hit and bool(
+                DIRECTORY_SUBMIT_INTENT_RE.search(action_path) or
+                DIRECTORY_SUBMIT_INTENT_RE.search(page_path) or
+                DIRECTORY_SUBMIT_INTENT_RE.search(form_text)
+            )
+        )
+        local_gp_intent = (
+            not local_checker_hit and bool(
+                GP_SUBMIT_INTENT_RE.search(action_path) or
+                GP_SUBMIT_INTENT_RE.search(page_path) or
+                GP_SUBMIT_INTENT_RE.search(form_text)
+            )
+        )
+
         # 排除包含密码的登录/注册表单
         has_password = any(c.get('type') == 'password' or 'password' in (c.get('name') or '').lower() for c in controls)
         if has_password:
@@ -310,18 +335,29 @@ def analyze_html(raw_html, base_url):
             field_desc = re.sub(r'[\W_]+', ' ', f"{cname} {cid} {cplaceholder} {ctype}").strip()
             btn_desc = re.sub(r'[\W_]+', ' ', f"{ctext} {cvalue} {cname} {cid}").strip()
 
-            # 检查提交按钮及意图 (严格分离 Listing 提交意图与 Checker 分析意图)
+            # 检查提交按钮及意图 (严格区分显式文案与 plain submit)
             is_potential_btn = (ctype == 'submit' or tag == 'button' or ctype in ('button', 'image'))
             if is_potential_btn:
-                # 明确拒绝 checker intent (check / analyze / scan / lookup / search 等)
-                if not CHECKER_INTENT_RE.search(btn_desc):
-                    is_plain_submit = (ctype == 'submit' and not (ctext.strip() or cvalue.strip()))
-                    if DIRECTORY_SUBMIT_INTENT_RE.search(btn_desc) or is_plain_submit:
-                        btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
-                        submit_buttons.append(btn_name[:50])
-                    elif GP_SUBMIT_INTENT_RE.search(btn_desc):
-                        btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
-                        gp_submit_buttons.append(btn_name[:50])
+                has_explicit_text = bool(ctext.strip() or cvalue.strip())
+                if has_explicit_text:
+                    # 规则 1: 显式按钮文案，明确拒绝 checker intent (check / analyze / scan 等优先拦截)
+                    if not CHECKER_INTENT_RE.search(btn_desc):
+                        if DIRECTORY_SUBMIT_INTENT_RE.search(btn_desc):
+                            btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
+                            submit_buttons.append(btn_name[:50])
+                        elif GP_SUBMIT_INTENT_RE.search(btn_desc):
+                            btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
+                            gp_submit_buttons.append(btn_name[:50])
+                else:
+                    # 规则 2: 无 text/value 的 plain <input type=submit> 或纯提交按钮
+                    # 绝不能单独构成 submission intent，必须依赖且仅依赖不含 checker 的 LOCAL context
+                    if ctype == 'submit' or tag == 'button':
+                        if local_submit_intent:
+                            btn_name = cname or 'Submit'
+                            submit_buttons.append(btn_name[:50])
+                        elif local_gp_intent:
+                            btn_name = cname or 'Submit'
+                            gp_submit_buttons.append(btn_name[:50])
 
             # 检查字段用途
             if RESOURCE_FIELD_RE.search(field_desc):

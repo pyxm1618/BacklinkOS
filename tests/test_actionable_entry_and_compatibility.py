@@ -469,6 +469,56 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
         )
         self.assertIsNone(prow_missing_ai, "ai_powered 缺失时必须 fail closed 拒绝物化！")
 
+    def test_plain_submit_requires_non_checker_local_context(self):
+        # A. <form action="/analyze"><input type=url name=website_url><input type=submit></form> -> REJECT
+        html_a = """
+        <html><body>
+            <form action="/analyze" method="POST">
+                <input type="url" name="website_url">
+                <input type="submit">
+            </form>
+        </body></html>
+        """
+        analysis_a = analyze_html(html_a, "https://example.com/")
+        self.assertEqual(len(analysis_a["actionable_forms"]), 0, "A: action=/analyze 的 plain submit 必须被拒绝！")
+
+        # B. 页面 /check <form><input name=website><input type=submit></form> -> REJECT
+        html_b = """
+        <html><body>
+            <form method="POST">
+                <input name="website">
+                <input type="submit">
+            </form>
+        </body></html>
+        """
+        analysis_b = analyze_html(html_b, "https://example.com/check")
+        self.assertEqual(len(analysis_b["actionable_forms"]), 0, "B: 当前页面为 /check 的 plain submit 必须被拒绝！")
+
+        # C. <form action="/submit"><input type=url name=website_url><input type=submit></form> -> PASS
+        html_c = """
+        <html><body>
+            <form action="/submit" method="POST">
+                <input type="url" name="website_url">
+                <input type="submit">
+            </form>
+        </body></html>
+        """
+        analysis_c = analyze_html(html_c, "https://example.com/")
+        self.assertEqual(len(analysis_c["actionable_forms"]), 1, "C: action=/submit 的 plain submit 具备 LOCAL context，必须通过！")
+        self.assertEqual(analysis_c["actionable_forms"][0]["form_type"], "directory_listing")
+
+        # D. <form action="/submit"><input type=url name=website_url><button type=submit>Analyze</button></form> -> REJECT
+        html_d = """
+        <html><body>
+            <form action="/submit" method="POST">
+                <input type="url" name="website_url">
+                <button type="submit">Analyze</button>
+            </form>
+        </body></html>
+        """
+        analysis_d = analyze_html(html_d, "https://example.com/submit")
+        self.assertEqual(len(analysis_d["actionable_forms"]), 0, "D: 显式 checker 文案 (Analyze) 优先于 path 触发拦截，必须被拒绝！")
+
 
 if __name__ == "__main__":
     unittest.main()
