@@ -309,19 +309,24 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
         self.assertIn("跨域", reason)
 
     def test_p1_4_submission_entry_with_noindex_is_accepted_when_mechanism_present(self):
-        # P1-4: https://example.com/submit, HTTP 200, mechanism_signals = ["submit your product"], noindex = true
+        # P1-4: https://example.com/submit, HTTP 200, actionable_forms 存在, noindex = true
         # 预期: Verified Entry (提交表单页面的 indexability 不作为淘汰条件)
         def fake_fetch(url):
             return {
                 "status": 200,
                 "final_url": "https://example.com/submit",
-                "mechanism_signals": ["submit your product"],
+                "actionable_forms": [{
+                    "form_type": "directory_listing",
+                    "action": "https://example.com/submit",
+                    "resource_fields": ["website", "tool_name"],
+                    "submit_controls": ["Submit"],
+                }],
                 "noindex": True,
             }
         entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
         self.assertIsNotNone(entry_obj, "Entry 页面本身不应因标记 noindex 被筛掉！")
         self.assertEqual(entry_obj.url, "https://example.com/submit")
-        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
+        self.assertEqual(entry_obj.evidence_type, "actionable_form")
         self.assertIn("现场核验通过", reason)
 
     def test_p1_5_auth_wall_submission_with_redirect_callback_is_verified(self):
@@ -441,7 +446,12 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
                 return {
                     "status": 200,
                     "final_url": "https://noindex-home.com/add-tool",
-                    "mechanism_signals": ["submit your product"],
+                    "actionable_forms": [{
+                        "form_type": "directory_listing",
+                        "action": "https://noindex-home.com/add-tool",
+                        "resource_fields": ["website", "tool"],
+                        "submit_controls": ["Submit"],
+                    }],
                     "noindex": False,
                 }
             return {"status": 404}
@@ -449,7 +459,7 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
         entry_obj, reason = discover_and_verify_entry("noindex-home.com", fetcher=fake_fetch)
         self.assertIsNotNone(entry_obj, "首页 noindex 绝不应阻断后续子页面真实入口的发现！")
         self.assertEqual(entry_obj.url, "https://noindex-home.com/add-tool")
-        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
+        self.assertEqual(entry_obj.evidence_type, "actionable_form")
 
     def test_p1_5_auth_wall_submission_without_callback_is_rejected(self):
         # 任意未知路径跳到纯 /login（无 callback 参数）-> 拒绝，防止盲猜
@@ -476,7 +486,12 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
                 return {
                     "status": 200,
                     "final_url": "https://testdir.com/add-project",
-                    "mechanism_signals": ["submit your product"],
+                    "actionable_forms": [{
+                        "form_type": "directory_listing",
+                        "action": "https://testdir.com/add-project",
+                        "resource_fields": ["project_url", "name"],
+                        "submit_controls": ["Submit Project"],
+                    }],
                     "noindex": False,
                 }
             return {"status": 404}
@@ -484,7 +499,7 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
         entry_obj, reason = discover_and_verify_entry("testdir.com", fetcher=fake_fetch)
         self.assertIsNotNone(entry_obj)
         self.assertEqual(entry_obj.url, "https://testdir.com/add-project")
-        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
+        self.assertEqual(entry_obj.evidence_type, "actionable_form")
 
     def test_entry_unknown_remains_empty_and_candidate_retained(self):
         def fake_fetch_no_entry(url):
@@ -519,7 +534,12 @@ class ProjectSynchronizationTests(unittest.TestCase):
                 return {
                     "status": 200,
                     "final_url": "https://good-opportunity.com/submit",
-                    "mechanism_signals": ["submit a tool"],
+                    "actionable_forms": [{
+                        "form_type": "directory_listing",
+                        "action": "https://good-opportunity.com/submit",
+                        "resource_fields": ["website", "name"],
+                        "submit_controls": ["Submit"],
+                    }],
                 }
             return {"status": 404}
 
@@ -535,7 +555,7 @@ class ProjectSynchronizationTests(unittest.TestCase):
         self.assertEqual(prow["外链ID"], "good-opportunity.com")
         self.assertEqual(prow["状态"], PROJECT_STATUS_TO_SUBMIT)
         self.assertEqual(prow["尝试次数"], "0")
-        self.assertIn("subpage_mechanism", prow["证据摘要"])
+        self.assertIn("actionable_form", prow["证据摘要"])
 
     def test_materialize_fails_when_live_verification_fails(self):
         # 生产队列 materialization 必须由内部 live verification 驱动，核验失败绝不生成行

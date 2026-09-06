@@ -111,6 +111,9 @@ INVALID_ENTRY_PATH_PATTERNS = [
     re.compile(r"/(sitemap|xmlrpc|feed|atom|rss)(/|$)", re.I),
 ]
 
+# 私有控制台保护规则：除非携带提交上下文，否则不能作为通用 Entry
+DASHBOARD_PATH_RE = re.compile(r"/(?:app/)?(?:dashboard|overview|console|admin|portal)(?:/|$)", re.I)
+
 # 首页作为入口的显式 CTA 正则守卫（首页必须在页面中有强烈的机制 CTA 才可作为起点）
 HOMEPAGE_EXPLICIT_CTA_PATTERNS = [
     re.compile(r"\b(?:submit|add|list|register)\s+(?:your\s+)?(?:product|tool|startup|site|website|project|app)\b", re.I),
@@ -150,8 +153,10 @@ class VerifiedEntry:
     """
     url: str
     domain: str
-    evidence_type: str  # 'subpage_mechanism' | 'auth_wall_submission' | 'homepage_cta'
+    evidence_type: str  # 'actionable_form' | 'auth_wall_submission' | 'homepage_actionable' | 'homepage_cta'
     evidence_summary: str
+    form_details: dict[str, Any] | None = None
+    ai_only: bool = False
 
     def __post_init__(self):
         if not self.url or not self.domain:
@@ -225,6 +230,12 @@ def submission_entry_policy_guard(url: str, domain: str = "") -> tuple[bool, str
     for pattern in INVALID_ENTRY_PATH_PATTERNS:
         if pattern.search(path):
             return False, f"命中排除路径规则: {pattern.pattern}"
+
+    # 检查是否命中私有控制台保护规则（dashboard/console/admin 等），除非带明确提交 intent
+    if DASHBOARD_PATH_RE.search(path):
+        q = (parsed.query or "").lower()
+        if not re.search(r'\b(submit|add|listing|new|action=)\b', q):
+            return False, f"命中私有控制台排除规则（无提交意图参数）: {path}"
 
     return True, "通过 Policy Guard"
 
@@ -332,6 +343,108 @@ def check_auth_wall_callback_evidence(
     return True, f"访问提交入口触发平台认证墙，登录后重定向回提交流程 ({callback_path}): {final_path}"
 
 
+def evaluate_page_for_actionable_entry(
+    page_res: dict[str, Any],
+    req_url: str,
+    domain: str,
+    fetcher: Callable[[str], dict],
+    is_discovered_candidate: bool = False,
+    allow_cta_follow: bool = True,
+) -> tuple[VerifiedEntry | None, str]:
+    """统一评估一个抓取到的页面是否构成真实可操作的提交入口。
+    
+    规则：
+    1. 搜索结果页 (is_search_page=True) 直接拒绝；
+    2. 检查 Actionable Form：包含 directory_listing 或 guest_post 表单；
+    3. 检查 Auth Wall：访问后重定向至登录页且 callback 明确指向提交流程；
+    4. 检查 CTA 跟随 (Follow CTA)：来源页本身绝不升级为 Entry，跟随打开 CTA 目标页并验证；
+    5. 绝不允许仅凭正文 mechanism_signals 单独升级！
+    """
+    cd = canonical_domain(domain)
+    final_url = page_res.get("final_url") or req_url
+
+    # 1. 搜索结果页拦截
+    if page_res.get("is_search_page") or ("?q=" in final_url or "?s=" in final_url):
+        return None, "页面为搜索结果页，非有效提交入口"
+
+    path = (urlparse(final_url).path or "/").strip()
+    is_auth_wall = bool(AUTH_PATH_RE.search(path))
+
+    # 2. 检查 Actionable Forms (A 规则)
+    actionable_forms = page_res.get("actionable_forms") or []
+    if actionable_forms:
+        top_form = actionable_forms[0]
+        summary = f"现场核验通过: 真实可操作提交表单 ({top_form['form_type']}, 字段: {top_form['resource_fields']}, 按钮: {top_form['submit_controls']})"
+        return VerifiedEntry(
+            url=final_url,
+            domain=cd,
+            evidence_type="actionable_form",
+            evidence_summary=summary,
+            form_details=top_form,
+            ai_only=bool(page_res.get("ai_only_signals")),
+        ), "现场核验通过 (Actionable Form)"
+
+    # 3. 检查 Auth Wall (C 规则)
+    if is_auth_wall:
+        is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
+            req_url=req_url,
+            final_url=final_url,
+            domain=cd,
+            is_discovered_candidate=is_discovered_candidate,
+        )
+        if is_auth_callback:
+            return VerifiedEntry(
+                url=req_url,
+                domain=cd,
+                evidence_type="auth_wall_submission",
+                evidence_summary=auth_reason,
+                ai_only=bool(page_res.get("ai_only_signals")),
+            ), "现场核验通过 (认证墙回调证据)"
+        else:
+            return None, auth_reason
+
+    # 4. 检查 CTA 跟随 (B 规则)
+    if allow_cta_follow:
+        cta_links = page_res.get("submission_cta_links") or []
+        for cta in cta_links[:3]:
+            tgt_url = cta.get("url")
+            tgt_text = cta.get("text") or "CTA"
+            if not tgt_url:
+                continue
+            allowed_tgt, _ = submission_entry_policy_guard(tgt_url, domain=cd)
+            if not allowed_tgt:
+                continue
+            tgt_res = fetcher(tgt_url)
+            if tgt_res.get("status") != 200:
+                continue
+            tgt_final = tgt_res.get("final_url") or tgt_url
+            allowed_tgt_final, _ = submission_entry_policy_guard(tgt_final, domain=cd)
+            if not allowed_tgt_final:
+                continue
+            # 递归检查目标页面 (禁止二次嵌套 follow 防止死循环)
+            sub_verified, sub_reason = evaluate_page_for_actionable_entry(
+                page_res=tgt_res,
+                req_url=tgt_url,
+                domain=cd,
+                fetcher=fetcher,
+                is_discovered_candidate=True,
+                allow_cta_follow=False,
+            )
+            if sub_verified:
+                combined_summary = f"跟随来源页 CTA ('{tgt_text}') -> {sub_verified.evidence_summary}"
+                return VerifiedEntry(
+                    url=sub_verified.url,
+                    domain=cd,
+                    evidence_type=sub_verified.evidence_type,
+                    evidence_summary=combined_summary,
+                    form_details=sub_verified.form_details,
+                    ai_only=bool(sub_verified.ai_only or page_res.get("ai_only_signals")),
+                ), f"通过跟随 CTA 闭环入口 ({sub_reason})"
+
+    # 5. 纯正文或普通文章，坚决不通过
+    return None, "页面虽返回 200 但未检测到真实可操作提交表单（Actionable Form）或有效认证墙（拒绝正文文字臆想）"
+
+
 def verify_submission_entry(
     domain: str,
     entry_url: str,
@@ -343,12 +456,10 @@ def verify_submission_entry(
     契约规则：
     1. 必须先通过 Policy Guard；
     2. 现场打开页面：
-       - 检查 final_url 是否依然通过 Policy Guard（P0-3 必须验证 redirect 后 final_url，防止逃逸到 pricing 或跨域）；
-       - 若是首页，必须通过 verify_homepage_as_entry（页面内有明确 CTA 机制证据）；
-       - 若触发认证墙跳转（如 /submit -> /login?redirect=/submit），严格要求已证实来源证据（默认 is_discovered_candidate=False，历史存量未经证明不得盲目升级）；
-         核验成功时 VerifiedEntry.url 保留原始稳定 entry_url，不写入带会话参数的 /login URL；
-       - 若是子页面，必须具备明确机制信号（mechanism_signals）；单纯 HTTP 200 + URL 路径含 submit 绝不足以成为证据；
-       - noindex 处理：提交入口页面本身不因 noindex 筛掉，只要机制真实且符合 Guard；
+       - 检查 final_url 是否依然通过 Policy Guard；
+       - 若是首页：若有内嵌表单，以首页为准；若有明确提交 CTA，必须跟随打开子页面核验；
+       - 若是子页面：必须包含真实 Actionable Form、合法 Auth Wall 回调，或跟随 CTA 到达真实表单；
+       - 严禁正文 mechanism_signals 单独升级！
     3. 验证成功返回 (VerifiedEntry, 成功说明)；
     4. 验证失败返回 (None, 失败理由)。
     """
@@ -366,16 +477,63 @@ def verify_submission_entry(
         return None, f"页面不可达 (HTTP {res.get('status', 0)})"
         
     final_url = res.get("final_url") or entry_url
-    
-    # P0-3 修复：必须对 redirect 后的 final_url 重新执行 Policy Guard
     allowed_final, final_guard_reason = submission_entry_policy_guard(final_url, domain=cd)
     if not allowed_final:
         return None, f"最终跳转 URL 未通过 Policy Guard: {final_guard_reason}"
 
     path = (urlparse(final_url).path or "/").strip()
     
-    # 区分是否为首页
+    # 首页检查
     if path in ("", "/"):
+        # 若首页自身包含 Actionable Form
+        if res.get("actionable_forms"):
+            top_form = res["actionable_forms"][0]
+            summary = f"首页内嵌真实可操作提交表单: {top_form['form_type']} (字段: {top_form['resource_fields']}, 控件: {top_form['submit_controls']})"
+            return VerifiedEntry(
+                url=final_url,
+                domain=cd,
+                evidence_type="homepage_actionable",
+                evidence_summary=summary,
+                form_details=top_form,
+                ai_only=bool(res.get("ai_only_signals")),
+            ), "首页核验通过 (内嵌表单)"
+
+        # 首页尝试跟随 CTA
+        cta_links = res.get("submission_cta_links") or []
+        for cta in cta_links[:3]:
+            tgt_url = cta.get("url")
+            tgt_text = cta.get("text") or "CTA"
+            if not tgt_url:
+                continue
+            allowed_tgt, _ = submission_entry_policy_guard(tgt_url, domain=cd)
+            if not allowed_tgt:
+                continue
+            tgt_res = _fetch(tgt_url)
+            if tgt_res.get("status") != 200:
+                continue
+            tgt_final = tgt_res.get("final_url") or tgt_url
+            allowed_tgt_final, _ = submission_entry_policy_guard(tgt_final, domain=cd)
+            if not allowed_tgt_final:
+                continue
+            sub_verified, sub_reason = evaluate_page_for_actionable_entry(
+                page_res=tgt_res,
+                req_url=tgt_url,
+                domain=cd,
+                fetcher=_fetch,
+                is_discovered_candidate=True,
+                allow_cta_follow=False,
+            )
+            if sub_verified:
+                summary = f"跟随首页 CTA ('{tgt_text}') -> {sub_verified.evidence_summary}"
+                return VerifiedEntry(
+                    url=sub_verified.url,
+                    domain=cd,
+                    evidence_type=sub_verified.evidence_type,
+                    evidence_summary=summary,
+                    form_details=sub_verified.form_details,
+                    ai_only=bool(sub_verified.ai_only or res.get("ai_only_signals")),
+                ), f"通过跟随首页 CTA 闭环子页面入口 ({sub_reason})"
+
         is_cta, cta_reason = verify_homepage_as_entry(res)
         if is_cta:
             return VerifiedEntry(
@@ -383,48 +541,19 @@ def verify_submission_entry(
                 domain=cd,
                 evidence_type="homepage_cta",
                 evidence_summary=cta_reason,
+                ai_only=bool(res.get("ai_only_signals")),
             ), cta_reason
         return None, f"首页未包含有效机制 CTA: {cta_reason}"
 
-    is_auth_wall = bool(AUTH_PATH_RE.search(path))
-    has_mech = bool(res.get("mechanism_signals"))
-
-    if is_auth_wall:
-        is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
-            req_url=entry_url,
-            final_url=final_url,
-            domain=cd,
-            is_discovered_candidate=is_discovered_candidate,
-        )
-        if is_auth_callback:
-            # 保留原始稳定 submission URL，而不是带 token 或 query 的 /login URL
-            return VerifiedEntry(
-                url=entry_url,
-                domain=cd,
-                evidence_type="auth_wall_submission",
-                evidence_summary=auth_reason,
-            ), "现场核验通过 (认证墙回调证据)"
-        elif has_mech:
-            return VerifiedEntry(
-                url=final_url,
-                domain=cd,
-                evidence_type="auth_wall_submission",
-                evidence_summary=f"现场核验通过: 机制信号 {res.get('mechanism_signals')}",
-            ), "现场核验通过"
-        else:
-            return None, auth_reason
-
-    # P0-1 核心守卫：非认证墙普通子页面必须有真实机制文案/控件（mechanism_signals）
-    if not has_mech:
-        return None, "页面虽返回 200 但未检测到实际提交/收录/建链机制文案（拒绝仅凭 URL 路径臆想）"
-        
-    # P1-4 修复：页面本身无论是否标记 noindex，只要机制真实且符合 Guard，均不被误杀
-    return VerifiedEntry(
-        url=final_url,
+    # 子页面使用核心评估函数
+    return evaluate_page_for_actionable_entry(
+        page_res=res,
+        req_url=entry_url,
         domain=cd,
-        evidence_type="subpage_mechanism",
-        evidence_summary=f"现场核验通过: 机制信号 {res.get('mechanism_signals')}",
-    ), "现场核验通过"
+        fetcher=_fetch,
+        is_discovered_candidate=is_discovered_candidate,
+        allow_cta_follow=True,
+    )
 
 
 def discover_and_verify_entry(
@@ -432,22 +561,7 @@ def discover_and_verify_entry(
     fetcher: Callable[[str], dict] | None = None,
     max_probes: int = 15,
 ) -> tuple[VerifiedEntry | None, str]:
-    """使用已有经过测试的爬虫机制，对指定域名进行真实页面探测，寻找最低限度提交入口。
-    
-    流程：
-    1. 访问首页（裸域/www 双试，由 fetch_page/probe 处理）；
-       - 删除 homepage noindex 阻断逻辑：entry discovery 不以 indexability 淘汰；
-    2. 获取首页 candidate_urls（按 strong/weak 排序）与 COMMON_PATHS；
-    3. 访问子页面，寻找包含真实 mechanism 信号或合法 auth wall 回调的页面：
-       - 严格执行 P0-1：只有返回 200 且真正包含 mechanism_signals 或合法 auth wall 回调才算真入口；单纯路径像 submit 坚决不通过；
-       - 严格执行 P1-4：Entry 页面本身不因 noindex 筛掉；
-       - 严格执行 P1-5：支持真实 /submit -> /login?redirect=/submit 回调证据链，auth wall 成功时保留原始稳定 target_url；
-       - 严格执行 P0-3：任何最终跳转 URL 必须重新通过 Policy Guard；
-    4. 对候选 URL 跑 submission_entry_policy_guard；
-    5. 若找到真实子页面入口，返回 (VerifiedEntry, 成功理由)；
-    6. 若只有首页且首页具备明确 CTA，返回 (VerifiedEntry, 首页理由)；
-    7. 否则返回 (None, 失败理由)，保持为空，绝不胡乱捏造。
-    """
+    """使用已有经过测试的爬虫机制，对指定域名进行真实页面探测，寻找最低限度提交入口。"""
     cd = canonical_domain(domain)
     if not cd:
         return None, "域名无效"
@@ -472,8 +586,6 @@ def discover_and_verify_entry(
                 
     if not home or home.get("status") != 200:
         return None, f"站点首页不可达 (HTTP {home.get('status') if home else 0})"
-        
-    # 删除原先的 if home.get("noindex"): return None 逻辑，entry discovery 不受 homepage noindex 阻断
 
     base_url = home.get("final_url") or f"https://{cd}/"
     candidate_urls = list(home.get("candidate_urls") or [])
@@ -502,57 +614,53 @@ def discover_and_verify_entry(
             continue
             
         final_url = page_res.get("final_url") or target_url
-        # P0-3 修复：对最终 URL 重新执行 Policy Guard
         allowed_final, _ = submission_entry_policy_guard(final_url, domain=cd)
         if not allowed_final:
             continue
-            
-        # P1-4 修复：Entry 页面本身不因 noindex 筛掉（已移除 noindex 过滤）
 
-        # P1-5 修复：支持真实 /submit -> /login?redirect=/submit 认证墙回调证据
         is_from_candidate_list = target_url in candidate_urls
-        is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
+        sub_verified, sub_reason = evaluate_page_for_actionable_entry(
+            page_res=page_res,
             req_url=target_url,
-            final_url=final_url,
             domain=cd,
+            fetcher=_fetch,
             is_discovered_candidate=is_from_candidate_list,
+            allow_cta_follow=True,
         )
-        if is_auth_callback:
-            # 保留原始稳定 target_url，而不是带 token 或 query 的 final_url
-            return VerifiedEntry(
-                url=target_url,
-                domain=cd,
-                evidence_type="auth_wall_submission",
-                evidence_summary=auth_reason,
-            ), "通过真实页面探测闭环真实入口 (认证墙回调)"
-            
-        # P0-1 核心修复：坚决杜绝 URL path 单独升级！必须有实际机制信号 mechanism_signals
-        has_mech = bool(page_res.get("mechanism_signals"))
-        if not has_mech:
-            # 即使 path 是 /submit，但页面没有机制信号，绝不通过！
-            continue
-            
-        final_path = urlparse(final_url).path or "/"
-        is_auth_wall = bool(AUTH_PATH_RE.search(final_path))
-        evidence_type = "auth_wall_submission" if is_auth_wall else "subpage_mechanism"
-        entry_obj = VerifiedEntry(
-            url=final_url,
+        if sub_verified:
+            # 继承主页的 ai_only_signals
+            if home and home.get("ai_only_signals") and not sub_verified.ai_only:
+                sub_verified = VerifiedEntry(
+                    url=sub_verified.url,
+                    domain=sub_verified.domain,
+                    evidence_type=sub_verified.evidence_type,
+                    evidence_summary=sub_verified.evidence_summary,
+                    form_details=sub_verified.form_details,
+                    ai_only=True,
+                )
+            return sub_verified, f"通过真实页面探测闭环真实入口 ({sub_reason})"
+
+    # 首页检查
+    if home.get("actionable_forms"):
+        top_form = home["actionable_forms"][0]
+        return VerifiedEntry(
+            url=base_url,
             domain=cd,
-            evidence_type=evidence_type,
-            evidence_summary=f"真实页面探测到机制信号: {page_res.get('mechanism_signals')}",
-        )
-        return entry_obj, "通过真实页面探测闭环真实入口"
-            
-    # 如果所有子页面都没有发现，检查首页本身是否具备明确 CTA
+            evidence_type="homepage_actionable",
+            evidence_summary=f"首页内嵌真实表单: {top_form['form_type']} (字段: {top_form['resource_fields']})",
+            form_details=top_form,
+            ai_only=bool(home.get("ai_only_signals")),
+        ), "通过首页真实表单闭环入口"
+
     is_home_cta, home_reason = verify_homepage_as_entry(home)
     if is_home_cta:
-        entry_obj = VerifiedEntry(
+        return VerifiedEntry(
             url=base_url,
             domain=cd,
             evidence_type="homepage_cta",
             evidence_summary=home_reason,
-        )
-        return entry_obj, home_reason
+            ai_only=bool(home.get("ai_only_signals")),
+        ), home_reason
         
     return None, "未定位到用户可提交的入口页（证据缺失，保持候选状态）"
 
@@ -668,12 +776,22 @@ def upsert_master_rows(
 # 6. Project Management Materialization 算法
 # ==========================================
 
+def resolve_project_context(project_id: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """通用项目上下文解析器。优先使用显式传入的 context，若未提供则根据已知配置解析。"""
+    res = dict(context or {})
+    proj = str(project_id or "").strip()
+    if proj == "quick-iching" and "ai_powered" not in res:
+        res["ai_powered"] = False
+    return res
+
+
 def _materialize_verified_project_row(
     master_row: dict[str, Any],
     existing_project_rows: list[dict[str, Any]],
     project_id: str,
     verified_entry: VerifiedEntry,
     target_url: str = "",
+    project_context: dict[str, Any] | None = None,
 ) -> dict[str, str] | None:
     """内部底层 helper：仅供内部 live verification 流程在产生现场证据后组装项目行。
     
@@ -698,7 +816,13 @@ def _materialize_verified_project_row(
     status = str(master_row.get("基础状态") or "").strip()
     if status != MASTER_STATUS_CANDIDATE:
         return None
-        
+
+    # P0-3 通用项目兼容性硬门禁 (Project Compatibility Hard Gate)
+    p_ctx = resolve_project_context(proj, project_context)
+    if p_ctx.get("ai_powered") is False and verified_entry.ai_only:
+        # 平台存在强限制仅限 AI 工具 (AI-only)，当前项目明确声明非 AI (ai_powered=False)，拒绝生成项目行
+        return None
+
     # 检查 project_id + backlink_id 唯一性
     for prow in existing_project_rows:
         p_proj = str(prow.get("项目ID") or "").strip()
@@ -729,6 +853,7 @@ def materialize_project_row(
     fetcher: Callable[[str], dict] | None = None,
     entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
     entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
+    project_context: dict[str, Any] | None = None,
 ) -> dict[str, str] | None:
     """为明确项目（例如 quick-iching）创建【外链管理】待提交行的正式公开生产编排函数。
     
@@ -740,9 +865,10 @@ def materialize_project_row(
        - 若无已知入口：调用 entry_finder 现场探测；
        - 验证失败或未获得真实证据：返回 None，绝不入库；
        - 验证成功：由内部 helper 组装待提交行；
-    4. 保证 project_id + backlink_id 唯一，保留已有项目行状态，不重复创建。
+    4. 保证 project_id + backlink_id 唯一，保留已有项目行状态，不重复创建；
+    5. P0-3: 检查项目通用兼容性上下文 (Project Compatibility Hard Gate)。
     
-    返回: 新行 dict，若核验不通过或不满足唯一性条件则返回 None
+    返回: 新行 dict，若核验不通过或不满足唯一性/兼容性条件则返回 None
     """
     proj = str(project_id or "").strip()
     if not proj:
@@ -783,6 +909,7 @@ def materialize_project_row(
         project_id=proj,
         verified_entry=verified_obj,
         target_url=target_url,
+        project_context=project_context,
     )
 
 
@@ -798,6 +925,7 @@ def batch_hydrate_candidates(
     scan_limit: int = 30,
     entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
     entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
+    project_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """对总表现有候选进行严格双边界批次 Hydration。
     
@@ -808,13 +936,15 @@ def batch_hydrate_candidates(
     4. P0-2：已有非空 `提交入口` 必须经 entry_verifier 现场重新核验，核验通过才能 materialize；
        未通过则保持候选，不生成项目行，不随意替换原 URL；
     5. 空入口通过 entry_finder 现场探测，探测成功写入总表提交入口并 materialize；
-    6. 找不到真实入口的 domain 保持候选，不排除，提交入口保持为空。
+    6. 找不到真实入口的 domain 保持候选，不排除，提交入口保持为空；
+    7. P0-3：支持通用 project_context 兼容性门禁，不兼容候选保留在 Master 但不为项目 materialize。
     
     返回: {
         'hydrated_master_rows': 更新后的 master_rows,
         'new_project_rows': 新生成的待提交项目行列表,
         'succeeded_count': 成功生成的行数,
         'processed_candidates': 遍历尝试的域名数,
+        'skipped_incompatible': 因兼容性门禁跳过的数量,
     }
     """
     proj = str(project_id or "").strip()
@@ -840,6 +970,7 @@ def batch_hydrate_candidates(
     new_project_rows: list[dict[str, str]] = []
     succeeded = 0
     processed = 0
+    skipped_incompatible = 0
     
     for mrow in master_rows:
         # P0-3 双边界检查：达成目标或达到扫描上限即刻停止
@@ -875,15 +1006,19 @@ def batch_hydrate_candidates(
                 existing_project_rows=existing_project_rows + new_project_rows,
                 project_id=proj,
                 verified_entry=verified_obj,
+                project_context=project_context,
             )
             if prow:
                 new_project_rows.append(prow)
                 existing_project_bids.add(cid)
                 succeeded += 1
+            elif verified_obj.ai_only:
+                skipped_incompatible += 1
 
     return {
         "hydrated_master_rows": master_rows,
         "new_project_rows": new_project_rows,
         "succeeded_count": succeeded,
         "processed_candidates": processed,
+        "skipped_incompatible": skipped_incompatible,
     }

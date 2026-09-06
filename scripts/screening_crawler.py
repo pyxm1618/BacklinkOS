@@ -48,80 +48,315 @@ COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool'
                 '/advertise','/partners','/tools/submit','/directory/submit','/submit.html',
                 '/become-a-contributor','/guest-posting','/free-listing']
 
+# Actionable Form / CTA 强模式定义
+RESOURCE_FIELD_RE = re.compile(r'\b(url|website|site|tool|product|app|startup|business|listing|project)\b', re.I)
+SUBMIT_CONTROL_RE = re.compile(r'\b(submit|add|publish|post|contribute|list|create|send)\b', re.I)
+GUEST_POST_CONTEXT_RE = re.compile(r'\b(write[-_\s]for[-_\s]us|contribute|guest[-_\s]?post|guest[-_\s]?article|submit[-_\s]article)\b', re.I)
+GUEST_POST_FIELD_RE = re.compile(r'\b(pitch|article|content|story|topic|outline|draft|post_content)\b', re.I)
+SEARCH_FIELD_RE = re.compile(r'^(?:q|s|query|search|keyword|k)$', re.I)
+SUBMISSION_CTA_ANCHOR_RE = re.compile(
+    r'\b(submit|add|list|register|claim|post)\s+(?:your\s+)?(?:tool|product|website|site|startup|app|project|business|link)\b'
+    r'|\b(submit|add)\s+(?:a\s+)?(?:tool|product|website|site|startup|app|link)\b'
+    r'|\b(get\s+listed|write\s+for\s+us|become\s+an?\s+author|become\s+a\s+contributor)\b',
+    re.I
+)
+AI_ONLY_STRONG_PATTERNS = [
+    r'\bonly\s+ai\s+(?:tools?|products?|startups?|apps?|projects?|software|sites?)\b',
+    r'\bai\s+(?:tools?|products?|startups?|apps?|sites?)\s+only\b',
+    r'\bnon[- ]ai\s+(?:tools?|products?)\s+(?:are\s+)?rejected\b',
+    r'\b(?:product|tool|site|app|startup)\s+must\s+(?:be|use|feature)\s+ai\b',
+    r'\b(?:we\s+)?only\s+accept\s+ai\b',
+    r'\bexclusively\s+for\s+ai\b',
+    r'\bmust\s+be\s+an?\s+ai\b',
+    r'\bai[- ]only\b',
+]
+
+
 class Parser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.title=[]; self.in_title=False; self.text=[]; self.links=[]; self.metas=[]
-        self._a=None; self._atext=[]
+        self.title = []
+        self.in_title = False
+        self.text = []
+        self.links = []
+        self.metas = []
+        self.forms = []
+        self._current_form = None
+        self._current_button = None
+        self._a = None
+        self._atext = []
+
     def handle_starttag(self, tag, attrs):
-        d={k.lower():(v or '') for k,v in attrs}
-        t=tag.lower()
-        if t=='title': self.in_title=True
-        elif t=='a':
+        d = {k.lower(): (v or '') for k, v in attrs}
+        t = tag.lower()
+        if t == 'title':
+            self.in_title = True
+        elif t == 'a':
             self._flush_a()  # 上一个 <a> 没闭合就先收掉，别把锚文本串到下一条
-            self._a=(d.get('href',''), d.get('rel',''), d.get('title',''))
-            self._atext=[]
-        elif t=='meta': self.metas.append(d)
+            self._a = (d.get('href', ''), d.get('rel', ''), d.get('title', ''))
+            self._atext = []
+        elif t == 'meta':
+            self.metas.append(d)
+        elif t == 'form':
+            self._current_form = {
+                'action': d.get('action', ''),
+                'method': d.get('method', 'get').upper(),
+                'controls': [],
+                'text': [],
+            }
+        elif t in ('input', 'textarea', 'select', 'button'):
+            ctrl = {
+                'tag': t,
+                'type': d.get('type', 'text' if t == 'input' else t).lower(),
+                'name': d.get('name', ''),
+                'id': d.get('id', ''),
+                'placeholder': d.get('placeholder', ''),
+                'value': d.get('value', ''),
+                'text': '',
+            }
+            if self._current_form is not None:
+                self._current_form['controls'].append(ctrl)
+            if t == 'button':
+                self._current_button = ctrl
+
     def handle_endtag(self, tag):
-        t=tag.lower()
-        if t=='title': self.in_title=False
-        elif t=='a': self._flush_a()
+        t = tag.lower()
+        if t == 'title':
+            self.in_title = False
+        elif t == 'a':
+            self._flush_a()
+        elif t == 'form':
+            if self._current_form is not None:
+                self.forms.append(self._current_form)
+                self._current_form = None
+        elif t == 'button':
+            self._current_button = None
+
     def handle_data(self, data):
-        if self.in_title: self.title.append(data)
-        if self._a is not None: self._atext.append(data)
+        if self.in_title:
+            self.title.append(data)
+        if self._a is not None:
+            self._atext.append(data)
+        if self._current_form is not None:
+            self._current_form['text'].append(data)
+        if self._current_button is not None:
+            self._current_button['text'] += (' ' + data)
         self.text.append(data)
+
     def _flush_a(self):
-        if self._a is None: return
+        if self._a is None:
+            return
         href, rel, atitle = self._a
         self.links.append((href, rel, atitle, ' '.join(self._atext).strip()[:200]))
-        self._a=None; self._atext=[]
+        self._a = None
+        self._atext = []
+
     def close(self):
-        super().close(); self._flush_a()
+        super().close()
+        self._flush_a()
+        if self._current_form is not None:
+            self.forms.append(self._current_form)
+            self._current_form = None
+
 
 def _hits(text, patterns):
-    out=[]
-    low=text.lower()
+    out = []
+    low = text.lower()
     for p in patterns:
-        if re.search(p, low, re.I): out.append(p)
+        if re.search(p, low, re.I):
+            out.append(p)
     return out
 
+
+def is_safe_subdomain_or_same(host_a: str, host_b: str) -> bool:
+    if not host_a or not host_b:
+        return False
+    ha = host_a.lower().strip().split(':')[0].strip('.')
+    hb = host_b.lower().strip().split(':')[0].strip('.')
+    if ha.startswith('www.'):
+        ha = ha[4:]
+    if hb.startswith('www.'):
+        hb = hb[4:]
+    if ha == hb:
+        return True
+    return ha.endswith('.' + hb)
+
+
 def analyze_html(raw_html, base_url):
-    p=Parser()
-    try: p.feed(raw_html)
-    except Exception: pass
-    title=' '.join(p.title).strip()[:300]
-    body=' '.join(p.text)
-    norm=' '.join(body.split())[:500000]
-    robots=' '.join(m.get('content','') for m in p.metas if m.get('name','').lower() in ('robots','googlebot')).lower()
-    noindex='noindex' in robots
-    host=(urlparse(base_url).hostname or '').lower()
-    ext_follow=ext_nofollow=0
-    strong=[]; weak=[]
+    p = Parser()
+    try:
+        p.feed(raw_html)
+    except Exception:
+        pass
+    p.close()
+
+    title = ' '.join(p.title).strip()[:300]
+    body = ' '.join(p.text)
+    norm = ' '.join(body.split())[:500000]
+    robots = ' '.join(m.get('content', '') for m in p.metas if m.get('name', '').lower() in ('robots', 'googlebot')).lower()
+    noindex = 'noindex' in robots
+    parsed_base = urlparse(base_url)
+    host = (parsed_base.hostname or '').lower()
+    path_and_query = (parsed_base.path or '') + '?' + (parsed_base.query or '')
+
+    ext_follow = ext_nofollow = 0
+    strong = []
+    weak = []
+    submission_cta_links = []
+
     for href, rel, atitle, atext in p.links:
-        if not href or href.startswith(('#','mailto:','tel:','javascript:')): continue
-        u=urljoin(base_url, href)
-        pu=urlparse(u)
-        if pu.scheme not in ('http','https'): continue
-        # 锚文本必须参与匹配。"Submit a tool" 这种入口常常只在可见文字里，
-        # href 是 /s/new 之类看不出意图的路径——只看 href+title 会整条漏掉。
-        ltxt=(href+' '+atitle+' '+atext).lower()
-        if (pu.hostname or '').lower()==host:
+        if not href or href.startswith(('#', 'mailto:', 'tel:', 'javascript:')):
+            continue
+        u = urljoin(base_url, href)
+        pu = urlparse(u)
+        if pu.scheme not in ('http', 'https'):
+            continue
+
+        ltxt = (href + ' ' + atitle + ' ' + atext).lower()
+        is_same_host = (pu.hostname or '').lower() == host
+
+        if is_same_host:
             if any(re.search(x, ltxt, re.I) for x in MECHANISM_PATTERNS) or ENTRY_HINTS.search(ltxt):
-                if u not in strong: strong.append(u)
+                if u not in strong:
+                    strong.append(u)
             elif DISCOVERY_HINTS.search(ltxt):
-                if u not in weak: weak.append(u)
-        if pu.hostname and pu.hostname.lower()!=host:
-            tokens=set((rel or '').lower().split())
-            if tokens & {'nofollow','ugc','sponsored'}: ext_nofollow+=1
-            else: ext_follow+=1
-    candidate=strong+[w for w in weak if w not in strong]
-    full=(title+' '+norm)
+                if u not in weak:
+                    weak.append(u)
+
+            # 结构化 CTA Link 识别：可见文本明确匹配提交流程动词短语
+            visible_cta_text = (atext + ' ' + atitle).strip()
+            if SUBMISSION_CTA_ANCHOR_RE.search(visible_cta_text):
+                # 排除指向当前页面本身的自循环链接
+                clean_target = pu.path.rstrip('/') or '/'
+                clean_base = parsed_base.path.rstrip('/') or '/'
+                if clean_target != clean_base or pu.query != parsed_base.query:
+                    if not any(item['url'] == u for item in submission_cta_links):
+                        submission_cta_links.append({'url': u, 'text': visible_cta_text[:100]})
+
+        if pu.hostname and pu.hostname.lower() != host:
+            tokens = set((rel or '').lower().split())
+            if tokens & {'nofollow', 'ugc', 'sponsored'}:
+                ext_nofollow += 1
+            else:
+                ext_follow += 1
+
+    candidate = strong + [w for w in weak if w not in strong]
+    full = (title + ' ' + norm)
+
+    # 1. 判定是否为搜索结果页
+    is_search_page = bool(re.search(r'[?&](?:q|s|query|search|keyword)=', path_and_query, re.I)) or bool(
+        re.search(r'\b(?:search\s+results?|search\s+for)\b', title, re.I)
+    )
+
+    # 2. 判定 AI-Only 强限制
+    ai_only_signals = _hits(full, AI_ONLY_STRONG_PATTERNS)
+
+    # 3. 结构化分析可操作表单（Actionable Forms）
+    actionable_forms = []
+    has_gp_context = bool(GUEST_POST_CONTEXT_RE.search(full))
+
+    for form in p.forms:
+        # A. 跨域 action 校验
+        action_raw = form.get('action') or ''
+        resolved_action = urljoin(base_url, action_raw) if action_raw else base_url
+        action_parsed = urlparse(resolved_action)
+        if action_parsed.hostname and not is_safe_subdomain_or_same(action_parsed.hostname, host):
+            # 跨域 action 表单直接排除
+            continue
+
+        form_text = ' '.join(form.get('text') or []).lower()
+        controls = form.get('controls') or []
+
+        # 排除包含密码的登录/注册表单
+        has_password = any(c.get('type') == 'password' or 'password' in (c.get('name') or '').lower() for c in controls)
+        if has_password:
+            continue
+
+        # 提取字段特征
+        resource_fields_found = []
+        gp_fields_found = []
+        is_pure_search = True
+        has_email = False
+        has_message = False
+
+        submit_buttons = []
+        for c in controls:
+            tag = c.get('tag')
+            ctype = c.get('type', '')
+            cname = (c.get('name') or '').lower()
+            cid = (c.get('id') or '').lower()
+            cplaceholder = (c.get('placeholder') or '').lower()
+            cvalue = (c.get('value') or '').lower()
+            ctext = (c.get('text') or '').lower()
+            field_desc = re.sub(r'[\W_]+', ' ', f"{cname} {cid} {cplaceholder} {ctype}").strip()
+
+            # 检查提交按钮
+            if ctype == 'submit' or tag == 'button' or SUBMIT_CONTROL_RE.search(cvalue) or SUBMIT_CONTROL_RE.search(ctext):
+                btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
+                submit_buttons.append(btn_name[:50])
+
+            # 检查字段用途
+            if RESOURCE_FIELD_RE.search(field_desc):
+                resource_fields_found.append(cname or cid or cplaceholder or 'resource_field')
+                is_pure_search = False
+
+            if GUEST_POST_FIELD_RE.search(field_desc):
+                gp_fields_found.append(cname or cid or cplaceholder or 'gp_field')
+                is_pure_search = False
+
+            if 'email' in field_desc or ctype == 'email':
+                has_email = True
+                is_pure_search = False
+
+            if 'message' in field_desc or 'comment' in field_desc or tag == 'textarea':
+                has_message = True
+                is_pure_search = False
+
+            if not SEARCH_FIELD_RE.match(cname):
+                if ctype not in ('hidden', 'search'):
+                    is_pure_search = False
+
+        if is_pure_search:
+            continue
+
+        # 检查是否为纯订阅 newsletter 表单 (仅 email + subscribe)
+        if has_email and not resource_fields_found and not gp_fields_found and not has_message:
+            if re.search(r'\b(subscribe|newsletter)\b', form_text):
+                continue
+
+        # 判定表单类型
+        form_type = None
+        # Type 1: Directory / Tool Listing 表单
+        if resource_fields_found and submit_buttons:
+            form_type = 'directory_listing'
+        # Type 2: Guest Post / 投稿表单
+        elif (has_gp_context or GUEST_POST_CONTEXT_RE.search(form_text)) and gp_fields_found and submit_buttons:
+            form_type = 'guest_post'
+
+        if form_type:
+            actionable_forms.append({
+                'form_type': form_type,
+                'action': resolved_action,
+                'method': form.get('method', 'GET'),
+                'resource_fields': list(dict.fromkeys(resource_fields_found or gp_fields_found))[:5],
+                'submit_controls': list(dict.fromkeys(submit_buttons))[:3],
+            })
+
     return {
-        'title': title, 'noindex': noindex, 'mechanism_signals': _hits(full, MECHANISM_PATTERNS),
-        'free_signals': _hits(full, FREE_PATTERNS), 'paid_signals': _hits(full, PAID_PATTERNS),
+        'title': title,
+        'noindex': noindex,
+        'mechanism_signals': _hits(full, MECHANISM_PATTERNS),
+        'free_signals': _hits(full, FREE_PATTERNS),
+        'paid_signals': _hits(full, PAID_PATTERNS),
         'spam_signals': _hits(full, SPAM_PATTERNS),
-        'external_follow_count': ext_follow, 'external_nofollow_count': ext_nofollow,
-        'candidate_urls': candidate[:12], 'text_excerpt': norm[:500]
+        'external_follow_count': ext_follow,
+        'external_nofollow_count': ext_nofollow,
+        'candidate_urls': candidate[:12],
+        'text_excerpt': norm[:500],
+        'actionable_forms': actionable_forms,
+        'submission_cta_links': submission_cta_links,
+        'is_search_page': is_search_page,
+        'ai_only_signals': ai_only_signals,
     }
 
 class Redirects(HTTPRedirectHandler): pass

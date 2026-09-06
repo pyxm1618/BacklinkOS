@@ -97,7 +97,12 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 ### 核心架构原则
 1. **Live Evidence（真实页面证据）**：
    - 实际请求目标页面（HTTP 200，同源）；
-   - **禁止 URL path 单独升级为入口：** 仅凭路径含 submit 且 HTTP 200 绝不足以成为有效入口，页面内必须实际包含机制文案/交互控件（`mechanism_signals` 如 "submit your tool", "add website", "write for us"）。普通页面或空白页断然拒绝；
+   - **正文机制文案仅作为 Hint，绝不得单独升级为 Entry：** 普通 SEO 文章、搜索结果页（`?q=`）、软文即便出现 "submit product"、"guest post" 等文字，若无真实提交表单或合规认证墙，坚决不判 Verified Entry；
+   - **Actionable Form 最低证据要求：**
+     - Directory / Tool Listing：必须包含至少一个资源身份字段（如 `url / website / site / tool / product / app / startup / business / listing`），再加 submit 按钮；**普通 Contact 表单（如姓名 + 邮箱 + Message + Submit）严格排除**；
+     - Guest Post：必须在“投稿/写文章”上下文（URL 路径或标题/正文含有 `write for us / guest post / submit article / contribute`）下，且表单包含投稿相关字段（如 `article / pitch / content / draft` 或 `url / website`）；
+   - **CTA Link 追踪（来源页绝不能当 Entry）：** 页面出现 `Submit a Tool` 等 CTA 按钮时只能作为 Candidate 链接，来源页本身不是 Entry；必须跟随打开目标页，只有目标页本身具备 Actionable Form 时，才以目标页为 Entry；
+   - **跨域 Form Action 拦截：** 表单 action 若指向外部第三方域名，直接判定为跨域非法表单并排除，防止把中间跳转 landing page 当 Entry；
    - **Entry 表单与首页不因 noindex 筛掉：** Entry discovery 不以 indexability 淘汰。表单页或首页带 noindex 绝不阻断后续真实机制入口的发现；
    - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（`AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时，认定为有效入口。
      - **来源证明严格要求：** 页面缺少机制文案时，必须要求具备真实页面 CTA/link 发现依据（`ENTRY_HINTS` 只能用于探测，绝不得作为来源证据）；
@@ -108,7 +113,8 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 2. **Policy Guard（政策守卫拦截与 Redirect 验证）**：
    - 必须是 http/https 且同源；
    - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等；
-   - **Redirect 后的 Final URL 重新校验：** 现场核验发生重定向时，跳转后的 `final_url` 必须重新通过 Policy Guard（拦截跳转到 pricing 或跨域逃逸），未通过则核验失败。
+   - **私有控制台保护：** 拦截 `/dashboard`、`/app/overview`、`/console` 等路径，除非 query 携带明确提交意图；
+   - **Redirect 后的 Final URL 重新校验：** 现场核验发生重定向时，跳转后的 `final_url` 必须重新通过 Policy Guard（拦截跳转到 pricing、私有控制台或跨域逃逸），未通过则核验失败。
 3. **写入决策**：
    - 只有同时具备现场真实证据且通过 Policy Guard 的 URL，才允许记录 `提交入口` 并产生内部 `VerifiedEntry`；
    - **普通新 discovery 阶段：** 提交入口默认保持为空；
@@ -121,8 +127,11 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-iching`）中：
 
-### 内部 Live Verification 流程驱动
-- **生产队列 Materialization 必须由内部 live verification 流程驱动：** 
+### 内部 Live Verification 流程驱动与兼容性门禁
+- **生产队列 Materialization 必须由内部 live verification 流程驱动：**
+  严禁外部调用方手造 `VerifiedEntry` 绕过现场真实核验直接创建项目行。
+- **通用 Project Compatibility Hard Gate：**
+  针对平台的强类型约束（如 `AI-only` 平台强约束要求仅接受 AI 工具），在 `project_context.ai_powered == False`（非 AI 项目如 Quick I Ching）时，硬门禁必须拦截，拒绝为其生成项目待提交行，同时总表基础状态保持为 `候选`（不影响其他 AI 项目复用）。
   禁止外部调用者自行实例化 `VerifiedEntry(...)` 绕过现场核验；公开的编排函数 `materialize_project_row()` 必须在内部现场核验通过后，才由内部 helper 组装项目行；核验失败一律返回 `None`，杜绝任何未经验证行进入生产队列。
 
 ### 创建条件
