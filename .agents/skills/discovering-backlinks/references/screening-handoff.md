@@ -1,10 +1,19 @@
-# Discovery → Screening Handoff Contract
+# Discovery → Screening Handoff Contract (Legacy / Optional)
+
+> **注意：此契约属于历史/可选旁路（Legacy / Deprecated / Optional）。**
+> 
+> BacklinkOS 当前主生产工作流已经全面切换为：
+> `discovering-backlinks` → 【外链总表】Upsert → 最低限度 Submission Entry Enrichment → 【外链管理】待提交行 → `backlink-autofill` 真实浏览器执行。
+> 
+> `screening-backlinks` 不再作为默认必经阶段。本契约仅在需要进行特定历史排查或深度溯源时作为可选工具使用。
+
+---
 
 ## Boundary
 
 Discovery owns factual acquisition from project/SEO/backlink data. Screening owns current-opportunity judgment. Screening may request more Discovery facts, but Screening does not invent historical source pages，**Discovery 不决定获取方式或处理结果**。
 
-## Default handoff
+## Default handoff (Optional bypass)
 
 Domain-level discovery is the default handoff because it is cheaper and usually sufficient:
 

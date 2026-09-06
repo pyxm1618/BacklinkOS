@@ -23,7 +23,7 @@
 19. 不因为目标项目是 Quick I Ching、AI、非 AI 或其他行业而过滤候选。
 20. 已经在 BacklinkOS 见过的 referring domain 再次出现时标记为历史已见，并增加新的成功项目证据；不能伪装成本轮首次发现。
 21. `first_seen` 不得表述为精确建链日期。
-22. Discovery 不判断免费/付费、当前提交入口或最终是否入库；这些必须交给 `screening-backlinks`。
+22. Discovery 不自行判断免费/付费、是否 Follow 或执行结果；这些属于 `backlink-autofill` 真实浏览器执行的事实。
 23. runner 最终 summary 至少分别报告：`organic_value`、`organic_no_data`、真实错误数、合格项目数、RD complete/partial 项目数、raw RD rows、unique referring domains。
 24. 已验证结构样例：`obby.fun` 的 Organic 请求曾返回 Global 187 / US 139；其 Referring Domains 请求曾返回 total 115、page0 100 rows。该样例只用于结构回归，不作为永久业务数据。
 25. 已验证分页样例：`vectosolve.com` 在 2026-08-21 实际完成 5 页，`reported_total=484`、`fetched_unique=484`、`complete=true`。此结果用于证明自动分页链路，而不是固定业务常量。
@@ -38,7 +38,15 @@
 34. 默认 100 个新项目只表示一个 Discovery 批次；用户要求继续扩库时达到 100 后停止并声称“找完”属于失败。
 35. 长期扩池必须记录种子来源分布；一个来源明显集中时，应优先使用已经批准的其他来源补充，不能为了方便无限单源深挖。
 36. Semrush 暂时不可用但项目官网已核实时，内部可以记录 `pending_semrush`；当前 Google Sheet `项目池` 必须落为 `SEO筛选状态=待Semrush`、`RD状态=待Semrush筛选`，Organic、qualified、RD、Follow 等未知字段保持为空，不得新增字面状态 `pending_semrush`。
-37. Screening 返回 `source_url_enrichment_required` 时，Discovery 只对请求的 referring domain/source projects 补 exact source-page facts，不改变 Screening 的业务结论。
+37. [可选历史契约] Screening 返回 `source_url_enrichment_required` 时，Discovery 只对请求的 referring domain/source projects 补 exact source-page facts，不改变 Screening 的业务结论。
 38. source URL enrichment 可以使用已保存同源 capture/result 或允许的 Semrush 网站原生 Backlinks 导出；不得把尚未验证的 Backlinks endpoint/参数写成正式 relay 契约。
 39. `source_url`、`target_url`、`anchor`、`source_rel_observation` 等 enrichment 字段仍是历史发现事实；不能写成“当前免费路径已确认”。
 40. enrichment 失败或被外部会话阻塞时可以返回 `source_url_unavailable`，不能把缺失事实改写成 0、Nofollow、不可用或回收结论。
+41. 对 `@外链管理总控表` 的 `外链总表` 实行 Upsert：新域名新增为候选；已存在域名不重复建行；已有真实实测字段不得覆盖；基础状态已排除或失效绝对不得重新改成候选。
+42. 硬黑名单统一直接来自外链总表已排除或失效状态，不重复研究，不重新进入项目执行队列。
+43. Discovery 严禁填写总表的 5 个实测事实字段（实测免费、实测需登录、实测登录方式、实测限制、实测链接属性、最后验证时间），必须严格留空。
+44. Submission Entry Enrichment 遵循两层架构：Live Evidence（真实打开页面/机制信号或首页明确 CTA） -> Candidate URL -> Policy Guard 校验 -> 写入 Sheet。
+45. pricing/terms/category/seo-report 等页面严禁冒充提交入口；未经验证的首页严禁盲填；找不到入口保持为空且候选继续保留，绝对不因找不到入口而淘汰。
+46. 项目执行行 Materialization：在明确项目上下文下，仅当候选具备真实验证入口且项目记录尚不存在时，才在 `外链管理` 创建待提交行。
+47. `project_id + backlink_id` 唯一：已存在任何状态均不重复创建或重置为待提交；Quick I Ching 已有历史必须保护。
+48. Bounded Batch Hydration 必须显式传入 project_id 与 limit，严格有界逐个核验，达到 limit 即停止，绝对不一次性将 3000+ 候选全量复制到项目表。

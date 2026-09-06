@@ -1,115 +1,83 @@
-# BacklinkOS 工作交接（2026-09-02 更新）
+# BacklinkOS 工作交接（2026-09-06 更新）
 
 给下一个 Claude 会话：先读这份，再读 CLAUDE.md。
 
-## 背景
+## 最新架构升级（2026-09-06）
 
-用户目标只有两个：**找外链**、**筛外链**。他自己用，强调「不要过度设计、不要误杀、重效果」。
+主生产工作流已全面重构，解耦对旧 `screening-backlinks` 的强依赖：
 
-诊断结论：项目 90% 的工程精力花在证据纪律上（防误判、防把未知当 0），
-这些约束是对的，但**没人写那段把候选推过终点线的代码**，所以 4180 条候选跑完
-正式机会是 0。这一轮补上了那一段。
-
-## 当前成果（全部已 commit）
-
-```
-data/opportunities/opportunities.csv     18 条已闭环 免费+Follow+可索引
-data/opportunities/internal-status.csv   1002 条全状态
-```
-其中 7 条早前已独立核验（证据页是真实用户产出页）：
-fazier.com / usecasesforagents.com / mrrwars.com / thehackstack.com /
-aiproductshunt.com / realaiexamples.com / peerlist.io
-
-### 漏斗（同一批 4180 候选，两轮累计）
-
-```
-                                     最初    现在
-mechanism_needs_link_verification      301  →  1002
-no_generic_mechanism（unverified）    2852  →  2314
-noindex 判死                           157  →    23
-inactive_dns                           121  →     0
-paid_mechanism                          43  →   134
-正式机会                                  0  →    18
+```text
+discovering-backlinks
+        ↓
+发现真实 referring domains
+        ↓
+canonicalize / 去重
+        ↓
+写入或合并【外链总表】（Master Sheet Upsert）
+        ↓
+最低限度 Submission Entry Enrichment (Live Evidence + Policy Guard)
+        ↓
+为明确项目创建【外链管理】待提交行 (Materialization)
+        ↓
+backlink-autofill (独立仓库，真实浏览器执行)
+        ↓
+回写真实平台事实和项目执行结果
 ```
 
-## 绝对不要改回去的地方
+### 核心变更点
 
-`scripts/README.md` 的「误杀防护」段是权威版本，改动前必读。要点：
+1. **唯一控制面：`@外链管理总控表`**
+   - **`外链总表`**（平台级唯一事实库）：基础状态为 `候选`、`已排除`、`失效`。
+   - **字段隔离：** Discovery 严禁填写 `实测免费`、`实测需登录`、`实测登录方式`、`实测限制`、`实测链接属性`、`最后验证时间`。这些属于 `backlink-autofill` 真实执行之后的事实。UNKNOWN 必须为空。
+   - **Upsert 保护：** 新域名新增为候选；已有域名不重复创建，不得覆盖已有真实实测字段，**绝不得将`已排除`或`失效`改回`候选`**。
+   - **硬黑名单：** 直接来自总表 `已排除` 或 `失效` 状态，不重复研究，不重新进入项目执行队列。不维护第二套独立黑名单。
+2. **最低限度 Submission Entry Enrichment**
+   - 对准备进入项目队列的平台寻找真实可执行入口（Submit, Add Product, Write for Us, Create Profile 等）。
+   - 严格区分两层：**Live Evidence（真实打开页面/机制信号或首页明确 CTA） → Candidate URL → Policy Guard 校验（排除 pricing/terms/category/seo-report 等） → 写入 Sheet**。
+   - 首页绝不能仅凭 URL 冒充入口；无页面 CTA 证据的首页一律拦截。
+   - **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
+3. **项目执行行 Materialization**
+   - 必须运行在明确项目上下文（如 `quick-iching`）下。
+   - 仅当满足：`总表基础状态==候选` AND `存在真实验证的提交入口` AND `当前 project_id + backlink_id 尚不存在` 时，才生成 `待提交` 行。
+   - **项目行不重复：** `project_id + backlink_id` 唯一。已存在任何状态均不重复创建或重置。Quick I Ching 已有历史记录必须保护。
+4. **存量池 Bounded Batch Hydration**
+   - 存量候选 Hydration 必须显式指定 `project_id` 和 `limit`（如 10），严格有界逐个推进，**绝不一次性灌入 3000+**。
+5. **`screening-backlinks` 状态**
+   - 旧 Skill 退出主工作流，不要删除其历史文件，作为 legacy / optional 旁路保留。
 
-1. **noindex 只认能代表站点的页面**（SPA 软 404、登录墙都不算）
-2. **`path:` 前缀是伪信号**，不能作淘汰依据
-3. **裸域和 www 都要试**（toolify.ai 裸域 403/www 200，medium.com 相反）
-4. **样例页必须是详情页**（首页/分类页的外链是站点导航）
-5. **子页 noindex 判死要同时满足四条**：非盲探、同源、不是登录墙/跳转落地页、
-   路径本身像投稿入口。这组守卫救回了 43 条，其中 promoteproject.com
-   救回后成了正式机会
-6. **判同源不能用 `lstrip('www.')`**——按字符集剥，`wow.com` 会变成 `o.com`
-7. **`ENTRY_HINTS` 必须带词边界**——`disclaimer` 里含 `claim`
+---
 
-## bucket 语义（不能混）
+## 支撑代码与回归测试
 
-| bucket | 含义 | 会不会再被捞回 |
-|---|---|---|
-| dead | 已确认淘汰，有闭环负面证据 | 不会 |
-| paid | 付费排除 | 不会 |
-| pending | 有机制/被阻止，差最后一步 | 会 |
-| unverified | **没找到入口 = 证据缺失，不是淘汰** | 会，下轮必须重筛 |
+- 核心逻辑模块：`scripts/master_sheet_sync.py`
+  - 纯业务契约与测试完全解耦 I/O，不引入生产凭据。
+  - 复用 `scripts/screening_crawler.py` 经过全面验证的入口匹配基础设施（`ENTRY_HINTS`、`COMMON_PATHS`、Parser 锚文本等）。
+- 回归测试：`tests/test_master_sheet_sync.py`（22 个用例全部 PASS），覆盖 Domain Upsert、Entry Policy Guard & Live Verification、Project Synchronization、Bounded Batch Hydration、Fact Separation 全语义。
+- TS 契约测试：`tests/skill-contracts.test.ts`。
 
-## 数据文件
+---
 
-```
-/tmp/final2.jsonl   4180 条最新爬虫结果（已含浏览器兜底 + 重筛 + 误杀修正）
-```
-/tmp 被清了就重跑（**workers 别超过 25**，40 会打满本机端口）：
-```bash
-echo 'domain' > /tmp/cand.csv
-cat data/screening-candidates/[0-9][0-9][0-9].txt | sed '/^$/d' | sort -u >> /tmp/cand.csv
-python3 scripts/screening_crawler.py --input /tmp/cand.csv --output /tmp/full.jsonl \
-  --workers 25 --timeout 8 --max-probes 30
-python3 scripts/browser_probe.py --input /tmp/full.jsonl --output /tmp/bp.jsonl --workers 6
-python3 scripts/verify_opportunity.py --input /tmp/bp.jsonl --out-dir data/opportunities --workers 25
-```
-
-## 待办
-
-1. **写 Google Sheet**（上轮用户选择暂缓）—— 表 `1gAia71b4ts_vghzLZaFvXkEkFbgS3NJv9uVEPmeyY68`
-   已确认映射，**不用新建表结构**：
-   ```
-   正式机会   → 已确认免费Follow      待确认 → 证据不足
-   已确认淘汰 → 筛选回收站            付费排除 → 已排除付费
-   ```
-   不要动 `免费外链机会`(120 行) —— 那是用 A/B/C 优先级的历史表。
-   **需要用户提供服务账号 JSON**（仓库里没有任何 Google 相关代码或密钥）。
-   写入按 SKILL 硬规则 13：target-first（先写目标→回读确认→再动源数据），不碰公式列。
-2. **Semrush 中转自动化**（上轮用户选择暂缓）—— Playwright 持久化 profile 驱动
-   `.agents/skills/discovering-backlinks/scripts/semrush-relay-batch.js`。
-   该脚本有 `return output`、无手工点击依赖，可 `page.evaluate()` 直接取返回值。
-   **仍走 sem.3ue.com 中转，不碰硬规则 6**。需要用户登录一次。
-3. 926 条 `待确认` 里，多数是「入口页有免费措辞但样例页拿不到 rel」。
-   值得用浏览器兜底跑 `verify_opportunity` 那一步（现在它只用 urllib）。
-4. 2314 条 `unverified` 仍未找到入口。已经过两轮路径扩展，边际收益在递减，
-   再挖建议换思路（如按站点类型分组、或人工抽样看看这些站到底长什么样），
-   **但它们始终不是淘汰**。
-5. 一个已知误判：`timothe.ai/tools/pdf-add-link` 是 PDF 工具页，路径里的
-   `add-link` 命中入口词被判死。要不要把子页 noindex 判死收紧成
-   「只有首页 noindex 才判死」是**显式契约变更**（`test_noindex_on_real_entry_page_is_dead`
-   锁着），别顺手改。
-
-## 环境坑
-
-- 项目**必须放在 ~/Projects 之类非 TCC 目录**。放 ~/Downloads 会被 macOS TCC
-  反复拒绝，且 `tccutil reset` 会清掉自己刚勾的授权，形成恶性循环。
-- **Playwright sync API 不能在线程里用**。`sync_playwright()` 基于 greenlet，
-  放进 ThreadPoolExecutor 会直接挂死。`browser_probe.py` 用多进程。
-- **单域名超时只能靠父进程 kill**。`page.goto` 的 timeout 管不住 route 拦截和
-  `page.content()`，SIGALRM 也没用（阻塞在 greenlet 的 C 调用里）。
-- `outputs/` 已进 .gitignore（24MB 截图/xlsx，仓库不跟踪二进制）。
-- 别同时开十几个 claude 实例。
-
-## 验收
+## 验收命令
 
 ```bash
-npm test                                              # 39 项
-python3 -m unittest tests/test_screening_crawler.py   # 23 项
-npm run typecheck
+pytest -v                                             # Python 回归测试 (45 passed)
+npm test                                              # TS 契约测试 (41 passed)
+npm run typecheck                                     # 类型检查
 ```
+
+---
+
+## 历史环境踩坑备忘
+
+- 项目**必须放在 ~/Projects 之类非 TCC 目录**。放 ~/Downloads 会被 macOS TCC 反复拒绝。
+- **Playwright sync API 不能在线程里用**。`sync_playwright()` 基于 greenlet，放进 ThreadPoolExecutor 会直接挂死。
+- **单域名超时只能靠父进程 kill**。`page.goto` 的 timeout 管不住 route 拦截和 `page.content()`。
+- **误杀防护 7 大要点**（见 `scripts/README.md`）：
+  1. noindex 只认能代表站点的页面（SPA 软 404、登录墙不算）；
+  2. `path:` 前缀是伪信号，不能作淘汰依据；
+  3. 裸域和 www 都要试；
+  4. 样例页必须是详情页；
+  5. 子页 noindex 判死需同时满足四条守卫；
+  6. 判同源不能用 `lstrip('www.')`；
+  7. `ENTRY_HINTS` 必须带词边界。
+
