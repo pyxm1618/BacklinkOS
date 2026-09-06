@@ -73,13 +73,14 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 ### 如果域名不存在
 - 新增行：`外链ID=canonical domain`、`平台域名=canonical domain`、`基础状态=候选`、`发现来源=本次真实来源`、`发现时间=本次时间`。
+- **提交入口默认保持为空**：禁止任何未经 Live Verification 的普通字符串 URL 直接写入总表 `提交入口`。只有在通过现场真实核验（Live Verification）产出凭据时才允许记录。
 - 其余未知字段及 5 个实测事实字段严格留空。
 
 ### 如果域名已存在
 - **绝不重复创建新行**；
 - **绝不覆盖已有真实执行字段**（`实测免费`、`实测需登录`、`实测登录方式`、`实测限制`、`实测链接属性`、`最后验证时间`）；
 - **绝不得把`已排除`或`失效`重新改成`候选`**；
-- 仅允许补充安全的 provenance 信息（如原有发现来源为空时补充）。
+- 仅允许补充安全的 provenance 信息（如原有发现来源为空时补充），禁止普通字符串覆盖或写入 `提交入口`。
 
 ### 硬黑名单机制
 如果查询发现总表中域名的 `基础状态 == 已排除` 或 `基础状态 == 失效`：
@@ -91,19 +92,22 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 ## 4. 最低限度 Submission Entry Enrichment
 
-针对 `基础状态 == '候选'` 且准备进入项目执行队列的平台，进行真实入口查找与核验：
+针对 `基础状态 == '候选'` 且准备进入项目执行队列的平台，进行真实入口查找与现场核验（Live Verification）：
 
-### 两层架构原则
+### 核心架构原则
 1. **Live Evidence（真实页面证据）**：
    - 实际请求目标页面（HTTP 200，同源）；
    - **禁止 URL path 单独升级为入口：** 仅凭路径含 submit 且 HTTP 200 绝不足以成为有效入口，页面内必须实际包含机制文案/交互控件（`mechanism_signals` 如 "submit your tool", "add website", "write for us"）。普通页面或空白页断然拒绝；
-   - **登录/注册墙 noindex 防误杀：** 复用 `AUTH_PATH_RE`；若页面属于登录/注册/认证墙（如 `/login`, `/auth`, `/sign-up`），其设置 noindex 属于正常现象，只要具备机制文案或登录跳转特征，绝不误杀；
+   - **Entry 页面本身不因 noindex 筛掉：** 提交入口表单是否 indexable 不属于价值判断条件（Indexability 属于最终建链上线结果页的验证职责）。只要机制文案真实且符合 Policy Guard，即使标记了 `noindex`，也认定为有效 Verified Entry；
+   - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（命中 `AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时（如 `redirect=/submit`, `next=%2Fsubmit` 等），认定为合法 `auth_wall_submission`；但无回调参数的盲猜跳转坚决拒绝；
    - 首页必须确认页面本身具有明确的机制 CTA 文案（如 "Submit your tool", "Create profile to list"），不能无证据拿首页填空。
-2. **Policy Guard（政策守卫拦截）**：
+2. **Policy Guard（政策守卫拦截与 Redirect 验证）**：
    - 必须是 http/https 且同源；
-   - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等。
+   - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等；
+   - **Redirect 后的 Final URL 重新校验：** 现场核验发生重定向时，跳转后的 `final_url` 必须重新通过 Policy Guard（拦截跳转到 pricing 或跨域逃逸），未通过则核验失败。
 3. **写入决策**：
-   - 只有同时具备真实页面机制证据且通过 Policy Guard 的 URL，才写入 `提交入口` 并产生内部 `VerifiedEntry`；
+   - 只有同时具备现场真实证据且通过 Policy Guard 的 URL，才允许记录 `提交入口` 并产生内部 `VerifiedEntry`；
+   - **普通新 discovery 阶段：** 提交入口默认保持为空；
    - **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
    - 严禁在这个阶段提前做免费/Follow/DR/资格等实测事实判定。
 
@@ -113,11 +117,15 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-iching`）中：
 
+### 内部 Live Verification 流程驱动
+- **生产队列 Materialization 必须由内部 live verification 流程驱动：** 
+  禁止外部调用者自行实例化 `VerifiedEntry(...)` 绕过现场核验；公开的编排函数 `materialize_project_row()` 必须在内部现场核验通过后，才由内部 helper 组装项目行；核验失败一律返回 `None`，杜绝任何未经验证行进入生产队列。
+
 ### 创建条件
 同时满足以下四项：
 1. `外链总表.基础状态 == '候选'`；
-2. **具备现场核验通过的 `VerifiedEntry` 对象**（若总表已有历史提交入口，在 Hydration 时也必须现场重新核验通过产生 VerifiedEntry，禁止未经现场核验直接通过）；
-3. `verified_entry.domain` 与 `外链ID` 完全一致；
+2. **经由内部 Live Verification 现场核验通过产生真实证据**；
+3. 核验域名与 `外链ID` 完全一致；
 4. 当前 `project_id + backlink_id` 尚不存在于 `外链管理` 中。
 
 ### 创建内容

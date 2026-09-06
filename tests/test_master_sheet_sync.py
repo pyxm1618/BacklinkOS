@@ -57,6 +57,23 @@ class MasterSheetUpsertTests(unittest.TestCase):
         self.assertEqual(row["发现时间"], "2026-09-06T12:00:00Z")
         self.assertEqual(row["提交入口"], "")
 
+    def test_new_discovery_string_submission_entry_remains_empty_in_master_row(self):
+        # P0-1 严格守卫：new_discoveries 携带普通字符串 submission_entry，但无 live verification evidence
+        # 预期：新 master row.提交入口 == ""
+        existing = []
+        new_items = [{
+            "referring_domain": "example.com",
+            "submission_entry": "https://example.com/submit",
+            "discovery_source": "semrush_competitor",
+        }]
+        merged, stats = upsert_master_rows(existing, new_items)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(stats["new_inserted"], 1)
+        self.assertEqual(
+            merged[0]["提交入口"], "",
+            "禁止任何未经 live verification 的字符串 URL 进入提交入口！"
+        )
+
     def test_existing_domain_not_duplicated(self):
         existing = [{
             "外链ID": "existing.com",
@@ -245,6 +262,73 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
         self.assertEqual(entry_obj.evidence_type, "auth_wall_submission")
         self.assertEqual(entry_obj.url, "https://auth-site.com/login?redirect=/submit")
 
+    def test_p0_3_verify_submission_entry_rejects_redirect_to_pricing(self):
+        # P0-3: example.com/submit -> redirect example.com/pricing -> reject
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://example.com/pricing",
+                "mechanism_signals": ["submit a tool"],
+            }
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        self.assertIsNone(entry_obj, "重定向到 /pricing 的入口必须被 Policy Guard 坚决拒绝！")
+        self.assertIn("未通过 Policy Guard", reason)
+
+    def test_p0_3_verify_submission_entry_rejects_redirect_to_thirdparty(self):
+        # P0-3: example.com/submit -> redirect thirdparty.com/form -> reject
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://thirdparty.com/form",
+                "mechanism_signals": ["submit a tool"],
+            }
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        self.assertIsNone(entry_obj, "重定向到跨域域名的入口必须被 Policy Guard 坚决拒绝！")
+        self.assertIn("跨域", reason)
+
+    def test_p1_4_submission_entry_with_noindex_is_accepted_when_mechanism_present(self):
+        # P1-4: https://example.com/submit, HTTP 200, mechanism_signals = ["submit your product"], noindex = true
+        # 预期: Verified Entry (提交表单页面的 indexability 不作为淘汰条件)
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://example.com/submit",
+                "mechanism_signals": ["submit your product"],
+                "noindex": True,
+            }
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        self.assertIsNotNone(entry_obj, "Entry 页面本身不应因标记 noindex 被筛掉！")
+        self.assertEqual(entry_obj.url, "https://example.com/submit")
+        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
+        self.assertIn("现场核验通过", reason)
+
+    def test_p1_5_auth_wall_submission_with_redirect_callback_is_verified(self):
+        # P1-5: 请求 example.com/submit，跳到 example.com/login?redirect=/submit
+        # 登录页本身未再写机制文案，但保留了原始 candidate 请求 + auth wall + 回调参数的完整事实链
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://example.com/login?redirect=%2Fsubmit",
+                "mechanism_signals": [],  # 登录页通常仅有 Sign In 文案
+                "noindex": True,
+            }
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        self.assertIsNotNone(entry_obj, "包含明确回跳提交参数的认证墙应当作为有效入口核验通过！")
+        self.assertEqual(entry_obj.url, "https://example.com/login?redirect=%2Fsubmit")
+        self.assertEqual(entry_obj.evidence_type, "auth_wall_submission")
+        self.assertIn("认证墙回调", reason)
+
+    def test_p1_5_auth_wall_submission_without_callback_is_rejected(self):
+        # 任意未知路径跳到纯 /login（无 callback 参数）-> 拒绝，防止盲猜
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://example.com/login",
+                "mechanism_signals": [],
+            }
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/random", fetcher=fake_fetch)
+        self.assertIsNone(entry_obj, "无明确 callback 参数的未知登录跳转绝不能当做有效入口！")
+
     def test_discover_and_verify_entry_locates_subpage(self):
         def fake_fetch(url):
             if url == "https://testdir.com/":
@@ -296,18 +380,22 @@ class ProjectSynchronizationTests(unittest.TestCase):
             "基础状态": MASTER_STATUS_CANDIDATE,
             "提交入口": "https://good-opportunity.com/submit",
         }
-        verified_entry = VerifiedEntry(
-            url="https://good-opportunity.com/submit",
-            domain="good-opportunity.com",
-            evidence_type="subpage_mechanism",
-            evidence_summary="包含 submit a tool 机制",
-        )
+        # 通过 fake fetcher 驱动真实 live verification
+        def fake_fetch(url):
+            if url == "https://good-opportunity.com/submit":
+                return {
+                    "status": 200,
+                    "final_url": "https://good-opportunity.com/submit",
+                    "mechanism_signals": ["submit a tool"],
+                }
+            return {"status": 404}
+
         existing_project_rows = []
         prow = materialize_project_row(
             master_row=master_row,
             existing_project_rows=existing_project_rows,
             project_id="quick-iching",
-            verified_entry=verified_entry,
+            fetcher=fake_fetch,
         )
         self.assertIsNotNone(prow)
         self.assertEqual(prow["项目ID"], "quick-iching")
@@ -316,16 +404,21 @@ class ProjectSynchronizationTests(unittest.TestCase):
         self.assertEqual(prow["尝试次数"], "0")
         self.assertIn("subpage_mechanism", prow["证据摘要"])
 
-    def test_materialize_fails_without_verified_entry_object(self):
-        # 封死未经 live verification 的普通字符串绕过
+    def test_materialize_fails_when_live_verification_fails(self):
+        # 生产队列 materialization 必须由内部 live verification 驱动，核验失败绝不生成行
         master_row = {
             "外链ID": "unverified.com",
             "平台域名": "unverified.com",
             "基础状态": MASTER_STATUS_CANDIDATE,
             "提交入口": "https://unverified.com/submit",
         }
-        # 不传 verified_entry 必须返回 None
-        self.assertIsNone(materialize_project_row(master_row, [], "quick-iching", verified_entry=None))
+        def fake_fetch_fail(url):
+            return {
+                "status": 200,
+                "final_url": "https://unverified.com/submit",
+                "mechanism_signals": [],  # 无机制文案
+            }
+        self.assertIsNone(materialize_project_row(master_row, [], "quick-iching", fetcher=fake_fetch_fail))
 
     def test_existing_project_row_not_duplicated_or_reset(self):
         master_row = {
@@ -334,28 +427,28 @@ class ProjectSynchronizationTests(unittest.TestCase):
             "基础状态": MASTER_STATUS_CANDIDATE,
             "提交入口": "https://active-task.com/submit",
         }
-        verified_entry = VerifiedEntry(
-            url="https://active-task.com/submit",
-            domain="active-task.com",
-            evidence_type="subpage_mechanism",
-            evidence_summary="test",
-        )
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": "https://active-task.com/submit",
+                "mechanism_signals": ["submit"],
+            }
         existing_project_rows = [{
             "项目ID": "quick-iching",
             "外链ID": "active-task.com",
             "状态": "已提交",
             "结果链接": "https://active-task.com/p/quickiching",
         }]
-        prow = materialize_project_row(master_row, existing_project_rows, "quick-iching", verified_entry=verified_entry)
+        prow = materialize_project_row(master_row, existing_project_rows, "quick-iching", fetcher=fake_fetch)
         self.assertIsNone(prow)
 
     def test_excluded_or_dead_master_row_does_not_materialize(self):
-        verified_entry = VerifiedEntry(
-            url="https://excluded.com/submit",
-            domain="excluded.com",
-            evidence_type="subpage_mechanism",
-            evidence_summary="test",
-        )
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": url,
+                "mechanism_signals": ["submit"],
+            }
         excluded_master = {
             "外链ID": "excluded.com",
             "基础状态": MASTER_STATUS_EXCLUDED,
@@ -366,16 +459,16 @@ class ProjectSynchronizationTests(unittest.TestCase):
             "基础状态": MASTER_STATUS_DEAD,
             "提交入口": "https://dead.com/submit",
         }
-        self.assertIsNone(materialize_project_row(excluded_master, [], "quick-iching", verified_entry=verified_entry))
-        self.assertIsNone(materialize_project_row(dead_master, [], "quick-iching", verified_entry=verified_entry))
+        self.assertIsNone(materialize_project_row(excluded_master, [], "quick-iching", fetcher=fake_fetch))
+        self.assertIsNone(materialize_project_row(dead_master, [], "quick-iching", fetcher=fake_fetch))
 
     def test_preserves_quick_iching_historical_terminal_statuses(self):
-        verified_entry = VerifiedEntry(
-            url="https://e2e-protected.com/submit",
-            domain="e2e-protected.com",
-            evidence_type="subpage_mechanism",
-            evidence_summary="test",
-        )
+        def fake_fetch(url):
+            return {
+                "status": 200,
+                "final_url": url,
+                "mechanism_signals": ["submit"],
+            }
         for terminal_status in ["已排期", "需人工", "不适用", "已上线", "失败"]:
             master_row = {
                 "外链ID": "e2e-protected.com",
@@ -387,7 +480,8 @@ class ProjectSynchronizationTests(unittest.TestCase):
                 "外链ID": "e2e-protected.com",
                 "状态": terminal_status,
             }]
-            self.assertIsNone(materialize_project_row(master_row, existing, "quick-iching", verified_entry=verified_entry))
+            self.assertIsNone(materialize_project_row(master_row, existing, "quick-iching", fetcher=fake_fetch))
+
 
 
 class P0_2_ExistingMasterEntryVerificationTests(unittest.TestCase):

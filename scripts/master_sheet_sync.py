@@ -19,7 +19,7 @@ import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 # 复用已有且经过全面测试的 screening_crawler 能力
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,6 +117,24 @@ HOMEPAGE_EXPLICIT_CTA_PATTERNS = [
     re.compile(r"\b(?:create|sign\s*up\s+to\s+create)\s+(?:a\s+)?(?:profile|listing|account\s+to\s+list)\b", re.I),
     re.compile(r"\bjoin\s+and\s+submit\b", re.I),
 ]
+
+# 常见登录/认证跳转返回参数名，用于识别 /submit -> /login?redirect=/submit 模式
+AUTH_REDIRECT_PARAMS = {
+    "redirect",
+    "redirect_url",
+    "redirect_to",
+    "next",
+    "return",
+    "return_to",
+    "continue",
+    "callback",
+    "target",
+    "goto",
+    "dest",
+    "destination",
+    "url",
+}
+
 
 
 # ==========================================
@@ -227,6 +245,73 @@ def verify_homepage_as_entry(home_result: dict) -> tuple[bool, str]:
     return False, "首页未包含明确的提交/收录/建链 CTA，不能拿首页填空"
 
 
+def check_auth_wall_callback_evidence(
+    req_url: str,
+    final_url: str,
+    domain: str,
+    is_discovered_candidate: bool = False,
+) -> tuple[bool, str]:
+    """检查是否属于真实合法的 /submit -> /login 重定向证据链。
+    
+    必须满足以下完整事实链条：
+    1. 原始请求 req_url 必须通过 Policy Guard，且具有入口依据：
+       - 来自平台 CTA / 页面链接（is_discovered_candidate=True）
+       - 或其 path 命中 ENTRY_HINTS（如 /submit, /add-tool 等）；
+    2. 跳转后的 final_url 必须通过 Policy Guard，且属于同平台（canonical_domain 一致）；
+    3. final_url 的 path 命中 AUTH_PATH_RE（登录/注册/认证墙）；
+    4. final_url 的 query 参数中明确包含指向提交流程的回调/跳转参数（如 redirect=/submit, next=/add 等）；
+    5. 重定向目标参数解析出的路径本身必须通过 Policy Guard 且包含提交机制意图（非 pricing 等排除路径）。
+    """
+    cd = canonical_domain(domain)
+    if not cd:
+        return False, "域名无效"
+        
+    req_ok, req_reason = submission_entry_policy_guard(req_url, domain=cd)
+    if not req_ok:
+        return False, f"原始请求未通过 Policy Guard: {req_reason}"
+        
+    req_path = (urlparse(req_url).path or "/").strip()
+    is_hint_path = bool(ENTRY_HINTS.search(req_path))
+    if not is_discovered_candidate and not is_hint_path:
+        return False, "原始请求缺乏入口来源证据（非发现候选且非提示路径）"
+        
+    final_ok, final_reason = submission_entry_policy_guard(final_url, domain=cd)
+    if not final_ok:
+        return False, f"最终跳转未通过 Policy Guard: {final_reason}"
+        
+    parsed_final = urlparse(final_url)
+    final_path = (parsed_final.path or "/").strip()
+    if not AUTH_PATH_RE.search(final_path):
+        return False, f"最终跳转路径非认证墙: {final_path}"
+        
+    qs = parse_qs(parsed_final.query)
+    found_valid_callback = False
+    callback_val = ""
+    
+    for k, vals in qs.items():
+        k_lower = k.lower()
+        if k_lower in AUTH_REDIRECT_PARAMS or "redirect" in k_lower or "return" in k_lower or "next" in k_lower:
+            for v in vals:
+                decoded = unquote(v).strip()
+                dec_path = urlparse(decoded).path if "://" in decoded else decoded.split("?")[0]
+                if dec_path:
+                    # 检查是否命中排除路径（比如 redirect=/pricing 绝对不行）
+                    for p in INVALID_ENTRY_PATH_PATTERNS:
+                        if p.search(dec_path):
+                            return False, f"认证跳转回调指向排除路径: {dec_path}"
+                    if ENTRY_HINTS.search(dec_path) or (req_path != "/" and req_path in dec_path):
+                        found_valid_callback = True
+                        callback_val = decoded
+                        break
+        if found_valid_callback:
+            break
+            
+    if not found_valid_callback:
+        return False, "认证跳转页面未包含明确返回提交流程的回调参数"
+        
+    return True, f"访问提交入口触发平台认证墙，回调参数明确返回提交流程 ({callback_val}): {final_url}"
+
+
 def verify_submission_entry(
     domain: str,
     entry_url: str,
@@ -237,10 +322,11 @@ def verify_submission_entry(
     契约规则：
     1. 必须先通过 Policy Guard；
     2. 现场打开页面：
+       - 检查 final_url 是否依然通过 Policy Guard（P0-3 必须验证 redirect 后 final_url，防止逃逸到 pricing 或跨域）；
        - 若是首页，必须通过 verify_homepage_as_entry（页面内有明确 CTA 机制证据）；
-       - 若是子页面，必须具备明确机制信号（mechanism_signals）；
-         单纯 HTTP 200 + URL 路径含 submit 绝不足以成为证据；
-       - noindex 处理：若属于登录/注册墙（AUTH_PATH_RE），允许 noindex；非认证墙 noindex 拒绝。
+       - 若触发认证墙跳转（如 /submit -> /login?redirect=/submit），检查合法的回调证据链（P1-5）；
+       - 若是子页面，必须具备明确机制信号（mechanism_signals）；单纯 HTTP 200 + URL 路径含 submit 绝不足以成为证据（P0-1）；
+       - noindex 处理：提交入口页面本身不因 noindex 筛掉，只要机制真实且符合 Guard（P1-4）；
     3. 验证成功返回 (VerifiedEntry, 成功说明)；
     4. 验证失败返回 (None, 失败理由)。
     """
@@ -258,6 +344,12 @@ def verify_submission_entry(
         return None, f"页面不可达 (HTTP {res.get('status', 0)})"
         
     final_url = res.get("final_url") or entry_url
+    
+    # P0-3 修复：必须对 redirect 后的 final_url 重新执行 Policy Guard
+    allowed_final, final_guard_reason = submission_entry_policy_guard(final_url, domain=cd)
+    if not allowed_final:
+        return None, f"最终跳转 URL 未通过 Policy Guard: {final_guard_reason}"
+
     path = (urlparse(final_url).path or "/").strip()
     
     # 区分是否为首页
@@ -271,17 +363,29 @@ def verify_submission_entry(
                 evidence_summary=cta_reason,
             ), cta_reason
         return None, f"首页未包含有效机制 CTA: {cta_reason}"
-        
-    # 子页面 noindex 处理：认证墙允许 noindex，其他页面 noindex 视为不可索引/不可用
-    is_auth_wall = bool(AUTH_PATH_RE.search(path))
-    if res.get("noindex") and not is_auth_wall:
-        return None, "入口子页面标记 noindex 且非认证墙页面"
-        
-    # P0-1 核心守卫：必须有真实页面机制文案/控件（mechanism_signals）
+
+    # P1-5 修复：支持真实 /submit -> /login?redirect=/submit 的认证墙回调证据
+    is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
+        req_url=entry_url,
+        final_url=final_url,
+        domain=cd,
+        is_discovered_candidate=True,
+    )
+    if is_auth_callback:
+        return VerifiedEntry(
+            url=final_url,
+            domain=cd,
+            evidence_type="auth_wall_submission",
+            evidence_summary=auth_reason,
+        ), "现场核验通过 (认证墙回调证据)"
+
+    # P0-1 核心守卫：非认证墙回调的子页面必须有真实机制文案/控件（mechanism_signals）
     has_mech = bool(res.get("mechanism_signals"))
     if not has_mech:
         return None, "页面虽返回 200 但未检测到实际提交/收录/建链机制文案（拒绝仅凭 URL 路径臆想）"
         
+    # P1-4 修复：页面本身无论是否标记 noindex，只要机制真实且符合 Guard，均不被误杀
+    is_auth_wall = bool(AUTH_PATH_RE.search(path))
     evidence_type = "auth_wall_submission" if is_auth_wall else "subpage_mechanism"
     return VerifiedEntry(
         url=final_url,
@@ -301,9 +405,11 @@ def discover_and_verify_entry(
     流程：
     1. 访问首页（裸域/www 双试，由 fetch_page/probe 处理）；
     2. 获取首页 candidate_urls（按 strong/weak 排序）与 COMMON_PATHS；
-    3. 访问子页面，寻找包含真实 mechanism 信号的页面：
-       - 严格执行 P0-1：只有返回 200 且真正包含 mechanism_signals 的页面才算真入口；单纯路径像 submit 坚决不通过；
-       - 严格执行 P1：如果是 AUTH_PATH_RE（登录/注册墙），允许 noindex，防止误杀；非认证墙 noindex 仍然跳过；
+    3. 访问子页面，寻找包含真实 mechanism 信号或合法 auth wall 回调的页面：
+       - 严格执行 P0-1：只有返回 200 且真正包含 mechanism_signals 或合法 auth wall 回调才算真入口；单纯路径像 submit 坚决不通过；
+       - 严格执行 P1-4：Entry 页面本身不因 noindex 筛掉；
+       - 严格执行 P1-5：支持真实 /submit -> /login?redirect=/submit 回调证据链；
+       - 严格执行 P0-3：任何最终跳转 URL 必须重新通过 Policy Guard；
     4. 对候选 URL 跑 submission_entry_policy_guard；
     5. 若找到真实子页面入口，返回 (VerifiedEntry, 成功理由)；
     6. 若只有首页且首页具备明确 CTA，返回 (VerifiedEntry, 首页理由)；
@@ -364,16 +470,28 @@ def discover_and_verify_entry(
             continue
             
         final_url = page_res.get("final_url") or target_url
+        # P0-3 修复：对最终 URL 重新执行 Policy Guard
         allowed_final, _ = submission_entry_policy_guard(final_url, domain=cd)
         if not allowed_final:
             continue
             
-        final_path = urlparse(final_url).path or "/"
-        is_auth_wall = bool(AUTH_PATH_RE.search(final_path))
-        
-        # P1 修复：登录/注册墙 noindex 是正常的，不能误杀；非认证墙的 noindex 跳过
-        if page_res.get("noindex") and not is_auth_wall:
-            continue
+        # P1-4 修复：Entry 页面本身不因 noindex 筛掉（已移除 noindex 过滤）
+
+        # P1-5 修复：支持真实 /submit -> /login?redirect=/submit 认证墙回调证据
+        is_from_candidate_list = target_url in candidate_urls
+        is_auth_callback, auth_reason = check_auth_wall_callback_evidence(
+            req_url=target_url,
+            final_url=final_url,
+            domain=cd,
+            is_discovered_candidate=is_from_candidate_list,
+        )
+        if is_auth_callback:
+            return VerifiedEntry(
+                url=final_url,
+                domain=cd,
+                evidence_type="auth_wall_submission",
+                evidence_summary=auth_reason,
+            ), "通过真实页面探测闭环真实入口 (认证墙回调)"
             
         # P0-1 核心修复：坚决杜绝 URL path 单独升级！必须有实际机制信号 mechanism_signals
         has_mech = bool(page_res.get("mechanism_signals"))
@@ -381,6 +499,8 @@ def discover_and_verify_entry(
             # 即使 path 是 /submit，但页面没有机制信号，绝不通过！
             continue
             
+        final_path = urlparse(final_url).path or "/"
+        is_auth_wall = bool(AUTH_PATH_RE.search(final_path))
         evidence_type = "auth_wall_submission" if is_auth_wall else "subpage_mechanism"
         entry_obj = VerifiedEntry(
             url=final_url,
@@ -402,6 +522,7 @@ def discover_and_verify_entry(
         return entry_obj, home_reason
         
     return None, "未定位到用户可提交的入口页（证据缺失，保持候选状态）"
+
 
 
 # ==========================================
@@ -469,12 +590,13 @@ def upsert_master_rows(
         discovery_source = str(item.get("discovery_source") or item.get("发现来源") or "").strip()
         discovery_time = str(item.get("discovery_time") or item.get("发现时间") or now_iso).strip()
         
-        # 提交入口：必须经过验证才能传入，否则为空
-        submit_entry = str(item.get("submission_entry") or item.get("提交入口") or "").strip()
-        if submit_entry:
-            valid_entry, _ = submission_entry_policy_guard(submit_entry, domain=cid)
-            if not valid_entry:
-                submit_entry = ""
+        # P0-1 严格守卫：普通新 discovery 写入总表，提交入口必须默认保持空！
+        # 坚决禁止任何未经现场真实核验（Live Verification）的普通字符串 URL 写入提交入口。
+        # 只有在显式提供了合法且域匹配的 VerifiedEntry 凭据对象时，才允许记录提交入口。
+        submit_entry = ""
+        v_entry = item.get("verified_entry")
+        if isinstance(v_entry, VerifiedEntry) and canonical_domain(v_entry.domain) == cid and v_entry.url:
+            submit_entry = v_entry.url
         
         if cid not in master_map:
             new_row = {col: "" for col in MASTER_HEADER}
@@ -521,26 +643,16 @@ def upsert_master_rows(
 # 6. Project Management Materialization 算法
 # ==========================================
 
-def materialize_project_row(
+def _materialize_verified_project_row(
     master_row: dict[str, Any],
     existing_project_rows: list[dict[str, Any]],
     project_id: str,
-    verified_entry: VerifiedEntry | None = None,
+    verified_entry: VerifiedEntry,
     target_url: str = "",
 ) -> dict[str, str] | None:
-    """为明确项目（例如 quick-iching）创建【外链管理】待提交行。
+    """内部底层 helper：仅供内部 live verification 流程在产生现场证据后组装项目行。
     
-    契约条件（必须全部满足）：
-    1. 必须显式提供经过 Live Verification 产生的 VerifiedEntry 对象；
-    2. verified_entry 的 domain 必须精确匹配 master_row 的 canonical domain；
-    3. master_row.基础状态 == '候选'；
-    4. 当前 project_id + backlink_id 尚不存在于 existing_project_rows 中。
-    
-    保护规则：
-    若该项目的该外链已存在任何状态（待提交/已提交/已上线/需人工/不适用等），
-    绝对不能重复创建，也绝对不能重置为待提交。
-    
-    返回: 新行 dict，若不满足条件则返回 None
+    严禁作为生产外部公开入口，外部必须调用 materialize_project_row 进行现场核验。
     """
     proj = str(project_id or "").strip()
     if not proj:
@@ -550,7 +662,6 @@ def materialize_project_row(
     if not backlink_id:
         return None
         
-    # P0-2 守卫：必须提供现场核验凭证 VerifiedEntry，禁止仅凭普通字符串 URL 通过
     if not isinstance(verified_entry, VerifiedEntry):
         return None
     if canonical_domain(verified_entry.domain) != backlink_id:
@@ -582,6 +693,72 @@ def materialize_project_row(
         "原因/备注": "",
         "证据摘要": f"{verified_entry.evidence_type}: {verified_entry.evidence_summary}",
     }
+
+
+def materialize_project_row(
+    master_row: dict[str, Any],
+    existing_project_rows: list[dict[str, Any]],
+    project_id: str,
+    target_url: str = "",
+    entry_url: str = "",
+    fetcher: Callable[[str], dict] | None = None,
+    entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
+    entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
+) -> dict[str, str] | None:
+    """为明确项目（例如 quick-iching）创建【外链管理】待提交行的正式公开生产编排函数。
+    
+    契约规则（P0-2）：
+    1. 生产队列 materialization 必须由内部 live verification 流程驱动；
+    2. 禁止调用方通过自行实例化 VerifiedEntry 绕过现场核验；
+    3. 内部核验链路：
+       - 若指定了 entry_url 或 master_row 已有'提交入口'：调用 entry_verifier 进行现场核验；
+       - 若无已知入口：调用 entry_finder 现场探测；
+       - 验证失败或未获得真实证据：返回 None，绝不入库；
+       - 验证成功：由内部 helper 组装待提交行；
+    4. 保证 project_id + backlink_id 唯一，保留已有项目行状态，不重复创建。
+    
+    返回: 新行 dict，若核验不通过或不满足唯一性条件则返回 None
+    """
+    proj = str(project_id or "").strip()
+    if not proj:
+        return None
+        
+    backlink_id = canonical_domain(master_row.get("外链ID") or master_row.get("平台域名") or "")
+    if not backlink_id:
+        return None
+        
+    status = str(master_row.get("基础状态") or "").strip()
+    if status != MASTER_STATUS_CANDIDATE:
+        return None
+
+    # 查重检查：已存在则绝不重复创建
+    for prow in existing_project_rows:
+        p_proj = str(prow.get("项目ID") or "").strip()
+        p_bid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+        if p_proj == proj and p_bid == backlink_id:
+            return None
+
+    _verifier = entry_verifier or (lambda d, u: verify_submission_entry(d, u, fetcher=fetcher))
+    _finder = entry_finder or (lambda d: discover_and_verify_entry(d, fetcher=fetcher))
+
+    cand_entry = str(entry_url or master_row.get("提交入口") or "").strip()
+    verified_obj: VerifiedEntry | None = None
+
+    if cand_entry:
+        verified_obj, _ = _verifier(backlink_id, cand_entry)
+    else:
+        verified_obj, _ = _finder(backlink_id)
+
+    if not verified_obj:
+        return None
+
+    return _materialize_verified_project_row(
+        master_row=master_row,
+        existing_project_rows=existing_project_rows,
+        project_id=proj,
+        verified_entry=verified_obj,
+        target_url=target_url,
+    )
 
 
 # ==========================================
@@ -668,7 +845,7 @@ def batch_hydrate_candidates(
                 mrow["提交入口"] = verified_obj.url
                 
         if verified_obj:
-            prow = materialize_project_row(
+            prow = _materialize_verified_project_row(
                 master_row=mrow,
                 existing_project_rows=existing_project_rows + new_project_rows,
                 project_id=proj,
