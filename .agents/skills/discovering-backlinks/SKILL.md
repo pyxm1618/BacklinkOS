@@ -7,31 +7,37 @@ description: Use when the user asks to 抓外链, 找外链, 批量抄竞品外�
 
 ## 目标
 
-从近期已经跑出 SEO 结果的项目反查真实 Referring Domains，规范化后对平台级唯一事实库【外链总表】实行 Upsert，进行最低限度 Submission Entry Enrichment，并在明确项目上下文中为【外链管理】生成待提交行。
+从近期已经跑出 SEO 结果的项目反查真实 Referring Domains，规范化后对平台级唯一事实库【外链总表】实行 Upsert，全量投影项目待提交 Backlog（UNKNOWN != REJECT），执行小批量 Bounded Execution Preparation 进行现场 Submission Entry 核验，并在明确项目上下文中为 `backlink-autofill` 准备 Ready 队列。
 
 **核心原则：**
-- Discovery 负责**发现候选**和**最低限度执行入口准备**；
-- `backlink-autofill` 负责通过真实浏览器执行，真正判断免费、登录、限制、提交、上线和链接属性；
+- **PHASE A (Master Upsert)**：负责**发现候选**并合并入库，新行提交入口保持为空，不预设实测字段；
+- **PHASE B (Project Backlog Projection)**：纯数据库投影，Master 候选默认全量生成项目【外链管理】`待提交` 行，UNKNOWN != REJECT；
+- **PHASE C (Bounded Execution Preparation)**：每次小批量（如 10/20/50）进行 Submission Entry 现场核验；Only VerifiedEntry may become READY FOR AUTOFILL，但 VerifiedEntry is NOT required for existence in Project Backlog；
+- **PHASE D (`backlink-autofill`)**：通过真实浏览器执行，真正判断免费、登录、限制、提交、上线和链接属性；
 - 不在中间重新创造一个新的 Screening 层；旧的 `screening-backlinks` 已退出主工作流（仅作为 legacy / optional 历史排查工具保留）。
 
-## 架构与数据流
+## 架构与数据流 (Phase A ~ Phase D)
 
 ```text
-discovering-backlinks
-        ↓
+【PHASE A — Discover / Upsert Master】
 发现真实 referring domains
         ↓
 canonicalize / 去重
         ↓
-写入或合并【外链总表】（Master Sheet Upsert）
+写入或合并【外链总表】（Master Sheet Upsert，提交入口严格留空）
         ↓
-最低限度 Submission Entry Enrichment
+【PHASE B — Project Backlog Projection】
+纯数据库/内存投影（无网络IO）
+Master 候选（剔除已排除/失效/已证实硬不兼容）默认生成【外链管理】待提交行
+Backlog Size 达到数千规模（UNKNOWN 默认包含，保护历史行）
         ↓
-为明确项目创建【外链管理】待提交行（Materialization）
+【PHASE C — Bounded Execution Preparation】
+小批量（10 / 20 / 50）Bounded Batch Hydration 与现场核验
+已有入口 Live Revalidate / 空入口现场探测 (Live Evidence + Policy Guard)
+核验通过产出 VerifiedEntry 并写回 Master.提交入口，生成 Ready for Autofill 队列
         ↓
-backlink-autofill
-        ↓
-真实浏览器执行
+【PHASE D — backlink-autofill】
+真实浏览器自动化执行（登录、填表、提交、上线校验）
         ↓
 回写真实平台事实和项目执行结果
 ```
@@ -46,7 +52,7 @@ backlink-autofill
    - 若域名不存在：新增记录，`基础状态=候选`，记录真实发现来源与时间，实测字段留空。
    - 若域名已存在：**不得重复创建**，不得覆盖已有真实执行字段，**绝不得将`已排除`或`失效`重新改成`候选`**，新发现只能补充安全的 provenance 信息。
 3. **硬黑名单直接来自外链总表。** 若发现 domain 查询显示 `基础状态=已排除` 或 `基础状态=失效`，则视为历史已知硬负例：不重复研究，不重新进入项目执行队列，不覆盖排除原因，记录历史事实即可。不再维护第二套独立黑名单数据库。
-4. **最低限度 Submission Entry Enrichment。** 对于 `基础状态=候选` 的平台，在进入项目执行队列前确认真实可执行入口：
+4. **最低限度 Submission Entry Enrichment（执行就绪核验）。** 针对准备进入执行队列的平台，在 Execution Preparation 阶段确认真实可执行入口：
    - 严格区分两层：**Live Evidence（真实打开页面检测到可操作提交表单 Actionable Form，或同域合法认证墙，或首页明确 CTA） → Candidate URL → Policy Guard 校验 → 写入 Sheet**。
    - **正文机制文案仅作为 Hint，绝不得单独升级为 Entry：** 普通 SEO 文章、搜索结果页（`?q=`）、软文即便出现 "submit product"、"guest post" 等文字，若无真实提交表单或合规认证墙，坚决不判 Verified Entry。
    - **禁止 URL path 单独升级为有效入口：** 仅凭路径类似 `/submit` 且 HTTP 200 绝不足以成为真入口，页面内必须实际包含真实可操作表单（Actionable Form）或合规认证墙。普通文章或空白页坚决拒绝。
@@ -64,19 +70,25 @@ backlink-autofill
      - **Callback 同源校验：** callback 若为绝对 URL，必须验证 hostname 与平台同源；外部跨域 callback 坚决拒绝。
    - 严禁乱填：pricing、terms、privacy、category、SEO report、普通 article、自动统计页、unrelated landing page 绝不能冒充提交入口。
    - 平台首页：只有真实确认首页存在明确的提交/收录/建链 CTA 时（如 Submit your product, Create profile, Sign up to list, Add your site）才允许作为提交入口；否则绝不能拿首页填空。
-   - **找不到入口时：提交入口继续为空，候选继续保留。绝对不因为找不到入口而把候选标记为已排除！**
+   - **找不到入口时：提交入口保持为空，候选继续保留。绝对不因为找不到入口而把候选标记为已排除！**
    - 严禁在这个阶段提前根据 Follow/Nofollow/DR/免费性等淘汰候选。
-5. **项目执行行 Materialization 契约。** Discovery 必须运行在**明确项目上下文**中（例如 `当前项目 = quick-iching`）：
-   - **内部 Live Verification 流程驱动：** 生产队列 Materialization 必须由内部 live verification 流程驱动，严禁外部调用者手造 `VerifiedEntry` 绕过现场核验；
-   - **通用 Project Compatibility Hard Gate：** 针对平台的强类型约束（如 `AI-only` 平台强约束要求仅接受 AI 工具），在 `project_context.ai_powered == False`（非 AI 项目如 Quick I Ching）时，硬门禁必须拦截，拒绝为其生成项目待提交行，同时总表基础状态保持为 `候选`（不影响其他 AI 项目复用）；
-   - **已有历史提交入口不得绕过核验：** 总表现存历史 `提交入口` 必须通过内部 Live Verification 现场核验产生真实证据，才能建立项目待提交行；现场核验不通过则不 materialize，保持候选，且不随意替换原 URL。
-   - 仅当满足：`外链总表.基础状态 == 候选` AND `经由内部核验产生真实证据` AND `项目兼容性 Gate 通过` AND `当前 project_id + backlink_id 尚不存在` 时，才在 `外链管理` 创建待提交行。
-   - 待提交行默认值：`项目ID=当前项目ID`、`外链ID=canonical domain`、`外链域名=canonical domain`、`状态=待提交`、`尝试次数=0`、`目标URL=空（除非明确指定深链）`、其他结果字段留空。
-   - **绝对不能创建重复项目行：** `project_id + backlink_id` 唯一。若已存在（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用 任何一种），绝不重新创建或重置为待提交。Quick I Ching 已有历史记录必须优先保护。
-6. **存量池严格双边界 Bounded Batch Hydration。** 支持对总表存量候选池按批次进行 Hydration：
+5. **项目 Backlog Projection 与 Execution Readiness 契约。** Discovery 必须运行在**明确项目上下文**中（例如 `当前项目 = quick-iching`）：
+   - **PHASE B — Project Backlog Projection（全量机会池生成）：**
+     - 纯数据库级投影，零网络 IO，**禁止要求 Master 提交入口非空**；
+     - **UNKNOWN != REJECT：** 入口未知、免费未知、需登录未知、Follow 未知等绝不阻断进入项目 Backlog；
+     - **通用 Project Compatibility Hard Gate：** 针对平台的强类型约束（如已持久化强事实标明 `AI-only` 平台强约束要求仅接受 AI 工具），在 `project_context.ai_powered == False`（非 AI 项目如 Quick I Ching）时，拦截不为其生成项目待提交行，同时总表基础状态保持为 `候选`（不影响其他 AI 项目复用）；若缺乏明确证据，UNKNOWN 默认包含；
+     - **绝对不能创建重复项目行：** `project_id + backlink_id` 唯一。若已存在（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用 任何一种），绝不重新创建或重置为待提交。Quick I Ching 已有历史记录必须优先保护；
+     - 待提交行默认值：`项目ID=当前项目ID`、`外链ID=canonical domain`、`外链域名=canonical domain`、`状态=待提交`、`尝试次数=0`、`目标URL=默认 canonical URL 或指定深链`、其他结果字段留空。
+   - **PHASE C — Bounded Execution Preparation（小批量执行就绪准备）：**
+     - 从已有 `待提交` 记录中按批次处理（如 `target_ready_count=10`，`scan_limit=50`）；
+     - 关联 Master 进行现场核验（已有入口 Live Revalidate，空入口现场探测）；
+     - **核验通过才成为 Ready for Autofill**（写入 Master 提交入口，组装 VerifiedEntry 批次）；
+     - **核验失败或 unresolved：项目行仍保留，状态仍为待提交，尝试次数仍为 0，不标失败，继续下一候选**。
+6. **存量池严格双边界 Bounded Batch Hydration。** 支持对总表存量候选池按批次进行 Execution Preparation：
    - 必须显式传入 `project_id`、`target_count`（期望成功的项目行数量）与 `scan_limit`（最多检查候选数，`scan_limit >= target_count`）；
    - **双边界停止条件：** `succeeded >= target_count` 或 `processed >= scan_limit` 任意一个达到立即停止退出；
    - 严禁仅靠目标数量在大量失败时无限扫描 3000+ 候选。
+   - 明确说明：此机制只控制本次 Ready Preparation 数量，绝不能限制 Project Sheet 总人口。
 
 7. **Semrush 查询固定优先走已经跑通的 `sem.3ue.com` 中转。禁止因为官方 Semrush API units 不足而停止，也禁止改走需要 API units 的官方 Semrush API/connector。** 中转会话失效时，只处理登录/会话问题后继续中转。
 8. **Semrush 正式批量必须使用 `scripts/semrush-relay-batch.js`。** 不得每次重新猜 endpoint、参数、分页、字段语义或 session key 获取逻辑。
@@ -104,10 +116,11 @@ backlink-autofill
 6. 对通过项目抓 Referring Domains；根据 `refdomains.total` 自动分页抓完整，保留 complete/partial 状态。
 7. 保存原始事实：来源项目、Organic 状态/流量、referring domain、backlinks_num、AS、first_seen、last_seen、lost/new、is_follow。
 8. 规范化并聚合：通过 `canonical_domain` 统一格式，按 referring domain 聚合成功项目覆盖数和出现次数。
-9. **更新【外链总表】：** 对 `@外链管理总控表` 的 `外链总表` 实行 Upsert（新增候选，保护已有实测事实与已排除/失效状态，不写任何实测字段）。
-10. **执行 Submission Entry Enrichment：** 在明确项目上下文（如 `quick-iching`）下，对候选进行真实页面探测（Live Evidence + Policy Guard），找到真实入口则写入总表 `提交入口`；找不到则留空保留。
-11. **Materialize 项目待提交行：** 仅为具备真实验证入口且项目记录不存在的候选，在【外链管理】Tab 创建 `待提交` 行。后续由 `backlink-autofill` 在真实浏览器中执行。
-12. **[可选/历史旁路]** 如需调用 legacy `screening-backlinks`，按 `references/screening-handoff.md` 处理 `source_url_enrichment_required` 补证。
+9. **更新【外链总表】(Phase A)：** 对 `@外链管理总控表` 的 `外链总表` 实行 Upsert（新增候选，保护已有实测事实与已排除/失效状态，不写任何实测字段，提交入口默认留空）。
+10. **全量生成项目 Backlog (Phase B)：** 运行纯数据库 Projection（`materialize_project_backlog_rows`），为明确项目（如 `quick-iching`）生成全量待提交行（UNKNOWN != REJECT，保护现有 36 条历史记录）。
+11. **小批量执行准备 (Phase C)：** 运行 `prepare_execution_batch`，受 `target_ready_count`（如 10/20）控制，现场探测/重验提交入口，验证通过标记为 Ready 供执行。
+12. **交给 autofill 执行 (Phase D)：** 由 `backlink-autofill` 在真实浏览器中消费 Ready 队列并执行提交。
+13. **[可选/历史旁路]** 如需调用 legacy `screening-backlinks`，按 `references/screening-handoff.md` 处理 `source_url_enrichment_required` 补证。
 
 ## 控制面契约参考
 
@@ -118,3 +131,4 @@ backlink-autofill
 - 控制面与同步核心模块见 [scripts/master_sheet_sync.py](../../scripts/master_sheet_sync.py)。
 - 回归要求见 [references/test-cases.md](references/test-cases.md)。
 - 可选历史 screening 补证合同见 [references/screening-handoff.md](references/screening-handoff.md)。
+

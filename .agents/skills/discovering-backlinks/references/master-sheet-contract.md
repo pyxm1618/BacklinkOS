@@ -123,49 +123,37 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 ---
 
-## 5. 项目执行行 Materialization 契约
+## 5. 项目 Backlog Projection 与 Execution Readiness 契约
 
 Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-iching`）中：
 
-### 内部 Live Verification 流程驱动与兼容性门禁
-- **生产队列 Materialization 必须由内部 live verification 流程驱动：**
-  严禁外部调用方手造 `VerifiedEntry` 绕过现场真实核验直接创建项目行。
+### A. 全量 Project Backlog Projection（纯数据库投影）
+- **核心原则：UNKNOWN != REJECT。**
+- 凡是 `外链总表.基础状态 == '候选'` 且无已持久化项目硬不兼容事实的平台，一律默认生成项目待提交行。
+- 严禁在该阶段要求 Master 提交入口非空，禁止做网络请求。
 - **通用 Project Compatibility Hard Gate：**
-  针对平台的强类型约束（如 `AI-only` 平台强约束要求仅接受 AI 工具），在 `project_context.ai_powered == False`（非 AI 项目如 Quick I Ching）时，硬门禁必须拦截，拒绝为其生成项目待提交行，同时总表基础状态保持为 `候选`（不影响其他 AI 项目复用）。
-  禁止外部调用者自行实例化 `VerifiedEntry(...)` 绕过现场核验；公开的编排函数 `materialize_project_row()` 必须在内部现场核验通过后，才由内部 helper 组装项目行；核验失败一律返回 `None`，杜绝任何未经验证行进入生产队列。
+  针对平台的已持久化强事实约束（如已确认 `AI-only` 且 `project_context.ai_powered == False`），纯数据库/内存逻辑拦截不为该项目生成行，Master 本身保持候选；若缺乏明确强事实，一律作为 UNKNOWN 默认生成待提交行。
+- **创建内容：**
+  `项目ID = project_id`, `外链ID = canonical domain`, `外链域名 = canonical domain`, `状态 = 待提交`, `尝试次数 = 0`, `目标URL = 指定或默认`, 结果列与证据列留空。
+- **保护历史唯一性：**
+  `project_id + backlink_id` 唯一。若已存在任何状态（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用），绝不重复创建，绝不重置状态和尝试次数。Quick I Ching 已有历史记录必须优先保护。
 
-### 创建条件
-同时满足以下四项：
-1. `外链总表.基础状态 == '候选'`；
-2. **经由内部 Live Verification 现场核验通过产生真实证据**；
-3. 核验域名与 `外链ID` 完全一致；
-4. 当前 `project_id + backlink_id` 尚不存在于 `外链管理` 中。
-
-### 创建内容
-- `项目ID = project_id`
-- `外链ID = canonical domain`
-- `外链域名 = canonical domain`
-- `状态 = 待提交`
-- `尝试次数 = 0`
-- `证据摘要 = verified_entry.evidence_type: verified_entry.evidence_summary`
-- 其他执行与结果列留空。
-
-### 保护历史唯一性
-- `project_id + backlink_id` 唯一。
-- 若已存在任何状态（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用）：
-  **绝不重新创建，绝不把状态重置为待提交。**
-- Quick I Ching 已有的历史记录永远优先保护。
+### B. Bounded Execution Preparation（小批量执行就绪准备）
+- 从已有 `待提交` 记录中筛选小批量（如 `target_ready_count=10`，`scan_limit=50`）进行现场核验；
+- 只有经内部现场 Live Verification 核验通过产生真实证据（VerifiedEntry），才标记为 Ready for Autofill 并写回 Master 提交入口；
+- 未能验证或 unresolved 的项目行，继续保持在 Backlog 中（状态保持 `待提交`，尝试次数保持 0，不标失败）。
 
 ---
 
 ## 6. 存量池严格双边界 Bounded Batch Hydration
 
-支持对总表存量候选池进行按批次入口注入：
+支持对总表存量候选池进行按批次执行就绪准备（Execution Preparation）：
 - 必须显式传入 `project_id`、`target_count`（期望成功的项目行数量，默认 10）与 `scan_limit`（本次最多检查候选数，默认 30，且 `scan_limit >= target_count`）；
-- **已有入口现场核验：** 对总表已存在非空 `提交入口` 的候选，现场核验其有效性；通过则生成 VerifiedEntry 并 materialize；未通过则保持候选，不生成项目行，不随意替换原 URL；
+- **已有入口现场核验：** 对总表已存在非空 `提交入口` 的候选，现场核验其有效性；通过则生成 VerifiedEntry 并进入 Ready 队列；未通过则保持候选，不进入 Ready 队列，不随意替换原 URL；
 - **空入口现场探测：** 现场探测真实入口，成功则更新总表入口并生成 VerifiedEntry；
 - **双边界严格停止：** 满足 `succeeded >= target_count` 或 `processed >= scan_limit` 任意一个立即停止退出；
-- **严禁仅靠 target_count 在大量失败时无限扫描 3000+ 候选。**
+- **明确边界：** 此参数仅控制单次 Ready 批次规模，绝不限制 Project Backlog 总规模。
+
 
 ---
 

@@ -18,7 +18,10 @@ from master_sheet_sync import (
     batch_hydrate_candidates,
     canonical_domain,
     discover_and_verify_entry,
+    get_persisted_project_incompatibility,
+    materialize_project_backlog_rows,
     materialize_project_row,
+    prepare_execution_batch,
     submission_entry_policy_guard,
     upsert_master_rows,
     verify_homepage_as_entry,
@@ -771,5 +774,441 @@ class FactSeparationTests(unittest.TestCase):
             )
 
 
+
+class ProjectBacklogProjectionAndExecutionReadyTests(unittest.TestCase):
+    """
+    BacklinkOS 核心架构纠偏专用测试套件：
+    严格解耦 Project Backlog Projection 与 Execution Readiness，覆盖 Test 1 ~ Test 14。
+    """
+
+    def test_1_master_candidate_empty_entry_creates_backlog(self):
+        # Test 1: Master 候选, 提交入口="" -> Project Backlog Projection 创建 quick-iching, 待提交, attempt=0
+        master_rows = [{
+            "外链ID": "candidate-empty.com",
+            "平台域名": "candidate-empty.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            target_url="https://quickiching.com/",
+            project_context={"ai_powered": False},
+        )
+        self.assertEqual(len(new_rows), 1)
+        row = new_rows[0]
+        self.assertEqual(row["项目ID"], "quick-iching")
+        self.assertEqual(row["外链ID"], "candidate-empty.com")
+        self.assertEqual(row["外链域名"], "candidate-empty.com")
+        self.assertEqual(row["状态"], PROJECT_STATUS_TO_SUBMIT)
+        self.assertEqual(row["尝试次数"], "0")
+        self.assertEqual(row["最近操作时间"], "")
+        self.assertEqual(row["目标URL"], "https://quickiching.com/")
+        self.assertEqual(row["结果链接"], "")
+        self.assertEqual(row["原因/备注"], "")
+        self.assertEqual(row["证据摘要"], "")
+        self.assertEqual(stats["would_create_count"], 1)
+
+    def test_2_master_candidate_legacy_entry_creates_backlog_but_requires_live_revalidation_for_ready(self):
+        # Test 2: Master 候选, 提交入口="某个历史字符串"（尚未 Live Verified）
+        # -> Project Backlog 仍然可以创建；
+        # -> 但仅因该 URL 存在，不能自动成为 ready row；
+        # -> prepare_execution_batch() Live Revalidate: PASS 则 ready, FAIL 则不 ready 且保持待提交
+        master_rows = [{
+            "外链ID": "legacy-entry.com",
+            "平台域名": "legacy-entry.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://legacy.com/submit",
+        }]
+        # 1. Backlog 创建仍然成功
+        backlog_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            target_url="https://quickiching.com/",
+        )
+        self.assertEqual(len(backlog_rows), 1)
+        self.assertEqual(backlog_rows[0]["状态"], PROJECT_STATUS_TO_SUBMIT)
+
+        # 2. Case A: Live Revalidate 失败 -> 不 Ready，项目行仍为待提交，尝试次数仍为 0
+        def mock_fail_verifier(d, u):
+            return None, "现场核验失败: 页面 404"
+
+        res_fail = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=backlog_rows,
+            project_id="quick-iching",
+            target_ready_count=5,
+            scan_limit=10,
+            entry_verifier=mock_fail_verifier,
+        )
+        self.assertEqual(res_fail["ready_count"], 0)
+        self.assertEqual(len(res_fail["ready_rows"]), 0)
+        self.assertEqual(backlog_rows[0]["状态"], PROJECT_STATUS_TO_SUBMIT)
+        self.assertEqual(backlog_rows[0]["尝试次数"], "0")
+
+        # 3. Case B: Live Revalidate 成功 -> 成为 ready row
+        def mock_pass_verifier(d, u):
+            return VerifiedEntry(
+                url="https://legacy.com/submit",
+                domain=d,
+                evidence_type="actionable_form",
+                evidence_summary="现场表单通过",
+            ), "通过"
+
+        res_pass = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=backlog_rows,
+            project_id="quick-iching",
+            target_ready_count=5,
+            scan_limit=10,
+            entry_verifier=mock_pass_verifier,
+        )
+        self.assertEqual(res_pass["ready_count"], 1)
+        self.assertEqual(len(res_pass["ready_rows"]), 1)
+        self.assertEqual(res_pass["ready_rows"][0]["verified_entry"].url, "https://legacy.com/submit")
+
+    def test_3_master_excluded_does_not_create_backlog(self):
+        # Test 3: Master 已排除 -> 不创建 backlog
+        master_rows = [{
+            "外链ID": "excluded.com",
+            "平台域名": "excluded.com",
+            "基础状态": MASTER_STATUS_EXCLUDED,
+            "基础排除原因": "垃圾/PBN/负面SEO",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+        )
+        self.assertEqual(len(new_rows), 0)
+        self.assertEqual(stats["master_hard_negative_count"], 1)
+        self.assertEqual(stats["would_create_count"], 0)
+
+    def test_4_master_dead_does_not_create_backlog(self):
+        # Test 4: Master 失效 -> 不创建 backlog
+        master_rows = [{
+            "外链ID": "dead-site.com",
+            "平台域名": "dead-site.com",
+            "基础状态": MASTER_STATUS_DEAD,
+            "基础排除原因": "站点下线/NXDOMAIN",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+        )
+        self.assertEqual(len(new_rows), 0)
+        self.assertEqual(stats["master_hard_negative_count"], 1)
+        self.assertEqual(stats["would_create_count"], 0)
+
+    def test_5_compatibility_unknown_included(self):
+        # Test 5: Compatibility unknown -> INCLUDE (UNKNOWN != REJECT)
+        master_rows = [{
+            "外链ID": "unknown-platform.com",
+            "平台域名": "unknown-platform.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "",
+            "实测免费": "",
+            "实测需登录": "",
+            "实测登录方式": "",
+            "实测限制": "",
+            "平台备注": "AI directory of tools",  # 仅模糊文案，非排他强限制
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            project_context={"ai_powered": False},
+        )
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(new_rows[0]["外链ID"], "unknown-platform.com")
+        self.assertEqual(stats["would_create_count"], 1)
+        self.assertEqual(stats["proven_project_incompatible_count"], 0)
+
+    def test_6_proven_ai_only_skipped_for_non_ai_project(self):
+        # Test 6: 已有强证据 AI-only + project_context.ai_powered=False -> SKIP project materialization
+        master_rows = [{
+            "外链ID": "strictly-ai-tools.com",
+            "平台域名": "strictly-ai-tools.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "实测限制": "仅接受 AI 工具",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            project_context={"ai_powered": False},
+        )
+        self.assertEqual(len(new_rows), 0)
+        self.assertEqual(stats["proven_project_incompatible_count"], 1)
+        self.assertEqual(len(stats["incompatible_details"]), 1)
+        self.assertEqual(stats["incompatible_details"][0]["domain"], "strictly-ai-tools.com")
+        # Master 本身仍为候选，不受影响
+        self.assertEqual(master_rows[0]["基础状态"], MASTER_STATUS_CANDIDATE)
+
+    def test_7_proven_ai_only_included_for_ai_project(self):
+        # Test 7: AI-only + ai_powered=True -> 可以 INCLUDE
+        master_rows = [{
+            "外链ID": "ai-showcase.com",
+            "平台域名": "ai-showcase.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "实测限制": "AI tools only",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="my-ai-product",
+            project_context={"ai_powered": True},
+        )
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(new_rows[0]["外链ID"], "ai-showcase.com")
+        self.assertEqual(stats["would_create_count"], 1)
+        self.assertEqual(stats["proven_project_incompatible_count"], 0)
+
+    def test_8_existing_project_row_preserved_without_reset(self):
+        # Test 8: 已有 quick-iching row -> 不 duplicate, 状态/attempt/result URL 均不 reset
+        master_rows = [{
+            "外链ID": "already-in-project.com",
+            "平台域名": "already-in-project.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+        }]
+        existing_project_rows = [{
+            "项目ID": "quick-iching",
+            "外链ID": "already-in-project.com",
+            "外链域名": "already-in-project.com",
+            "状态": "已提交",
+            "尝试次数": "3",
+            "最近操作时间": "2026-09-01 10:00:00",
+            "目标URL": "https://quickiching.com/special",
+            "结果链接": "https://already-in-project.com/p/quickiching",
+            "原因/备注": "审核中",
+            "证据摘要": "提交成功截图已存",
+        }]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=existing_project_rows,
+            project_id="quick-iching",
+            target_url="https://quickiching.com/",
+        )
+        self.assertEqual(len(new_rows), 0)
+        self.assertEqual(stats["duplicate_preserved_count"], 1)
+        # 验证已有行未被改动
+        self.assertEqual(existing_project_rows[0]["状态"], "已提交")
+        self.assertEqual(existing_project_rows[0]["尝试次数"], "3")
+        self.assertEqual(existing_project_rows[0]["结果链接"], "https://already-in-project.com/p/quickiching")
+
+    def test_9_all_historical_terminal_statuses_preserved(self):
+        # Test 9: 已有各类状态（已提交/审核中/已排期/已上线/需人工/失败/不适用）-> Project Projection 全部保持原样
+        statuses = ["已提交", "审核中", "已排期", "已上线", "需人工", "失败", "不适用"]
+        master_rows = [
+            {"外链ID": f"site-{s}.com", "平台域名": f"site-{s}.com", "基础状态": MASTER_STATUS_CANDIDATE}
+            for s in statuses
+        ]
+        existing_project_rows = [
+            {
+                "项目ID": "quick-iching",
+                "外链ID": f"site-{s}.com",
+                "外链域名": f"site-{s}.com",
+                "状态": s,
+                "尝试次数": "1",
+                "最近操作时间": "2026-09-02",
+                "目标URL": "https://quickiching.com/",
+                "结果链接": f"https://site-{s}.com/res",
+                "原因/备注": f"note-{s}",
+                "证据摘要": f"evidence-{s}",
+            }
+            for s in statuses
+        ]
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=existing_project_rows,
+            project_id="quick-iching",
+        )
+        self.assertEqual(len(new_rows), 0)
+        self.assertEqual(stats["duplicate_preserved_count"], len(statuses))
+        for row in existing_project_rows:
+            self.assertIn(row["状态"], statuses)
+            self.assertEqual(row["尝试次数"], "1")
+
+    def test_10_execution_prep_blank_entry_finder_success_becomes_ready(self):
+        # Test 10: Execution Preparation: Project=待提交, Master entry blank, Live Finder 成功 -> ready row
+        master_rows = [{
+            "外链ID": "finder-success.com",
+            "平台域名": "finder-success.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "",
+        }]
+        project_rows = [{
+            "项目ID": "quick-iching",
+            "外链ID": "finder-success.com",
+            "外链域名": "finder-success.com",
+            "状态": PROJECT_STATUS_TO_SUBMIT,
+            "尝试次数": "0",
+        }]
+
+        def mock_finder_ok(d):
+            return VerifiedEntry(
+                url="https://finder-success.com/submit",
+                domain=d,
+                evidence_type="actionable_form",
+                evidence_summary="成功找到提交表单",
+            ), "成功"
+
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=5,
+            scan_limit=10,
+            entry_finder=mock_finder_ok,
+        )
+        self.assertEqual(res["ready_count"], 1)
+        self.assertEqual(len(res["ready_rows"]), 1)
+        self.assertEqual(res["ready_rows"][0]["verified_entry"].url, "https://finder-success.com/submit")
+        self.assertEqual(master_rows[0]["提交入口"], "https://finder-success.com/submit")
+
+    def test_11_execution_prep_blank_entry_finder_unresolved_retains_to_submit(self):
+        # Test 11: Project=待提交, Master entry blank, Live Finder unresolved -> Project 仍待提交, attempt=0, 继续扫描
+        master_rows = [
+            {"外链ID": "unresolved-1.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""},
+            {"外链ID": "success-2.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""},
+        ]
+        project_rows = [
+            {"项目ID": "quick-iching", "外链ID": "unresolved-1.com", "状态": PROJECT_STATUS_TO_SUBMIT, "尝试次数": "0"},
+            {"项目ID": "quick-iching", "外链ID": "success-2.com", "状态": PROJECT_STATUS_TO_SUBMIT, "尝试次数": "0"},
+        ]
+
+        def mock_finder_mixed(d):
+            if d == "success-2.com":
+                return VerifiedEntry(
+                    url="https://success-2.com/submit",
+                    domain=d,
+                    evidence_type="actionable_form",
+                    evidence_summary="成功",
+                ), "成功"
+            return None, "未找到有效表单"
+
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=5,
+            scan_limit=10,
+            entry_finder=mock_finder_mixed,
+        )
+        self.assertEqual(res["ready_count"], 1)
+        self.assertEqual(res["scanned_count"], 2)
+        # unresolved-1 项目行仍为待提交且 attempt=0
+        self.assertEqual(project_rows[0]["状态"], PROJECT_STATUS_TO_SUBMIT)
+        self.assertEqual(project_rows[0]["尝试次数"], "0")
+        self.assertEqual(res["failed_verification_count"], 1)
+
+    def test_12_execution_prep_legacy_entry_verifier_fail_retains_to_submit_not_ready(self):
+        # Test 12: Master 有 legacy Entry, 但 Live Verification 失败 -> Project backlog 仍保留, 不进入 Ready
+        master_rows = [{
+            "外链ID": "broken-legacy.com",
+            "平台域名": "broken-legacy.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://broken-legacy.com/old-submit",
+        }]
+        project_rows = [{
+            "项目ID": "quick-iching",
+            "外链ID": "broken-legacy.com",
+            "外链域名": "broken-legacy.com",
+            "状态": PROJECT_STATUS_TO_SUBMIT,
+            "尝试次数": "0",
+        }]
+
+        def mock_verifier_fail(d, u):
+            return None, "旧入口已失效重定向至 404"
+
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=5,
+            scan_limit=10,
+            entry_verifier=mock_verifier_fail,
+        )
+        self.assertEqual(res["ready_count"], 0)
+        self.assertEqual(len(res["ready_rows"]), 0)
+        self.assertEqual(project_rows[0]["状态"], PROJECT_STATUS_TO_SUBMIT)
+        self.assertEqual(project_rows[0]["尝试次数"], "0")
+
+    def test_13_batch_limits_only_bound_ready_prep_not_backlog_population(self):
+        # Test 13: target_ready_count=10, scan_limit=50 只能限制本批 ready preparation, 不能让 Project Backlog 最多只有 10 或 50 条
+        master_rows = [
+            {"外链ID": f"site-{i}.com", "平台域名": f"site-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""}
+            for i in range(100)
+        ]
+        # 1. Backlog Population: 100 个 candidate 全部生成 backlog
+        backlog_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+        )
+        self.assertEqual(len(backlog_rows), 100)
+        self.assertEqual(stats["would_create_count"], 100)
+
+        # 2. Ready Preparation: 受 target_ready_count=10, scan_limit=50 严格限制
+        def mock_finder_all_ok(d):
+            return VerifiedEntry(url=f"https://{d}/submit", domain=d, evidence_type="actionable_form", evidence_summary="ok"), "ok"
+
+        prep_res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=backlog_rows,
+            project_id="quick-iching",
+            target_ready_count=10,
+            scan_limit=50,
+            entry_finder=mock_finder_all_ok,
+        )
+        self.assertEqual(prep_res["ready_count"], 10)
+        self.assertEqual(len(prep_res["ready_rows"]), 10)
+        self.assertEqual(prep_res["scanned_count"], 10)
+
+    def test_14_large_candidate_pool_materializes_backlog_without_entries(self):
+        # Test 14: Project Backlog Projection 输入 200 个 Candidate -> 即使 submission entries 全为空
+        # 也可以生成接近 200 个 backlog rows，除去 duplicates / hard negatives / proven incompatibility
+        master_rows = []
+        for i in range(200):
+            if i == 0:
+                # 1 个已排除
+                master_rows.append({"外链ID": f"pool-{i}.com", "基础状态": MASTER_STATUS_EXCLUDED})
+            elif i == 1:
+                # 1 个失效
+                master_rows.append({"外链ID": f"pool-{i}.com", "基础状态": MASTER_STATUS_DEAD})
+            elif i == 2:
+                # 1 个 AI-only 强限制
+                master_rows.append({"外链ID": f"pool-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "实测限制": "AI tools only"})
+            else:
+                # 197 个普通候选，提交入口全为空
+                master_rows.append({"外链ID": f"pool-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""})
+
+        existing = [{
+            "项目ID": "quick-iching",
+            "外链ID": "pool-3.com",
+            "外链域名": "pool-3.com",
+            "状态": "待提交",
+        }]
+
+        new_rows, stats = materialize_project_backlog_rows(
+            master_rows=master_rows,
+            existing_project_rows=existing,
+            project_id="quick-iching",
+            project_context={"ai_powered": False},
+        )
+
+        # 预期：200 总数 - 2 hard negatives - 1 proven AI-only - 1 existing duplicate = 196 个新 backlog 行
+        self.assertEqual(stats["candidate_count"], 198)
+        self.assertEqual(stats["master_hard_negative_count"], 2)
+        self.assertEqual(stats["proven_project_incompatible_count"], 1)
+        self.assertEqual(stats["duplicate_preserved_count"], 1)
+        self.assertEqual(stats["would_create_count"], 196)
+        self.assertEqual(len(new_rows), 196)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -772,9 +772,285 @@ def upsert_master_rows(
 # 6. Project Management Materialization 算法
 # ==========================================
 
+
 def resolve_project_context(project_id: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     """通用项目上下文解析器。返回项目上下文 dict，严禁硬编码任何具体项目名称。"""
     return dict(context or {})
+
+
+# 持久化强限制排他正则：仅用于已持久化且明确的强事实，不能因模糊文案误判
+PERSISTED_AI_ONLY_STRONG_PATTERNS = [
+    re.compile(r"\b(?:ai[- ]only|only[- ]ai|ai[- ]tools?[- ]only|only\s+accepts?\s+ai|non[- ]ai\s+rejected|strictly\s+ai)\b", re.I),
+    re.compile(r"(?:仅接受|仅限|只接受|只收录|仅支持)\s*(?:ai|人工智能)\s*(?:工具|产品|项目)?(?:\b|$)|(?:非\s*ai|非人工智能).*(?:不收|拒绝|不接受)", re.I),
+]
+
+
+def get_persisted_project_incompatibility(
+    master_row: dict[str, Any],
+    project_context: dict[str, Any] | None = None,
+) -> tuple[bool, str, str]:
+    """纯数据库/内存逻辑：判断已有 Master 记录与当前项目是否存在已持久化的强不兼容事实。
+    
+    硬约束：
+    1. 绝对不发起任何网络请求；
+    2. 绝不依赖运行时 VerifiedEntry.ai_only；
+    3. 仅使用已持久化且明确的强事实（实测限制、平台备注、基础排除原因等）；
+    4. 证据不足时一律 UNKNOWN -> INCLUDE（返回 False）；
+    5. 不能因为“AI directory”、“看起来像 AI 平台”就排除；只有明确排他限制（如“仅接受 AI 工具”、“AI tools only”）才对 ai_powered=False 生效。
+    
+    返回: (is_incompatible, evidence_text, reason)
+    """
+    p_ctx = resolve_project_context("", project_context)
+    if p_ctx.get("ai_powered") is False:
+        # 检查持久化文本：实测限制、平台备注、基础排除原因
+        restriction = str(master_row.get("实测限制") or "").strip()
+        notes = str(master_row.get("平台备注") or "").strip()
+        reason_text = str(master_row.get("基础排除原因") or "").strip()
+        persisted_candidates = [restriction, notes, reason_text]
+        
+        for candidate_text in persisted_candidates:
+            if not candidate_text:
+                continue
+            for pat in PERSISTED_AI_ONLY_STRONG_PATTERNS:
+                m = pat.search(candidate_text)
+                if m:
+                    match_str = m.group(0)
+                    return True, match_str, f"已持久化强事实明确限制 '{match_str}'，与非 AI 项目不兼容"
+                    
+    return False, "", ""
+
+
+def materialize_project_backlog_rows(
+    master_rows: list[dict[str, Any]],
+    existing_project_rows: list[dict[str, Any]],
+    project_id: str,
+    target_url: str = "",
+    project_context: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """纯内存/数据库级 Project Backlog Projection（项目机会全量投影）。
+    
+    核心业务契约：
+    1. 纯数据库级投影，绝对禁止发起任何网络请求；
+    2. 禁止调用 verify_submission_entry / discover_and_verify_entry；
+    3. 禁止要求 Master 提交入口非空；
+    4. Master 基础状态 == 候选，默认生成 Project Backlog Row（UNKNOWN != REJECT）；
+    5. Master 基础状态 == 已排除 或 失效，不创建 Project Row；
+    6. 仅依据已持久化强事实拦截项目硬不兼容（get_persisted_project_incompatibility），证据不足（UNKNOWN）一律包含；
+    7. project_id + 外链ID 唯一，绝不重复创建，绝不重置状态、尝试次数或覆盖历史执行事实；
+    8. 新项目行默认：状态='待提交'，尝试次数='0'，最近操作时间=''，目标URL=target_url，结果链接=''，原因/备注=''，证据摘要=''。
+    
+    返回: (new_project_rows, stats)
+    """
+    proj = str(project_id or "").strip()
+    if not proj:
+        raise ValueError("必须显式指定 project_id")
+
+    p_ctx = resolve_project_context(proj, project_context)
+    
+    existing_bids: set[str] = set()
+    existing_project_count = 0
+    for prow in existing_project_rows:
+        p_proj = str(prow.get("项目ID") or "").strip()
+        if p_proj == proj:
+            existing_project_count += 1
+            bid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+            if bid:
+                existing_bids.add(bid)
+                
+    stats: dict[str, Any] = {
+        "candidate_count": 0,
+        "existing_project_count": existing_project_count,
+        "would_create_count": 0,
+        "duplicate_preserved_count": 0,
+        "master_hard_negative_count": 0,
+        "proven_project_incompatible_count": 0,
+        "incompatible_details": [],
+    }
+    
+    new_rows: list[dict[str, str]] = []
+    seen_in_new: set[str] = set()
+    
+    for mrow in master_rows:
+        raw_id = mrow.get("外链ID") or mrow.get("平台域名") or ""
+        cid = canonical_domain(raw_id)
+        if not cid:
+            continue
+            
+        status = str(mrow.get("基础状态") or "").strip()
+        if status in (MASTER_STATUS_EXCLUDED, MASTER_STATUS_DEAD):
+            stats["master_hard_negative_count"] += 1
+            continue
+        if status != MASTER_STATUS_CANDIDATE:
+            continue
+            
+        stats["candidate_count"] += 1
+        
+        # 查重：已存在于历史项目行或本批新生成中，绝不重复创建
+        if cid in existing_bids or cid in seen_in_new:
+            stats["duplicate_preserved_count"] += 1
+            continue
+            
+        # 检查已持久化硬不兼容强事实
+        is_incompatible, evidence, reason = get_persisted_project_incompatibility(mrow, p_ctx)
+        if is_incompatible:
+            stats["proven_project_incompatible_count"] += 1
+            stats["incompatible_details"].append({
+                "domain": cid,
+                "evidence": evidence,
+                "reason": reason,
+            })
+            continue
+            
+        # 默认生成待提交 Backlog Row
+        row = {
+            "项目ID": proj,
+            "外链ID": cid,
+            "外链域名": cid,
+            "状态": PROJECT_STATUS_TO_SUBMIT,
+            "尝试次数": "0",
+            "最近操作时间": "",
+            "目标URL": str(target_url or "").strip(),
+            "结果链接": "",
+            "原因/备注": "",
+            "证据摘要": "",
+        }
+        new_rows.append(row)
+        seen_in_new.add(cid)
+        stats["would_create_count"] += 1
+        
+    return new_rows, stats
+
+
+def prepare_execution_batch(
+    master_rows: list[dict[str, Any]],
+    project_rows: list[dict[str, Any]],
+    project_id: str,
+    target_ready_count: int = 10,
+    scan_limit: int = 50,
+    entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
+    entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
+    project_context: dict[str, Any] | None = None,
+    fetcher: Callable[[str], dict] | None = None,
+) -> dict[str, Any]:
+    """从已有项目 Backlog 中筛选待提交记录，执行有界的现场 Entry 核验，产出 Ready for Autofill 队列。
+    
+    契约规则：
+    1. 从 project_rows 中选择 项目ID == project_id AND 状态 == '待提交' 的小批量项目记录；
+    2. target_ready_count 控制目标 Ready 数量，scan_limit 控制最多扫描候选数；
+    3. 逐个关联 Master Row：
+       - 若 Master 已有'提交入口'：Live Revalidate existing entry；
+       - 若 Master 无'提交入口'：现场探测 discover_and_verify_entry；
+    4. 验证成功：
+       - 更新 Master 提交入口（如原为空或需要规范化更新）；
+       - 加入 ready_rows 批次；
+       - ready_count += 1；
+    5. 验证失败 / unresolved：
+       - 项目行仍然存在，状态仍为'待提交'，尝试次数仍为 0；
+       - 不得标记为'失败'，不得标记为'不适用'；
+       - batch 继续扫描下一个候选；
+    6. 仅当 ready_count >= target_ready_count 或 scanned_count >= scan_limit 时停止。
+    """
+    proj = str(project_id or "").strip()
+    if not proj:
+        raise ValueError("必须显式指定 project_id")
+    if target_ready_count <= 0:
+        raise ValueError("target_ready_count 必须为大于 0 的整数")
+    if scan_limit <= 0:
+        raise ValueError("scan_limit 必须为大于 0 的整数")
+    if scan_limit < target_ready_count:
+        raise ValueError("scan_limit 不能小于 target_ready_count")
+
+    _verifier = entry_verifier or (lambda d, u: verify_submission_entry(d, u, fetcher=fetcher))
+    _finder = entry_finder or (lambda d: discover_and_verify_entry(d, fetcher=fetcher))
+    p_ctx = resolve_project_context(proj, project_context)
+
+    # 建立 master 映射
+    master_map: dict[str, dict[str, Any]] = {}
+    for mrow in master_rows:
+        cid = canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or "")
+        if cid:
+            master_map[cid] = mrow
+
+    ready_rows: list[dict[str, Any]] = []
+    scanned_count = 0
+    skipped_incompatible = 0
+    failed_verification_count = 0
+
+    for prow in project_rows:
+        if len(ready_rows) >= target_ready_count or scanned_count >= scan_limit:
+            break
+
+        p_proj = str(prow.get("项目ID") or "").strip()
+        p_status = str(prow.get("状态") or "").strip()
+        if p_proj != proj or p_status != PROJECT_STATUS_TO_SUBMIT:
+            continue
+
+        cid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+        if not cid or cid not in master_map:
+            continue
+
+        mrow = master_map[cid]
+        m_status = str(mrow.get("基础状态") or "").strip()
+        if m_status != MASTER_STATUS_CANDIDATE:
+            continue
+
+        scanned_count += 1
+        current_entry = str(mrow.get("提交入口") or "").strip()
+        verified_obj: VerifiedEntry | None = None
+        verify_reason: str = ""
+
+        if current_entry:
+            # Live Revalidate existing entry
+            verified_obj, verify_reason = _verifier(cid, current_entry)
+        else:
+            # 现场探测 entry
+            verified_obj, verify_reason = _finder(cid)
+            if verified_obj:
+                mrow["提交入口"] = verified_obj.url
+
+        if verified_obj:
+            # 聚合主页 ai_only 约束
+            if not verified_obj.ai_only and fetcher:
+                for scheme in ("https", "http"):
+                    home_res = fetcher(f"{scheme}://{cid}/")
+                    if home_res and home_res.get("status") == 200:
+                        if home_res.get("ai_only_signals"):
+                            verified_obj = VerifiedEntry(
+                                url=verified_obj.url,
+                                domain=verified_obj.domain,
+                                evidence_type=verified_obj.evidence_type,
+                                evidence_summary=verified_obj.evidence_summary,
+                                form_details=verified_obj.form_details,
+                                ai_only=True,
+                            )
+                        break
+
+            # 检查项目兼容性
+            if verified_obj.ai_only and p_ctx.get("ai_powered") is not True:
+                skipped_incompatible += 1
+                # 兼容性不通过，不放入 ready，但项目行保持待提交
+                continue
+
+            ready_rows.append({
+                "project_row": dict(prow),
+                "master_row": dict(mrow),
+                "verified_entry": verified_obj,
+                "verify_reason": verify_reason,
+            })
+        else:
+            # 核验失败 / unresolved:
+            # 项目行仍然存在，状态仍然待提交，尝试次数仍然 0，不得标记为失败或不适用
+            failed_verification_count += 1
+
+    return {
+        "ready_rows": ready_rows,
+        "updated_master_rows": master_rows,
+        "ready_count": len(ready_rows),
+        "scanned_count": scanned_count,
+        "skipped_incompatible": skipped_incompatible,
+        "failed_verification_count": failed_verification_count,
+    }
+
 
 
 def _materialize_verified_project_row(
