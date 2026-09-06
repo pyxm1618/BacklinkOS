@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # 保证 scripts 路径在 sys.path
@@ -749,7 +750,8 @@ class P0_3_BoundedBatchHydrationTests(unittest.TestCase):
         # 触达 scan_limit=15 立即退出，虽然目标 10 未达成
         self.assertEqual(res["processed_candidates"], 15)
         self.assertEqual(res["succeeded_count"], 2)
-        self.assertEqual(len(res["new_project_rows"]), 2)
+        self.assertEqual(len(res["new_project_rows"]), 0)  # P0-3 契约：严禁新建项目持久化行
+        self.assertEqual(len(res["ready_rows"]), 2)
 
 
 class FactSeparationTests(unittest.TestCase):
@@ -1208,7 +1210,97 @@ class ProjectBacklogProjectionAndExecutionReadyTests(unittest.TestCase):
         self.assertEqual(stats["would_create_count"], 196)
         self.assertEqual(len(new_rows), 196)
 
+    @mock.patch("master_sheet_sync.fetch_page")
+    def test_15_prepare_execution_batch_uses_default_fetcher_for_homepage_ai_only(self, mock_fetch):
+        # P0-2: 当 fetcher=None 时，prepare_execution_batch 默认使用 fetch_page 聚合主页 ai_only 约束
+        master_rows = [{
+            "外链ID": "ai-portal.com",
+            "平台域名": "ai-portal.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://ai-portal.com/submit",
+        }]
+        project_rows = [{
+            "项目ID": "quick-iching",
+            "外链ID": "ai-portal.com",
+            "外链域名": "ai-portal.com",
+            "状态": "待提交",
+            "尝试次数": "0",
+        }]
+
+        # mock entry_verifier 校验通过，但 entry 自身 ai_only 为 False
+        def mock_verifier(d, u):
+            return VerifiedEntry(
+                url=u,
+                domain=d,
+                evidence_type="actionable_form",
+                evidence_summary="ok",
+                ai_only=False,
+            ), "ok"
+
+        # 主页返回带有 ai_only_signals
+        mock_fetch.return_value = {
+            "status": 200,
+            "html": "<html><body>only ai platforms</body></html>",
+            "ai_only_signals": ["only ai"],
+        }
+
+        # 调用时 fetcher=None，非 AI 项目 (quick-iching)
+        prep_res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=10,
+            scan_limit=10,
+            entry_verifier=mock_verifier,
+            fetcher=None,
+            project_context={"ai_powered": False},
+        )
+
+        # 预期：被 fetch_page 检出主页 AI 限制，排除出 ready 列表，且 skipped_incompatible=1
+        self.assertEqual(prep_res["ready_count"], 0)
+        self.assertEqual(prep_res["skipped_incompatible"], 1)
+        self.assertEqual(prep_res["scanned_count"], 1)
+        mock_fetch.assert_called()
+
+    def test_16_batch_hydrate_candidates_never_creates_persisted_project_rows(self):
+        # P0-3: batch_hydrate_candidates 绝不能新建持久化项目行，new_project_rows 必须永远为空列表
+        master_rows = [
+            {
+                "外链ID": f"ready-{i}.com",
+                "平台域名": f"ready-{i}.com",
+                "基础状态": MASTER_STATUS_CANDIDATE,
+                "提交入口": f"https://ready-{i}.com/submit",
+            }
+            for i in range(5)
+        ]
+        existing_project_rows = []
+
+        def mock_verifier(d, u):
+            return VerifiedEntry(
+                url=u,
+                domain=d,
+                evidence_type="actionable_form",
+                evidence_summary="ok",
+            ), "ok"
+
+        res = batch_hydrate_candidates(
+            master_rows=master_rows,
+            existing_project_rows=existing_project_rows,
+            project_id="quick-iching",
+            target_count=3,
+            scan_limit=5,
+            entry_verifier=mock_verifier,
+        )
+
+        self.assertEqual(res["succeeded_count"], 3)
+        self.assertEqual(res["processed_candidates"], 3)
+        # 核心契约：绝对不新建项目持久化行
+        self.assertEqual(res["new_project_rows"], [])
+        # 但通过 ready_rows 暴露 Ready 批次
+        self.assertEqual(len(res["ready_rows"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

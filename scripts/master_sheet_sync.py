@@ -1010,9 +1010,10 @@ def prepare_execution_batch(
 
         if verified_obj:
             # 聚合主页 ai_only 约束
-            if not verified_obj.ai_only and fetcher:
+            if not verified_obj.ai_only:
+                _fetch = fetcher or fetch_page
                 for scheme in ("https", "http"):
-                    home_res = fetcher(f"{scheme}://{cid}/")
+                    home_res = _fetch(f"{scheme}://{cid}/")
                     if home_res and home_res.get("status") == 200:
                         if home_res.get("ai_only_signals"):
                             verified_obj = VerifiedEntry(
@@ -1213,26 +1214,24 @@ def batch_hydrate_candidates(
     entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
     entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
     project_context: dict[str, Any] | None = None,
+    fetcher: Callable[[str], dict] | None = None,
 ) -> dict[str, Any]:
-    """对总表现有候选进行严格双边界批次 Hydration。
+    """对候选进行批次 Readiness 准备（向后兼容薄包装器，现已全面委托 prepare_execution_batch）。
     
-    严格约束：
-    1. 必须显式传入 project_id；
-    2. target_count > 0（目标待提交行数），scan_limit > 0（最多扫描候选数），scan_limit >= target_count；
-    3. 满足 `succeeded >= target_count or processed >= scan_limit` 任意一个立即停止；
-    4. P0-2：已有非空 `提交入口` 必须经 entry_verifier 现场重新核验，核验通过才能 materialize；
-       未通过则保持候选，不生成项目行，不随意替换原 URL；
-    5. 空入口通过 entry_finder 现场探测，探测成功写入总表提交入口并 materialize；
-    6. 找不到真实入口的 domain 保持候选，不排除，提交入口保持为空；
-    7. P0-3：支持通用 project_context 兼容性门禁，不兼容候选保留在 Master 但不为项目 materialize。
-    
-    返回: {
-        'hydrated_master_rows': 更新后的 master_rows,
-        'new_project_rows': 新生成的待提交项目行列表,
-        'succeeded_count': 成功生成的行数,
-        'processed_candidates': 遍历尝试的域名数,
-        'skipped_incompatible': 因兼容性门禁跳过的数量,
-    }
+    架构演进契约（P0-3）：
+    1. Project Backlog 行已在 Phase B (project_backlog_projection) 中全量投影，
+       因此本函数严禁新建任何项目持久化行，new_project_rows 必须永远返回空列表 []；
+    2. 若 existing_project_rows 未包含当前项目的待提交行（例如老单元测试传入空列表），
+       为保持向后兼容，基于 master_rows 中未在 existing_project_rows 出现的候选构建内存临时行委托执行；
+    3. 返回结构保持向后兼容：
+       {
+           'hydrated_master_rows': master_rows,
+           'new_project_rows': [],
+           'ready_rows': ready_rows,
+           'succeeded_count': ready_count,
+           'processed_candidates': scanned_count,
+           'skipped_incompatible': skipped_incompatible,
+       }
     """
     proj = str(project_id or "").strip()
     if not proj:
@@ -1243,69 +1242,49 @@ def batch_hydrate_candidates(
         raise ValueError("scan_limit 必须为大于 0 的整数")
     if scan_limit < target_count:
         raise ValueError("scan_limit 不能小于 target_count")
-        
-    _finder = entry_finder or discover_and_verify_entry
-    _verifier = entry_verifier or verify_submission_entry
-    
-    existing_project_bids = set()
-    for prow in existing_project_rows:
-        p_proj = str(prow.get("项目ID") or "").strip()
-        p_bid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
-        if p_proj == proj and p_bid:
-            existing_project_bids.add(p_bid)
 
-    new_project_rows: list[dict[str, str]] = []
-    succeeded = 0
-    processed = 0
-    skipped_incompatible = 0
-    
-    for mrow in master_rows:
-        # P0-3 双边界检查：达成目标或达到扫描上限即刻停止
-        if succeeded >= target_count or processed >= scan_limit:
-            break
-            
-        cid = canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or "")
-        status = str(mrow.get("基础状态") or "").strip()
-        
-        # 必须是候选
-        if status != MASTER_STATUS_CANDIDATE:
-            continue
-        # 项目尚无记录
-        if cid in existing_project_bids:
-            continue
-            
-        processed += 1
-        current_entry = str(mrow.get("提交入口") or "").strip()
-        verified_obj: VerifiedEntry | None = None
-        
-        if current_entry:
-            # P0-2 核心守卫：已有非空 entry 必须现场核验！
-            verified_obj, _ = _verifier(cid, current_entry)
-        else:
-            # 入口为空，执行现场探测
-            verified_obj, _ = _finder(cid)
-            if verified_obj:
-                mrow["提交入口"] = verified_obj.url
-                
-        if verified_obj:
-            prow = _materialize_verified_project_row(
-                master_row=mrow,
-                existing_project_rows=existing_project_rows + new_project_rows,
-                project_id=proj,
-                verified_entry=verified_obj,
-                project_context=project_context,
-            )
-            if prow:
-                new_project_rows.append(prow)
-                existing_project_bids.add(cid)
-                succeeded += 1
-            elif verified_obj.ai_only:
-                skipped_incompatible += 1
+    # 检查 existing_project_rows 是否有对应项目的待提交候选
+    p_rows = existing_project_rows
+    has_proj_candidates = any(
+        str(r.get("项目ID") or "").strip() == proj and str(r.get("状态") or "").strip() == PROJECT_STATUS_TO_SUBMIT
+        for r in existing_project_rows
+    )
+    if not has_proj_candidates:
+        existing_bids = {
+            canonical_domain(r.get("外链ID") or r.get("外链域名") or "")
+            for r in existing_project_rows
+            if str(r.get("项目ID") or "").strip() == proj
+        }
+        p_rows = [
+            {
+                "项目ID": proj,
+                "外链ID": canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or ""),
+                "外链域名": canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or ""),
+                "状态": PROJECT_STATUS_TO_SUBMIT,
+                "尝试次数": "0",
+            }
+            for mrow in master_rows
+            if str(mrow.get("基础状态") or "").strip() == MASTER_STATUS_CANDIDATE
+            and canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or "") not in existing_bids
+        ]
+
+    ready_res = prepare_execution_batch(
+        master_rows=master_rows,
+        project_rows=p_rows,
+        project_id=proj,
+        target_ready_count=target_count,
+        scan_limit=scan_limit,
+        entry_verifier=entry_verifier,
+        entry_finder=entry_finder,
+        project_context=project_context,
+        fetcher=fetcher,
+    )
 
     return {
-        "hydrated_master_rows": master_rows,
-        "new_project_rows": new_project_rows,
-        "succeeded_count": succeeded,
-        "processed_candidates": processed,
-        "skipped_incompatible": skipped_incompatible,
+        "hydrated_master_rows": ready_res["updated_master_rows"],
+        "new_project_rows": [],  # 严禁新建项目持久化行
+        "ready_rows": ready_res["ready_rows"],
+        "succeeded_count": ready_res["ready_count"],
+        "processed_candidates": ready_res["scanned_count"],
+        "skipped_incompatible": ready_res["skipped_incompatible"],
     }

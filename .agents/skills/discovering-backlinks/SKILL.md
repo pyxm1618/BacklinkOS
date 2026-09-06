@@ -82,8 +82,10 @@ Backlog Size 达到数千规模（UNKNOWN 默认包含，保护历史行）
    - **PHASE C — Bounded Execution Preparation（小批量执行就绪准备）：**
      - 从已有 `待提交` 记录中按批次处理（如 `target_ready_count=10`，`scan_limit=50`）；
      - 关联 Master 进行现场核验（已有入口 Live Revalidate，空入口现场探测）；
-     - **核验通过才成为 Ready for Autofill**（写入 Master 提交入口，组装 VerifiedEntry 批次）；
-     - **核验失败或 unresolved：项目行仍保留，状态仍为待提交，尝试次数仍为 0，不标失败，继续下一候选**。
+     - **核验通过才成为 Ready for Autofill**（写入 Master 提交入口，组装 VerifiedEntry 批次，产出 Ready Allowlist Manifest）；
+     - **核验失败或 unresolved：项目行仍保留，状态仍为待提交，尝试次数仍为 0，不标失败，继续下一候选**；
+     - **Phase C → Phase D Handoff 契约**：`backlink-autofill` 只能消费该 Ready Allowlist 与 Sheet 待提交的交集，绝不能直接从 3000+ 未验待提交行盲目取号，杜绝因入口为空误杀 Backlog。
+
 6. **存量池严格双边界 Bounded Batch Hydration。** 支持对总表存量候选池按批次进行 Execution Preparation：
    - 必须显式传入 `project_id`、`target_count`（期望成功的项目行数量）与 `scan_limit`（最多检查候选数，`scan_limit >= target_count`）；
    - **双边界停止条件：** `succeeded >= target_count` 或 `processed >= scan_limit` 任意一个达到立即停止退出；

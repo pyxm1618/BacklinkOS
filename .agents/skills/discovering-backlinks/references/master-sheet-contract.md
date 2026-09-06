@@ -140,8 +140,9 @@ Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-
 
 ### B. Bounded Execution Preparation（小批量执行就绪准备）
 - 从已有 `待提交` 记录中筛选小批量（如 `target_ready_count=10`，`scan_limit=50`）进行现场核验；
-- 只有经内部现场 Live Verification 核验通过产生真实证据（VerifiedEntry），才标记为 Ready for Autofill 并写回 Master 提交入口；
-- 未能验证或 unresolved 的项目行，继续保持在 Backlog 中（状态保持 `待提交`，尝试次数保持 0，不标失败）。
+- 只有经内部现场 Live Verification 核验通过产生真实证据（VerifiedEntry），才标记为 Ready for Autofill、写回 Master 提交入口，并生成 Ready Allowlist Manifest；
+- 未能验证或 unresolved 的项目行，继续保持在 Backlog 中（状态保持 `待提交`，尝试次数保持 0，不标失败）；
+- **Handoff 契约**：下游 `backlink-autofill` 只能消费该 Ready Allowlist 与待提交的交集，绝不能直接盲目拉取 Sheet 待提交行，防止将未准备就绪的合法 Backlog 误报失败。
 
 ---
 
