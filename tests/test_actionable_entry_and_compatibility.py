@@ -308,6 +308,167 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
         self.assertIsNotNone(prow)
         self.assertEqual(prow["状态"], PROJECT_STATUS_TO_SUBMIT)
 
+    def test_homepage_text_submit_your_tool_without_href_or_form_is_rejected(self):
+        # 1. 删除 homepage text-only fallback:
+        # 首页只有 "Submit your tool" 等正文文案，但没有可操作 form，也没有结构化可跟随的 CTA 链接
+        # 坚决拒绝 (REJECT)，禁止生成 homepage_cta VerifiedEntry 作为生产准入！
+        html = """
+        <html>
+        <head><title>Awesome Directory</title></head>
+        <body>
+            <h1>Welcome to Awesome Directory</h1>
+            <p>You can submit your tool to reach 100k users! Check back soon for submissions.</p>
+        </body>
+        </html>
+        """
+        def fake_fetch(url):
+            return analyze_html(html, "https://textonly.com/") | {"status": 200, "final_url": "https://textonly.com/"}
+
+        # 直接验证首页
+        entry_v, reason_v = verify_submission_entry("textonly.com", "https://textonly.com/", fetcher=fake_fetch)
+        self.assertIsNone(entry_v, "首页仅有文本文案无表单/CTA链接，必须坚决拒绝！")
+        self.assertIn("无 Actionable Form", reason_v)
+
+        # 发现流程验证首页
+        entry_d, reason_d = discover_and_verify_entry("textonly.com", fetcher=fake_fetch)
+        self.assertIsNone(entry_d, "探测流程遇到纯正文首页，必须返回 None 保持候选，绝不能升级为 homepage_cta！")
+        self.assertIn("无 Actionable Form", reason_d)
+
+    def test_actionable_form_submit_intent_tightening(self):
+        # 2. 收紧 Actionable Form submit intent：
+        # Directory/listing form 必须同时具备 resource identity field + 真实 submission intent
+        # 明确拒绝 checker intent (check, analyze, scan, search 等)
+
+        # A. URL input + <button>Analyze</button> -> REJECT
+        html_analyze = """
+        <html>
+        <body>
+            <form action="/analyze" method="POST">
+                <input type="url" name="website_url" />
+                <button type="submit">Analyze</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_analyze = analyze_html(html_analyze, "https://checker.com/analyze")
+        self.assertEqual(len(analysis_analyze["actionable_forms"]), 0, "Analyze 按钮属于 checker intent，必须被排除！")
+
+        def fake_fetch_analyze(url):
+            return analysis_analyze | {"status": 200, "final_url": "https://checker.com/analyze"}
+        entry_analyze, _ = verify_submission_entry("checker.com", "https://checker.com/analyze", fetcher=fake_fetch_analyze)
+        self.assertIsNone(entry_analyze, "带 Analyze 按钮的分析表单绝不能作为提交入口！")
+
+        # B. website input + <input type=submit value="Check"> -> REJECT
+        html_check = """
+        <html>
+        <body>
+            <form action="/check" method="POST">
+                <input type="text" name="site_url" />
+                <input type="submit" value="Check" />
+            </form>
+        </body>
+        </html>
+        """
+        analysis_check = analyze_html(html_check, "https://checker.com/check")
+        self.assertEqual(len(analysis_check["actionable_forms"]), 0, "Check 按钮属于 checker intent，必须被排除！")
+
+        def fake_fetch_check(url):
+            return analysis_check | {"status": 200, "final_url": "https://checker.com/check"}
+        entry_check, _ = verify_submission_entry("checker.com", "https://checker.com/check", fetcher=fake_fetch_check)
+        self.assertIsNone(entry_check, "带 Check 按钮的检查表单绝不能作为提交入口！")
+
+        # C. website_url + <button>Submit Website</button> -> PASS
+        html_submit = """
+        <html>
+        <body>
+            <form action="/submit" method="POST">
+                <input type="url" name="website_url" />
+                <button type="submit">Submit Website</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_submit = analyze_html(html_submit, "https://good-dir.com/submit")
+        self.assertEqual(len(analysis_submit["actionable_forms"]), 1, "合法 submission intent 按钮必须正常识别！")
+
+        def fake_fetch_submit(url):
+            return analysis_submit | {"status": 200, "final_url": "https://good-dir.com/submit"}
+        entry_submit, _ = verify_submission_entry("good-dir.com", "https://good-dir.com/submit", fetcher=fake_fetch_submit)
+        self.assertIsNotNone(entry_submit)
+        self.assertEqual(entry_submit.evidence_type, "actionable_form")
+
+    def test_project_compatibility_aggregates_homepage_ai_only_signals_for_existing_master_entry(self):
+        # 3. Project Compatibility 聚合平台约束：
+        # 场景：
+        # homepage = "Only AI tools accepted"
+        # existing Master entry = /submit
+        # /submit 有正常 actionable form 但不含 AI-only 文案
+        homepage_html = """
+        <html>
+        <head><title>AI Platform Home</title></head>
+        <body>
+            <h1>AI Hub</h1>
+            <p>Notice: Only AI tools accepted. Non-AI tools are rejected.</p>
+        </body>
+        </html>
+        """
+        submit_page_html = """
+        <html>
+        <head><title>Submit Page</title></head>
+        <body>
+            <h1>Submit Tool</h1>
+            <form action="/submit" method="POST">
+                <input type="url" name="tool_url" />
+                <button type="submit">Submit Tool</button>
+            </form>
+        </body>
+        </html>
+        """
+        def fake_fetch(url):
+            if url == "https://ai-directory.com/":
+                return analyze_html(homepage_html, "https://ai-directory.com/") | {"status": 200, "final_url": "https://ai-directory.com/"}
+            if url == "https://ai-directory.com/submit":
+                return analyze_html(submit_page_html, "https://ai-directory.com/submit") | {"status": 200, "final_url": "https://ai-directory.com/submit"}
+            return {"status": 404}
+
+        master_row = {
+            "外链ID": "ai-directory.com",
+            "平台域名": "ai-directory.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://ai-directory.com/submit",  # existing Master entry
+        }
+
+        # Case 1: project ai_powered=False -> NO MATERIALIZATION
+        prow_non_ai = materialize_project_row(
+            master_row=master_row,
+            existing_project_rows=[],
+            project_id="test-non-ai-project",
+            project_context={"ai_powered": False},
+            fetcher=fake_fetch,
+        )
+        self.assertIsNone(prow_non_ai, "首页声明了 AI-only，非 AI 项目绝不能物化！")
+
+        # Case 2: 同样场景 ai_powered=True -> PASS
+        prow_ai = materialize_project_row(
+            master_row=master_row,
+            existing_project_rows=[],
+            project_id="test-ai-project",
+            project_context={"ai_powered": True},
+            fetcher=fake_fetch,
+        )
+        self.assertIsNotNone(prow_ai, "显式声明 ai_powered=True 应正常物化！")
+        self.assertEqual(prow_ai["状态"], PROJECT_STATUS_TO_SUBMIT)
+
+        # Case 3: 同样场景 ai_powered missing/unknown -> NO MATERIALIZATION (fail closed)
+        prow_missing_ai = materialize_project_row(
+            master_row=master_row,
+            existing_project_rows=[],
+            project_id="test-unknown-project",
+            project_context={},  # ai_powered missing!
+            fetcher=fake_fetch,
+        )
+        self.assertIsNone(prow_missing_ai, "ai_powered 缺失时必须 fail closed 拒绝物化！")
+
 
 if __name__ == "__main__":
     unittest.main()

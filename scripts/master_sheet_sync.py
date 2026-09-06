@@ -534,19 +534,10 @@ def verify_submission_entry(
                     ai_only=bool(sub_verified.ai_only or res.get("ai_only_signals")),
                 ), f"通过跟随首页 CTA 闭环子页面入口 ({sub_reason})"
 
-        is_cta, cta_reason = verify_homepage_as_entry(res)
-        if is_cta:
-            return VerifiedEntry(
-                url=final_url,
-                domain=cd,
-                evidence_type="homepage_cta",
-                evidence_summary=cta_reason,
-                ai_only=bool(res.get("ai_only_signals")),
-            ), cta_reason
-        return None, f"首页未包含有效机制 CTA: {cta_reason}"
+        return None, "首页无 Actionable Form 且未发现可跟随的有效提交 CTA 链接（严禁正文文字臆想为入口）"
 
     # 子页面使用核心评估函数
-    return evaluate_page_for_actionable_entry(
+    sub_verified, sub_reason = evaluate_page_for_actionable_entry(
         page_res=res,
         req_url=entry_url,
         domain=cd,
@@ -554,6 +545,21 @@ def verify_submission_entry(
         is_discovered_candidate=is_discovered_candidate,
         allow_cta_follow=True,
     )
+    if sub_verified and not sub_verified.ai_only and _fetch:
+        for scheme in ("https", "http"):
+            home_res = _fetch(f"{scheme}://{cd}/")
+            if home_res and home_res.get("status") == 200:
+                if home_res.get("ai_only_signals"):
+                    sub_verified = VerifiedEntry(
+                        url=sub_verified.url,
+                        domain=sub_verified.domain,
+                        evidence_type=sub_verified.evidence_type,
+                        evidence_summary=sub_verified.evidence_summary,
+                        form_details=sub_verified.form_details,
+                        ai_only=True,
+                    )
+                break
+    return sub_verified, sub_reason
 
 
 def discover_and_verify_entry(
@@ -652,17 +658,7 @@ def discover_and_verify_entry(
             ai_only=bool(home.get("ai_only_signals")),
         ), "通过首页真实表单闭环入口"
 
-    is_home_cta, home_reason = verify_homepage_as_entry(home)
-    if is_home_cta:
-        return VerifiedEntry(
-            url=base_url,
-            domain=cd,
-            evidence_type="homepage_cta",
-            evidence_summary=home_reason,
-            ai_only=bool(home.get("ai_only_signals")),
-        ), home_reason
-        
-    return None, "未定位到用户可提交的入口页（证据缺失，保持候选状态）"
+    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA，保持候选状态）"
 
 
 
@@ -777,12 +773,8 @@ def upsert_master_rows(
 # ==========================================
 
 def resolve_project_context(project_id: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """通用项目上下文解析器。优先使用显式传入的 context，若未提供则根据已知配置解析。"""
-    res = dict(context or {})
-    proj = str(project_id or "").strip()
-    if proj == "quick-iching" and "ai_powered" not in res:
-        res["ai_powered"] = False
-    return res
+    """通用项目上下文解析器。返回项目上下文 dict，严禁硬编码任何具体项目名称。"""
+    return dict(context or {})
 
 
 def _materialize_verified_project_row(
@@ -818,10 +810,11 @@ def _materialize_verified_project_row(
         return None
 
     # P0-3 通用项目兼容性硬门禁 (Project Compatibility Hard Gate)
+    # 对 ai_only 平台：只有 ai_powered == True 才允许；False 或 missing/unknown 均 fail closed
     p_ctx = resolve_project_context(proj, project_context)
-    if p_ctx.get("ai_powered") is False and verified_entry.ai_only:
-        # 平台存在强限制仅限 AI 工具 (AI-only)，当前项目明确声明非 AI (ai_powered=False)，拒绝生成项目行
-        return None
+    if verified_entry.ai_only:
+        if p_ctx.get("ai_powered") is not True:
+            return None
 
     # 检查 project_id + backlink_id 唯一性
     for prow in existing_project_rows:
@@ -902,6 +895,24 @@ def materialize_project_row(
 
     if not verified_obj:
         return None
+
+    # 聚合平台约束：homepage ai_only_signals + verified entry page ai_only_signals
+    # 无论 entry_finder 路径还是 existing Master entry + entry_verifier 路径，语义必须一致
+    if not verified_obj.ai_only:
+        _fetch = fetcher or fetch_page
+        for scheme in ("https", "http"):
+            home_res = _fetch(f"{scheme}://{backlink_id}/")
+            if home_res and home_res.get("status") == 200:
+                if home_res.get("ai_only_signals"):
+                    verified_obj = VerifiedEntry(
+                        url=verified_obj.url,
+                        domain=verified_obj.domain,
+                        evidence_type=verified_obj.evidence_type,
+                        evidence_summary=verified_obj.evidence_summary,
+                        form_details=verified_obj.form_details,
+                        ai_only=True,
+                    )
+                break
 
     return _materialize_verified_project_row(
         master_row=master_row,

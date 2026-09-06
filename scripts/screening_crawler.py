@@ -50,7 +50,25 @@ COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool'
 
 # Actionable Form / CTA 强模式定义
 RESOURCE_FIELD_RE = re.compile(r'\b(url|website|site|tool|product|app|startup|business|listing|project)\b', re.I)
-SUBMIT_CONTROL_RE = re.compile(r'\b(submit|add|publish|post|contribute|list|create|send)\b', re.I)
+
+# 明确拒绝的检测器/分析器意图 (Checker / Analyzer intent)
+CHECKER_INTENT_RE = re.compile(
+    r'\b(check|analyze|analyse|scan|lookup|search|audit|test|calculate|report|verify|ping|generate)\b',
+    re.I
+)
+
+# 允许的 Directory / Listing 提交流程意图 (Submission intent)
+DIRECTORY_SUBMIT_INTENT_RE = re.compile(
+    r'\b(submit|add|list|publish|get[-_\s]listed|create[-_\s]listing|post|register|claim)\b',
+    re.I
+)
+
+# 允许的 Guest Post 投稿提交流程意图
+GP_SUBMIT_INTENT_RE = re.compile(
+    r'\b(submit|add|publish|post|contribute|send|pitch)\b',
+    re.I
+)
+
 GUEST_POST_CONTEXT_RE = re.compile(r'\b(write[-_\s]for[-_\s]us|contribute|guest[-_\s]?post|guest[-_\s]?article|submit[-_\s]article)\b', re.I)
 GUEST_POST_FIELD_RE = re.compile(r'\b(pitch|article|content|story|topic|outline|draft|post_content)\b', re.I)
 SEARCH_FIELD_RE = re.compile(r'^(?:q|s|query|search|keyword|k)$', re.I)
@@ -280,6 +298,7 @@ def analyze_html(raw_html, base_url):
         has_message = False
 
         submit_buttons = []
+        gp_submit_buttons = []
         for c in controls:
             tag = c.get('tag')
             ctype = c.get('type', '')
@@ -289,11 +308,20 @@ def analyze_html(raw_html, base_url):
             cvalue = (c.get('value') or '').lower()
             ctext = (c.get('text') or '').lower()
             field_desc = re.sub(r'[\W_]+', ' ', f"{cname} {cid} {cplaceholder} {ctype}").strip()
+            btn_desc = re.sub(r'[\W_]+', ' ', f"{ctext} {cvalue} {cname} {cid}").strip()
 
-            # 检查提交按钮
-            if ctype == 'submit' or tag == 'button' or SUBMIT_CONTROL_RE.search(cvalue) or SUBMIT_CONTROL_RE.search(ctext):
-                btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
-                submit_buttons.append(btn_name[:50])
+            # 检查提交按钮及意图 (严格分离 Listing 提交意图与 Checker 分析意图)
+            is_potential_btn = (ctype == 'submit' or tag == 'button' or ctype in ('button', 'image'))
+            if is_potential_btn:
+                # 明确拒绝 checker intent (check / analyze / scan / lookup / search 等)
+                if not CHECKER_INTENT_RE.search(btn_desc):
+                    is_plain_submit = (ctype == 'submit' and not (ctext.strip() or cvalue.strip()))
+                    if DIRECTORY_SUBMIT_INTENT_RE.search(btn_desc) or is_plain_submit:
+                        btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
+                        submit_buttons.append(btn_name[:50])
+                    elif GP_SUBMIT_INTENT_RE.search(btn_desc):
+                        btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
+                        gp_submit_buttons.append(btn_name[:50])
 
             # 检查字段用途
             if RESOURCE_FIELD_RE.search(field_desc):
@@ -326,11 +354,11 @@ def analyze_html(raw_html, base_url):
 
         # 判定表单类型
         form_type = None
-        # Type 1: Directory / Tool Listing 表单
+        # Type 1: Directory / Tool Listing 表单 (必须有 resource identity field + 真实 submission intent)
         if resource_fields_found and submit_buttons:
             form_type = 'directory_listing'
-        # Type 2: Guest Post / 投稿表单
-        elif (has_gp_context or GUEST_POST_CONTEXT_RE.search(form_text)) and gp_fields_found and submit_buttons:
+        # Type 2: Guest Post / 投稿表单 (具备投稿上下文 + 文章字段 + 投稿提交控件)
+        elif (has_gp_context or GUEST_POST_CONTEXT_RE.search(form_text)) and gp_fields_found and (submit_buttons or gp_submit_buttons):
             form_type = 'guest_post'
 
         if form_type:
