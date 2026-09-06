@@ -931,6 +931,7 @@ def prepare_execution_batch(
     entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
     project_context: dict[str, Any] | None = None,
     fetcher: Callable[[str], dict] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """从已有项目 Backlog 中筛选待提交记录，执行有界的现场 Entry 核验，产出 Ready for Autofill 队列。
     
@@ -1042,6 +1043,18 @@ def prepare_execution_batch(
             # 核验失败 / unresolved:
             # 项目行仍然存在，状态仍然待提交，尝试次数仍然 0，不得标记为失败或不适用
             failed_verification_count += 1
+
+        if progress_callback:
+            outcome = "ready" if (verified_obj and not (verified_obj.ai_only and p_ctx.get("ai_powered") is not True)) else ("incompatible" if (verified_obj and verified_obj.ai_only) else "unresolved")
+            progress_callback({
+                "scanned_count": scanned_count,
+                "domain": cid,
+                "outcome": outcome,
+                "entry_url": verified_obj.url if verified_obj else None,
+                "ready_count": len(ready_rows),
+                "target_ready_count": target_ready_count,
+                "scan_limit": scan_limit,
+            })
 
     return {
         "ready_rows": ready_rows,

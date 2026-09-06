@@ -32,6 +32,9 @@ if SCRIPTS_DIR not in sys.path:
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 from master_sheet_sync import (
     MASTER_HEADER,
     PROJECT_HEADER,
@@ -39,6 +42,7 @@ from master_sheet_sync import (
     prepare_execution_batch,
     resolve_project_context,
 )
+from screening_crawler import fetch_page
 
 
 def get_sheets_service(credentials_path: str):
@@ -139,8 +143,29 @@ def run_phase_c_preparation(
     print(f"  - Master '提交入口' 位于列: {entry_col_letter}")
 
     # 2. 执行现场 Live Verification
-    print(f"\n[2/5] 开始筛选待提交候选并执行现场核验 (target={target_ready_count}, scan_limit={scan_limit})...")
+    print(f"\n[2/5] 开始筛选待提交候选并执行现场核验 (target={target_ready_count}, scan_limit={scan_limit})...", flush=True)
     project_context = {"ai_powered": ai_powered}
+
+    def on_progress(p: dict[str, Any]):
+        idx = p["scanned_count"]
+        limit = p["scan_limit"]
+        dom = p["domain"]
+        outcome = p["outcome"]
+        ready_now = p["ready_count"]
+        target = p["target_ready_count"]
+        url_str = f" -> {p['entry_url']}" if p.get("entry_url") else ""
+        outcome_tag = {
+            "ready": "✅ READY",
+            "incompatible": "⚠️ INCOMPATIBLE (AI-only)",
+            "unresolved": "❌ UNRESOLVED (无有效入口)",
+        }.get(outcome, outcome)
+        print(
+            f"  [{idx:03d}/{limit:03d}] {dom:<30} {outcome_tag}{url_str} | 已就绪: {ready_now}/{target}",
+            flush=True,
+        )
+
+    def fast_fetcher(url: str) -> dict:
+        return fetch_page(url, timeout=5)
 
     batch_result = prepare_execution_batch(
         master_rows=master_rows,
@@ -149,6 +174,8 @@ def run_phase_c_preparation(
         target_ready_count=target_ready_count,
         scan_limit=scan_limit,
         project_context=project_context,
+        fetcher=fast_fetcher,
+        progress_callback=on_progress,
     )
 
     ready_rows = batch_result["ready_rows"]
