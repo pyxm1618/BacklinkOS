@@ -130,11 +130,20 @@ test('discovering-backlinks defines bounded submission entry enrichment and proj
 
   // 存量池 Bounded Batch Hydration
   assert.match(skill, /Bounded Batch Hydration/i);
-  assert.match(skill, /limit/i);
+  assert.match(skill, /target_count/i);
+  assert.match(skill, /scan_limit/i);
+
+  // Verified Entry 与禁止 URL path 单独升级
+  assert.match(skill, /VerifiedEntry/i);
+  assert.match(skill, /(禁止|绝不|不能)[^\n]*(URL path|路径)[^\n]*(单独升级|真入口|有效入口)/i);
 
   assert.match(contract, /Submission Entry Enrichment/i);
+  assert.match(contract, /VerifiedEntry/i);
+  assert.match(contract, /scan_limit/i);
   assert.match(contract, /待提交/);
   assert.match(cases, /Policy Guard/i);
   assert.match(cases, /Quick I Ching/);
+  assert.match(cases, /scan_limit/i);
 });
+
 

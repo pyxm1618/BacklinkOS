@@ -91,19 +91,19 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 
 ## 4. 最低限度 Submission Entry Enrichment
 
-针对 `基础状态 == '候选' AND 提交入口为空` 且准备进入项目执行队列的平台，进行真实入口查找：
+针对 `基础状态 == '候选'` 且准备进入项目执行队列的平台，进行真实入口查找与核验：
 
 ### 两层架构原则
 1. **Live Evidence（真实页面证据）**：
-   - 实际请求目标页面（HTTP 200，非 noindex，同源）；
-   - 从实际 HTML 中通过锚文本、链接（ENTRY_HINTS / MECHANISM_PATTERNS）定位到可执行提交子页面（如 `/submit`, `/add-tool`, `/s/new`）；
-   - 或者确认首页本身具有明确的机制 CTA 文案（如 "Submit your tool", "Create profile to list"）。
+   - 实际请求目标页面（HTTP 200，同源）；
+   - **禁止 URL path 单独升级为入口：** 仅凭路径含 submit 且 HTTP 200 绝不足以成为有效入口，页面内必须实际包含机制文案/交互控件（`mechanism_signals` 如 "submit your tool", "add website", "write for us"）。普通页面或空白页断然拒绝；
+   - **登录/注册墙 noindex 防误杀：** 复用 `AUTH_PATH_RE`；若页面属于登录/注册/认证墙（如 `/login`, `/auth`, `/sign-up`），其设置 noindex 属于正常现象，只要具备机制文案或登录跳转特征，绝不误杀；
+   - 首页必须确认页面本身具有明确的机制 CTA 文案（如 "Submit your tool", "Create profile to list"），不能无证据拿首页填空。
 2. **Policy Guard（政策守卫拦截）**：
    - 必须是 http/https 且同源；
-   - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等；
-   - 首页绝不能仅凭 URL 冒充入口；无页面 CTA 证据的首页一律拦截。
+   - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等。
 3. **写入决策**：
-   - 只有同时具备真实页面证据且通过 Policy Guard 的 URL，才写入 `提交入口`；
+   - 只有同时具备真实页面机制证据且通过 Policy Guard 的 URL，才写入 `提交入口` 并产生内部 `VerifiedEntry`；
    - **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
    - 严禁在这个阶段提前做免费/Follow/DR/资格等实测事实判定。
 
@@ -114,10 +114,11 @@ Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` �
 Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-iching`）中：
 
 ### 创建条件
-同时满足以下三项：
-1. `外链总表.基础状态 == '候选'`
-2. `存在真实验证的提交入口`（非空且通过 Policy Guard）
-3. 当前 `project_id + backlink_id` 尚不存在于 `外链管理` 中
+同时满足以下四项：
+1. `外链总表.基础状态 == '候选'`；
+2. **具备现场核验通过的 `VerifiedEntry` 对象**（若总表已有历史提交入口，在 Hydration 时也必须现场重新核验通过产生 VerifiedEntry，禁止未经现场核验直接通过）；
+3. `verified_entry.domain` 与 `外链ID` 完全一致；
+4. 当前 `project_id + backlink_id` 尚不存在于 `外链管理` 中。
 
 ### 创建内容
 - `项目ID = project_id`
@@ -125,6 +126,7 @@ Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-
 - `外链域名 = canonical domain`
 - `状态 = 待提交`
 - `尝试次数 = 0`
+- `证据摘要 = verified_entry.evidence_type: verified_entry.evidence_summary`
 - 其他执行与结果列留空。
 
 ### 保护历史唯一性
@@ -135,14 +137,14 @@ Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-
 
 ---
 
-## 6. 存量池 Bounded Batch Hydration
+## 6. 存量池严格双边界 Bounded Batch Hydration
 
 支持对总表存量候选池进行按批次入口注入：
-- 必须显式传入 `project_id` 和 `limit`（目标批次大小，如 10）；
-- 严格有界，逐个核验候选域名；
-- 成功找到真实入口一个，才生成一条项目待提交行，达到 limit 即停止；
-- 找不到真实入口的 domain 保持候选，提交入口留空，不生成项目行；
-- **严禁一次性将 3000+ 候选全量复制或扫入项目队列。**
+- 必须显式传入 `project_id`、`target_count`（期望成功的项目行数量，默认 10）与 `scan_limit`（本次最多检查候选数，默认 30，且 `scan_limit >= target_count`）；
+- **已有入口现场核验：** 对总表已存在非空 `提交入口` 的候选，现场核验其有效性；通过则生成 VerifiedEntry 并 materialize；未通过则保持候选，不生成项目行，不随意替换原 URL；
+- **空入口现场探测：** 现场探测真实入口，成功则更新总表入口并生成 VerifiedEntry；
+- **双边界严格停止：** 满足 `succeeded >= target_count` 或 `processed >= scan_limit` 任意一个立即停止退出；
+- **严禁仅靠 target_count 在大量失败时无限扫描 3000+ 候选。**
 
 ---
 

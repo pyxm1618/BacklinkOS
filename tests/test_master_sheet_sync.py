@@ -14,6 +14,7 @@ from master_sheet_sync import (
     PROJECT_HEADER,
     PROJECT_STATUS_TO_SUBMIT,
     PROTECTED_FACT_COLUMNS,
+    VerifiedEntry,
     batch_hydrate_candidates,
     canonical_domain,
     discover_and_verify_entry,
@@ -21,6 +22,7 @@ from master_sheet_sync import (
     submission_entry_policy_guard,
     upsert_master_rows,
     verify_homepage_as_entry,
+    verify_submission_entry,
 )
 
 
@@ -85,7 +87,6 @@ class MasterSheetUpsertTests(unittest.TestCase):
             "实测链接属性": "Follow",
             "最后验证时间": "2026-08-20",
         }]
-        # 新发现中即使伪造了实测事实，upsert 必须严格保护已有事实不被污染覆盖
         new_items = [{
             "domain": "verified.com",
             "实测免费": "否",
@@ -193,6 +194,57 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertIn("包含明确提交 CTA", reason)
 
+    def test_p0_1_submit_url_with_200_but_no_mechanism_is_rejected(self):
+        # P0-1 核心：/submit 返回 HTTP 200，但 mechanism_signals 为空且为普通文章内容，必须坚决拒绝！
+        def fake_fetch(url):
+            if url == "https://plain-site.com/":
+                return {
+                    "status": 200,
+                    "final_url": "https://plain-site.com/",
+                    "candidate_urls": ["https://plain-site.com/submit"],
+                    "mechanism_signals": [],
+                    "noindex": False,
+                }
+            if url == "https://plain-site.com/submit":
+                return {
+                    "status": 200,
+                    "final_url": "https://plain-site.com/submit",
+                    "mechanism_signals": [],  # 没有真实机制信号！
+                    "noindex": False,
+                    "title": "Submit Page",
+                    "text_excerpt": "This is a generic page with some text.",
+                }
+            return {"status": 404}
+
+        entry_obj, reason = discover_and_verify_entry("plain-site.com", fetcher=fake_fetch)
+        self.assertIsNone(entry_obj, "没有机制信号的 /submit 页面绝不得被升级为 verified entry！")
+        self.assertIn("证据缺失", reason)
+
+    def test_p1_auth_wall_with_noindex_is_accepted_when_mechanism_present(self):
+        # P1 核心：登录/注册墙（/login）带 noindex 是正常的，若存在机制信号，绝不能被当作不可索引误杀
+        def fake_fetch_auth(url):
+            if url == "https://auth-site.com/":
+                return {
+                    "status": 200,
+                    "final_url": "https://auth-site.com/",
+                    "candidate_urls": ["https://auth-site.com/login?redirect=/submit"],
+                    "mechanism_signals": [],
+                    "noindex": False,
+                }
+            if url == "https://auth-site.com/login?redirect=/submit":
+                return {
+                    "status": 200,
+                    "final_url": "https://auth-site.com/login?redirect=/submit",
+                    "mechanism_signals": ["submit your project"],  # 机制明确
+                    "noindex": True,  # 登录墙正常 noindex
+                }
+            return {"status": 404}
+
+        entry_obj, reason = discover_and_verify_entry("auth-site.com", fetcher=fake_fetch_auth)
+        self.assertIsNotNone(entry_obj, "认证墙有效机制入口不应因 noindex 被误杀")
+        self.assertEqual(entry_obj.evidence_type, "auth_wall_submission")
+        self.assertEqual(entry_obj.url, "https://auth-site.com/login?redirect=/submit")
+
     def test_discover_and_verify_entry_locates_subpage(self):
         def fake_fetch(url):
             if url == "https://testdir.com/":
@@ -212,9 +264,10 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
                 }
             return {"status": 404}
 
-        entry_url, reason = discover_and_verify_entry("testdir.com", fetcher=fake_fetch)
-        self.assertEqual(entry_url, "https://testdir.com/add-project")
-        self.assertIn("闭环", reason)
+        entry_obj, reason = discover_and_verify_entry("testdir.com", fetcher=fake_fetch)
+        self.assertIsNotNone(entry_obj)
+        self.assertEqual(entry_obj.url, "https://testdir.com/add-project")
+        self.assertEqual(entry_obj.evidence_type, "subpage_mechanism")
 
     def test_entry_unknown_remains_empty_and_candidate_retained(self):
         def fake_fetch_no_entry(url):
@@ -230,29 +283,49 @@ class SubmissionEntryPolicyGuardAndDiscoveryTests(unittest.TestCase):
                 }
             return {"status": 404}
 
-        entry_url, reason = discover_and_verify_entry("noentry.com", fetcher=fake_fetch_no_entry)
-        self.assertIsNone(entry_url)
+        entry_obj, reason = discover_and_verify_entry("noentry.com", fetcher=fake_fetch_no_entry)
+        self.assertIsNone(entry_obj)
         self.assertIn("证据缺失", reason)
 
 
 class ProjectSynchronizationTests(unittest.TestCase):
-    def test_candidate_with_valid_entry_materializes_to_to_submit(self):
+    def test_candidate_with_verified_entry_materializes_to_to_submit(self):
         master_row = {
             "外链ID": "good-opportunity.com",
             "平台域名": "good-opportunity.com",
             "基础状态": MASTER_STATUS_CANDIDATE,
             "提交入口": "https://good-opportunity.com/submit",
         }
+        verified_entry = VerifiedEntry(
+            url="https://good-opportunity.com/submit",
+            domain="good-opportunity.com",
+            evidence_type="subpage_mechanism",
+            evidence_summary="包含 submit a tool 机制",
+        )
         existing_project_rows = []
-        prow = materialize_project_row(master_row, existing_project_rows, "quick-iching")
+        prow = materialize_project_row(
+            master_row=master_row,
+            existing_project_rows=existing_project_rows,
+            project_id="quick-iching",
+            verified_entry=verified_entry,
+        )
         self.assertIsNotNone(prow)
         self.assertEqual(prow["项目ID"], "quick-iching")
         self.assertEqual(prow["外链ID"], "good-opportunity.com")
-        self.assertEqual(prow["外链域名"], "good-opportunity.com")
         self.assertEqual(prow["状态"], PROJECT_STATUS_TO_SUBMIT)
         self.assertEqual(prow["尝试次数"], "0")
-        self.assertEqual(prow["目标URL"], "")
-        self.assertEqual(prow["结果链接"], "")
+        self.assertIn("subpage_mechanism", prow["证据摘要"])
+
+    def test_materialize_fails_without_verified_entry_object(self):
+        # 封死未经 live verification 的普通字符串绕过
+        master_row = {
+            "外链ID": "unverified.com",
+            "平台域名": "unverified.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://unverified.com/submit",
+        }
+        # 不传 verified_entry 必须返回 None
+        self.assertIsNone(materialize_project_row(master_row, [], "quick-iching", verified_entry=None))
 
     def test_existing_project_row_not_duplicated_or_reset(self):
         master_row = {
@@ -261,16 +334,28 @@ class ProjectSynchronizationTests(unittest.TestCase):
             "基础状态": MASTER_STATUS_CANDIDATE,
             "提交入口": "https://active-task.com/submit",
         }
+        verified_entry = VerifiedEntry(
+            url="https://active-task.com/submit",
+            domain="active-task.com",
+            evidence_type="subpage_mechanism",
+            evidence_summary="test",
+        )
         existing_project_rows = [{
             "项目ID": "quick-iching",
             "外链ID": "active-task.com",
             "状态": "已提交",
             "结果链接": "https://active-task.com/p/quickiching",
         }]
-        prow = materialize_project_row(master_row, existing_project_rows, "quick-iching")
+        prow = materialize_project_row(master_row, existing_project_rows, "quick-iching", verified_entry=verified_entry)
         self.assertIsNone(prow)
 
     def test_excluded_or_dead_master_row_does_not_materialize(self):
+        verified_entry = VerifiedEntry(
+            url="https://excluded.com/submit",
+            domain="excluded.com",
+            evidence_type="subpage_mechanism",
+            evidence_summary="test",
+        )
         excluded_master = {
             "外链ID": "excluded.com",
             "基础状态": MASTER_STATUS_EXCLUDED,
@@ -281,19 +366,16 @@ class ProjectSynchronizationTests(unittest.TestCase):
             "基础状态": MASTER_STATUS_DEAD,
             "提交入口": "https://dead.com/submit",
         }
-        self.assertIsNone(materialize_project_row(excluded_master, [], "quick-iching"))
-        self.assertIsNone(materialize_project_row(dead_master, [], "quick-iching"))
-
-    def test_empty_entry_does_not_materialize(self):
-        master_row = {
-            "外链ID": "no-entry.com",
-            "基础状态": MASTER_STATUS_CANDIDATE,
-            "提交入口": "",
-        }
-        self.assertIsNone(materialize_project_row(master_row, [], "quick-iching"))
+        self.assertIsNone(materialize_project_row(excluded_master, [], "quick-iching", verified_entry=verified_entry))
+        self.assertIsNone(materialize_project_row(dead_master, [], "quick-iching", verified_entry=verified_entry))
 
     def test_preserves_quick_iching_historical_terminal_statuses(self):
-        # 保护 36 条历史人工/E2E记录：已排期、需人工、不适用等终态绝对不被改写或重建
+        verified_entry = VerifiedEntry(
+            url="https://e2e-protected.com/submit",
+            domain="e2e-protected.com",
+            evidence_type="subpage_mechanism",
+            evidence_summary="test",
+        )
         for terminal_status in ["已排期", "需人工", "不适用", "已上线", "失败"]:
             master_row = {
                 "外链ID": "e2e-protected.com",
@@ -305,57 +387,119 @@ class ProjectSynchronizationTests(unittest.TestCase):
                 "外链ID": "e2e-protected.com",
                 "状态": terminal_status,
             }]
-            self.assertIsNone(materialize_project_row(master_row, existing, "quick-iching"))
+            self.assertIsNone(materialize_project_row(master_row, existing, "quick-iching", verified_entry=verified_entry))
 
 
-class BoundedBatchHydrationTests(unittest.TestCase):
-    def test_batch_hydration_is_strictly_bounded_by_limit(self):
-        master_rows = [
-            {"外链ID": f"cand-{i}.com", "平台域名": f"cand-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""}
-            for i in range(20)
-        ]
-        existing_project_rows = []
+class P0_2_ExistingMasterEntryVerificationTests(unittest.TestCase):
+    def test_existing_homepage_entry_without_cta_cannot_materialize_in_hydration(self):
+        # P0-2: master 中已有提交入口=https://example.com/，但首页现场核验无 Submit CTA -> 不得 materialize
+        master_rows = [{
+            "外链ID": "no-cta.com",
+            "平台域名": "no-cta.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://no-cta.com/",
+        }]
 
-        def mock_finder(d):
-            return f"https://{d}/submit", "found"
-
-        res = batch_hydrate_candidates(
-            master_rows=master_rows,
-            existing_project_rows=existing_project_rows,
-            project_id="quick-iching",
-            limit=5,
-            entry_finder=mock_finder,
-        )
-
-        self.assertEqual(res["succeeded_count"], 5)
-        self.assertEqual(len(res["new_project_rows"]), 5)
-        # 只处理了 5 个即停止，绝不一次性扫描全部 20 个
-        self.assertEqual(res["processed_candidates"], 5)
-
-    def test_batch_hydration_skips_failed_entry_and_retains_candidate(self):
-        master_rows = [
-            {"外链ID": "fail-1.com", "平台域名": "fail-1.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""},
-            {"外链ID": "success-2.com", "平台域名": "success-2.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""},
-        ]
-        def mock_finder(d):
-            if d == "fail-1.com":
-                return None, "no entry found"
-            return f"https://{d}/submit", "found"
+        def mock_verifier(d, url):
+            # 首页无 CTA
+            return None, "首页无明确 CTA"
 
         res = batch_hydrate_candidates(
             master_rows=master_rows,
             existing_project_rows=[],
             project_id="quick-iching",
-            limit=5,
-            entry_finder=mock_finder,
+            target_count=5,
+            scan_limit=10,
+            entry_verifier=mock_verifier,
         )
 
-        self.assertEqual(res["succeeded_count"], 1)
-        self.assertEqual(len(res["new_project_rows"]), 1)
-        self.assertEqual(res["new_project_rows"][0]["外链ID"], "success-2.com")
-        # fail-1.com 提交入口保持为空，基础状态保持为候选，不被排除
-        self.assertEqual(master_rows[0]["提交入口"], "")
+        self.assertEqual(res["succeeded_count"], 0)
+        self.assertEqual(len(res["new_project_rows"]), 0)
+        # 保持原有值，不瞎猜替换，保持候选
+        self.assertEqual(master_rows[0]["提交入口"], "https://no-cta.com/")
         self.assertEqual(master_rows[0]["基础状态"], MASTER_STATUS_CANDIDATE)
+
+    def test_existing_subpage_entry_without_mechanism_cannot_materialize_in_hydration(self):
+        # P0-2: master 中已有提交入口=https://example.com/submit，但现场页面不存在提交机制 -> 不得 materialize
+        master_rows = [{
+            "外链ID": "fake-submit.com",
+            "平台域名": "fake-submit.com",
+            "基础状态": MASTER_STATUS_CANDIDATE,
+            "提交入口": "https://fake-submit.com/submit",
+        }]
+
+        def mock_verifier(d, url):
+            return None, "页面无机制信号"
+
+        res = batch_hydrate_candidates(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            target_count=5,
+            scan_limit=10,
+            entry_verifier=mock_verifier,
+        )
+
+        self.assertEqual(res["succeeded_count"], 0)
+        self.assertEqual(len(res["new_project_rows"]), 0)
+        self.assertEqual(master_rows[0]["提交入口"], "https://fake-submit.com/submit")
+
+
+class P0_3_BoundedBatchHydrationTests(unittest.TestCase):
+    def test_batch_hydration_stops_at_scan_limit_when_all_fail(self):
+        # 100 个 candidate，全部 finder 返回 None，target_count=10, scan_limit=20
+        # 预期：processed_candidates == 20, succeeded_count == 0，绝不扫描 100 个！
+        master_rows = [
+            {"外链ID": f"cand-{i}.com", "平台域名": f"cand-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""}
+            for i in range(100)
+        ]
+
+        def mock_fail_finder(d):
+            return None, "no entry found"
+
+        res = batch_hydrate_candidates(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            target_count=10,
+            scan_limit=20,
+            entry_finder=mock_fail_finder,
+        )
+
+        self.assertEqual(res["processed_candidates"], 20)
+        self.assertEqual(res["succeeded_count"], 0)
+        self.assertEqual(len(res["new_project_rows"]), 0)
+
+    def test_batch_hydration_stops_early_when_scan_limit_hit_before_target(self):
+        # 成功率低：只有前 2 个成功，之后全失败，target_count=10，scan_limit=15
+        master_rows = [
+            {"外链ID": f"cand-{i}.com", "平台域名": f"cand-{i}.com", "基础状态": MASTER_STATUS_CANDIDATE, "提交入口": ""}
+            for i in range(50)
+        ]
+
+        def mock_low_hit_finder(d):
+            if d in ("cand-0.com", "cand-1.com"):
+                return VerifiedEntry(
+                    url=f"https://{d}/submit",
+                    domain=d,
+                    evidence_type="subpage_mechanism",
+                    evidence_summary="ok",
+                ), "ok"
+            return None, "no entry"
+
+        res = batch_hydrate_candidates(
+            master_rows=master_rows,
+            existing_project_rows=[],
+            project_id="quick-iching",
+            target_count=10,
+            scan_limit=15,
+            entry_finder=mock_low_hit_finder,
+        )
+
+        # 触达 scan_limit=15 立即退出，虽然目标 10 未达成
+        self.assertEqual(res["processed_candidates"], 15)
+        self.assertEqual(res["succeeded_count"], 2)
+        self.assertEqual(len(res["new_project_rows"]), 2)
 
 
 class FactSeparationTests(unittest.TestCase):
@@ -364,7 +508,6 @@ class FactSeparationTests(unittest.TestCase):
         new_items = [{
             "referring_domain": "clean.com",
             "discovery_source": "toolify",
-            # 假定上游或脚本不慎传递了猜测的实测值
             "实测免费": "是",
             "实测需登录": "否",
             "实测登录方式": "OAuth",

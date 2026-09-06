@@ -32,16 +32,18 @@ backlink-autofill (独立仓库，真实浏览器执行)
    - **Upsert 保护：** 新域名新增为候选；已有域名不重复创建，不得覆盖已有真实实测字段，**绝不得将`已排除`或`失效`改回`候选`**。
    - **硬黑名单：** 直接来自总表 `已排除` 或 `失效` 状态，不重复研究，不重新进入项目执行队列。不维护第二套独立黑名单。
 2. **最低限度 Submission Entry Enrichment**
-   - 对准备进入项目队列的平台寻找真实可执行入口（Submit, Add Product, Write for Us, Create Profile 等）。
-   - 严格区分两层：**Live Evidence（真实打开页面/机制信号或首页明确 CTA） → Candidate URL → Policy Guard 校验（排除 pricing/terms/category/seo-report 等） → 写入 Sheet**。
+   - 严格区分两层：**Live Evidence（真实打开页面检测到实际机制文案/控件，或首页明确 CTA） → Candidate URL → Policy Guard 校验（排除 pricing/terms/category/seo-report 等） → 写入 Sheet**。
+   - **禁止 URL path 单独升级为入口：** 仅凭路径含 submit 且 HTTP 200 绝不足以成为有效入口，页面内必须实际包含机制文案/控件（`mechanism_signals`）。普通页面坚决拒绝。
+   - **登录/注册墙 noindex 防误杀：** 复用 `AUTH_PATH_RE`；登录/注册墙页面带 noindex 是正常现象，只要有机制文案或登录跳转特征，绝不误杀。
    - 首页绝不能仅凭 URL 冒充入口；无页面 CTA 证据的首页一律拦截。
    - **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
 3. **项目执行行 Materialization**
    - 必须运行在明确项目上下文（如 `quick-iching`）下。
-   - 仅当满足：`总表基础状态==候选` AND `存在真实验证的提交入口` AND `当前 project_id + backlink_id 尚不存在` 时，才生成 `待提交` 行。
+   - **历史提交入口强制重新核验：** 总表现存历史 `提交入口` 必须通过现场 Live Verification 生成 `VerifiedEntry`，才能 materialize 为待提交行；未通过现场核验不生成项目行。
+   - 仅当满足：`总表基础状态==候选` AND `具备现场核验通过的 VerifiedEntry` AND `当前 project_id + backlink_id 尚不存在` 时，才生成 `待提交` 行。
    - **项目行不重复：** `project_id + backlink_id` 唯一。已存在任何状态均不重复创建或重置。Quick I Ching 已有历史记录必须保护。
-4. **存量池 Bounded Batch Hydration**
-   - 存量候选 Hydration 必须显式指定 `project_id` 和 `limit`（如 10），严格有界逐个推进，**绝不一次性灌入 3000+**。
+4. **存量池严格双边界 Bounded Batch Hydration**
+   - 必须显式指定 `project_id`、`target_count` 与 `scan_limit`，满足 `succeeded >= target_count` 或 `processed >= scan_limit` 任一条件即刻停止，**绝不因大量失败而无限扫完 3000+**。
 5. **`screening-backlinks` 状态**
    - 旧 Skill 退出主工作流，不要删除其历史文件，作为 legacy / optional 旁路保留。
 

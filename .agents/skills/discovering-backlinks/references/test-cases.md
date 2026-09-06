@@ -45,8 +45,10 @@
 41. 对 `@外链管理总控表` 的 `外链总表` 实行 Upsert：新域名新增为候选；已存在域名不重复建行；已有真实实测字段不得覆盖；基础状态已排除或失效绝对不得重新改成候选。
 42. 硬黑名单统一直接来自外链总表已排除或失效状态，不重复研究，不重新进入项目执行队列。
 43. Discovery 严禁填写总表的 5 个实测事实字段（实测免费、实测需登录、实测登录方式、实测限制、实测链接属性、最后验证时间），必须严格留空。
-44. Submission Entry Enrichment 遵循两层架构：Live Evidence（真实打开页面/机制信号或首页明确 CTA） -> Candidate URL -> Policy Guard 校验 -> 写入 Sheet。
-45. pricing/terms/category/seo-report 等页面严禁冒充提交入口；未经验证的首页严禁盲填；找不到入口保持为空且候选继续保留，绝对不因找不到入口而淘汰。
-46. 项目执行行 Materialization：在明确项目上下文下，仅当候选具备真实验证入口且项目记录尚不存在时，才在 `外链管理` 创建待提交行。
-47. `project_id + backlink_id` 唯一：已存在任何状态均不重复创建或重置为待提交；Quick I Ching 已有历史必须保护。
-48. Bounded Batch Hydration 必须显式传入 project_id 与 limit，严格有界逐个核验，达到 limit 即停止，绝对不一次性将 3000+ 候选全量复制到项目表。
+44. Submission Entry Enrichment 遵循两层架构：Live Evidence（真实打开页面检测到实际机制文案/控件，或首页明确 CTA） -> Candidate URL -> Policy Guard 校验 -> 写入 Sheet。
+45. 禁止 URL path 单独升级为入口：/submit 返回 HTTP 200 但没有实际机制文案（mechanism_signals 为空）时坚决拒绝，不得生成 verified entry；同时复用 AUTH_PATH_RE，登录/注册墙带 noindex 只要具有机制文案特征不予误杀。
+46. pricing/terms/category/seo-report 等页面严禁冒充提交入口；未经验证的首页严禁盲填；找不到入口保持为空且候选继续保留，绝对不因找不到入口而淘汰。
+47. 项目执行行 Materialization：在明确项目上下文下，仅当候选具备现场核验通过的 VerifiedEntry 且项目记录尚不存在时，才在 `外链管理` 创建待提交行。已有历史 entry 必须现场重新核验，未通过不得生成项目待提交行。
+48. `project_id + backlink_id` 唯一：已存在任何状态均不重复创建或重置为待提交；Quick I Ching 已有历史必须保护。
+49. 严格双边界 Bounded Batch Hydration：必须显式传入 project_id、target_count 与 scan_limit；满足 succeeded >= target_count 或 processed >= scan_limit 任一条件立即停止，绝对不因大量失败而无限扫描 3000+ 候选。
+
