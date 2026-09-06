@@ -519,6 +519,110 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
         analysis_d = analyze_html(html_d, "https://example.com/submit")
         self.assertEqual(len(analysis_d["actionable_forms"]), 0, "D: 显式 checker 文案 (Analyze) 优先于 path 触发拦截，必须被拒绝！")
 
+    def test_comment_and_reply_forms_rejected_as_directory_listing(self):
+        # A. 典型 WordPress / 博客评论表单：author + email + url + textarea[name=comment] + submit[value="Post Comment"] + action="/wp-comments-post.php"
+        html_a = """
+        <html>
+        <head><title>Blog Post - Example</title></head>
+        <body>
+            <article><h1>Some Article</h1><p>Content...</p></article>
+            <div id="comments">
+                <h3>Leave a Reply</h3>
+                <form action="/wp-comments-post.php" method="POST">
+                    <input type="text" name="author" placeholder="Name">
+                    <input type="email" name="email" placeholder="Email">
+                    <input type="url" name="url" placeholder="Website">
+                    <textarea name="comment" placeholder="Comment"></textarea>
+                    <input type="submit" value="Post Comment">
+                </form>
+            </div>
+        </body>
+        </html>
+        """
+        analysis_a = analyze_html(html_a, "https://example.com/blog/article-1")
+        self.assertEqual(len(analysis_a["actionable_forms"]), 0, "A: 典型博客评论表单绝不能识别为 actionable_forms！")
+
+        def fake_fetch_a(url):
+            return analysis_a | {"status": 200, "final_url": "https://example.com/blog/article-1"}
+
+        entry_obj_a, reason_a = verify_submission_entry("example.com", "https://example.com/blog/article-1", fetcher=fake_fetch_a)
+        self.assertIsNone(entry_obj_a, "A: 博客评论页面绝不能生成 VerifiedEntry！")
+        self.assertIn("未检测到真实可操作提交表单", reason_a)
+
+        # B. 真实的 Directory Form：website_url + description + button "Submit Website"
+        html_b = """
+        <html>
+        <head><title>Submit Your Site - Directory</title></head>
+        <body>
+            <form action="/submit" method="POST">
+                <input type="text" name="tool_name" placeholder="Tool Name">
+                <input type="url" name="website_url" placeholder="https://example.com">
+                <textarea name="description" placeholder="Short description"></textarea>
+                <button type="submit">Submit Website</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_b = analyze_html(html_b, "https://example.com/submit")
+        self.assertEqual(len(analysis_b["actionable_forms"]), 1, "B: 真实 Directory 表单必须正常通过！")
+        self.assertEqual(analysis_b["actionable_forms"][0]["form_type"], "directory_listing")
+
+        # B2. 带 "Additional comments" 字段的合法 Directory Form（绝不能被误杀！）
+        html_b2 = """
+        <html>
+        <head><title>Submit Tool to Directory</title></head>
+        <body>
+            <h1>Submit Tool</h1>
+            <p>Please enter details below. Any comments or instructions for the editorial team can be left in the comments box.</p>
+            <form action="/submit-tool" method="POST">
+                <input type="text" name="product_name" placeholder="Product Name">
+                <input type="url" name="website" placeholder="Website URL">
+                <textarea name="additional_comments" placeholder="Additional comments or notes for reviewers"></textarea>
+                <button type="submit">Submit Website</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_b2 = analyze_html(html_b2, "https://example.com/submit-tool")
+        self.assertEqual(len(analysis_b2["actionable_forms"]), 1, "B2: 包含 additional comments 辅助字段的合法 Directory 表单绝不能被误杀！")
+        self.assertEqual(analysis_b2["actionable_forms"][0]["form_type"], "directory_listing")
+
+        # C. 带有 url 字段但无文章字段且按钮为 "Reply" 的表单
+        html_c = """
+        <html>
+        <body>
+            <form action="/article/feedback" method="POST">
+                <input type="text" name="author" placeholder="Name">
+                <input type="url" name="url" placeholder="Your Site">
+                <textarea name="message" placeholder="Your feedback"></textarea>
+                <button type="submit">Reply</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_c = analyze_html(html_c, "https://example.com/article/feedback")
+        self.assertEqual(len(analysis_c["actionable_forms"]), 0, "C: 按钮为 Reply 的表单必须被拒绝为 directory_listing！")
+
+        # D. 合法的 Guest Post Form：具备 guest post context / pitch / article 字段 + "Submit Post"
+        html_d = """
+        <html>
+        <head><title>Write For Us - Guest Post Submission</title></head>
+        <body>
+            <h1>Guest Posting Guidelines</h1>
+            <form action="/submit-pitch" method="POST">
+                <input type="text" name="author_name" placeholder="Author Name">
+                <input type="email" name="email" placeholder="Author Email">
+                <input type="text" name="article_title" placeholder="Proposed Article Title">
+                <textarea name="pitch" placeholder="Outline and pitch details"></textarea>
+                <button type="submit">Submit Post</button>
+            </form>
+        </body>
+        </html>
+        """
+        analysis_d = analyze_html(html_d, "https://example.com/write-for-us")
+        self.assertEqual(len(analysis_d["actionable_forms"]), 1, "D: 合法 Guest Post 表单必须识别为 guest_post！")
+        self.assertEqual(analysis_d["actionable_forms"][0]["form_type"], "guest_post")
+
 
 if __name__ == "__main__":
     unittest.main()

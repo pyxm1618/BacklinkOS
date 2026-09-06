@@ -58,8 +58,22 @@ CHECKER_INTENT_RE = re.compile(
 )
 
 # 允许的 Directory / Listing 提交流程意图 (Submission intent)
+# 禁止裸 "post"，只允许明确的目录收录短语如 post listing / post website / post tool 等
 DIRECTORY_SUBMIT_INTENT_RE = re.compile(
-    r'\b(submit|add|list|publish|get[-_\s]listed|create[-_\s]listing|post|register|claim)\b',
+    r'\b(submit|add|list|publish|get[-_\s]listed|create[-_\s]listing|register|claim)\b'
+    r'|\bpost[-_\s]+(?:your[-_\s]+)?(?:listing|website|site|tool|product|startup|app|project|business)\b',
+    re.I
+)
+
+# 明确拒绝的评论/回复意图 (Comment / Reply submit control intent)
+COMMENT_SUBMIT_CONTROL_RE = re.compile(
+    r'\b(comment|comments|reply|replies|leave\s+a\s+comment|leave\s+a\s+reply|post\s+comment|submit\s+comment|add\s+comment)\b',
+    re.I
+)
+
+# 明确的评论端点路径 (Comment action path)
+COMMENT_PATH_RE = re.compile(
+    r'(?:wp-comments-post|/comments?(?:/|$|\.php)|/repl(?:y|ies)(?:/|$|\.php))',
     re.I
 )
 
@@ -340,8 +354,8 @@ def analyze_html(raw_html, base_url):
             if is_potential_btn:
                 has_explicit_text = bool(ctext.strip() or cvalue.strip())
                 if has_explicit_text:
-                    # 规则 1: 显式按钮文案，明确拒绝 checker intent (check / analyze / scan 等优先拦截)
-                    if not CHECKER_INTENT_RE.search(btn_desc):
+                    # 规则 1: 显式按钮文案，明确拒绝 checker intent 与 comment/reply intent
+                    if not CHECKER_INTENT_RE.search(btn_desc) and not COMMENT_SUBMIT_CONTROL_RE.search(btn_desc):
                         if DIRECTORY_SUBMIT_INTENT_RE.search(btn_desc):
                             btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
                             submit_buttons.append(btn_name[:50])
@@ -352,10 +366,10 @@ def analyze_html(raw_html, base_url):
                     # 规则 2: 无 text/value 的 plain <input type=submit> 或纯提交按钮
                     # 绝不能单独构成 submission intent，必须依赖且仅依赖不含 checker 的 LOCAL context
                     if ctype == 'submit' or tag == 'button':
-                        if local_submit_intent:
+                        if local_submit_intent and not COMMENT_PATH_RE.search(action_path):
                             btn_name = cname or 'Submit'
                             submit_buttons.append(btn_name[:50])
-                        elif local_gp_intent:
+                        elif local_gp_intent and not COMMENT_PATH_RE.search(action_path):
                             btn_name = cname or 'Submit'
                             gp_submit_buttons.append(btn_name[:50])
 
@@ -388,10 +402,35 @@ def analyze_html(raw_html, base_url):
             if re.search(r'\b(subscribe|newsletter)\b', form_text):
                 continue
 
+        # 提取 Comment / Reply 排除特征
+        # 禁止仅因 form_text 出现 comment 就 hard reject；
+        # 必须基于明确 comment action path、明确 comment/reply submit control，或组合式强证据判断
+        has_comment_action = bool(COMMENT_PATH_RE.search(action_path))
+        has_comment_submit_control = any(
+            COMMENT_SUBMIT_CONTROL_RE.search(re.sub(r'[\W_]+', ' ', f"{(c.get('text') or '')} {(c.get('value') or '')}"))
+            for c in controls if (c.get('type') in ('submit', 'button', 'image') or c.get('tag') == 'button')
+        )
+        # 组合强证据：评论主体输入（如 textarea/input name 精确为 comment/reply）+ 局部明确评论标题/引导
+        # 避免误杀带 "additional comments" / "comments for reviewer" 的合法目录提交表单
+        has_exact_comment_field = any(
+            (c.get('tag') == 'textarea' or c.get('type') == 'text') and
+            re.search(r'^(?:comment|comment_content|comment_text|reply)$', (c.get('name') or '').strip().lower())
+            for c in controls
+        )
+        has_explicit_comment_heading = bool(
+            re.search(r'\b(?:leave\s+a\s+(?:comment|reply)|add\s+a\s+comment|post\s+a\s+comment)\b', form_text, re.I)
+        )
+
+        has_comment_intent = bool(
+            has_comment_action or
+            has_comment_submit_control or
+            (has_exact_comment_field and has_explicit_comment_heading)
+        )
+
         # 判定表单类型
         form_type = None
-        # Type 1: Directory / Tool Listing 表单 (必须有 resource identity field + 真实 submission intent)
-        if resource_fields_found and submit_buttons:
+        # Type 1: Directory / Tool Listing 表单 (必须有 resource identity field + 真实 submission intent，且绝不能是评论/回复表单)
+        if resource_fields_found and submit_buttons and not has_comment_intent:
             form_type = 'directory_listing'
         # Type 2: Guest Post / 投稿表单 (具备投稿上下文 + 文章字段 + 投稿提交控件)
         elif (has_gp_context or GUEST_POST_CONTEXT_RE.search(form_text)) and gp_fields_found and (submit_buttons or gp_submit_buttons):
