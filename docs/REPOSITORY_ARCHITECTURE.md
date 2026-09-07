@@ -2,171 +2,236 @@
 
 ## Status
 
-**Current architecture as of 2026-09-06.**
+**Current architecture as of 2026-09-07.**
 
-This document describes repository boundaries and component roles. Detailed operating rules live in the canonical Skills and take precedence over this document when wording conflicts.
+This document describes repository boundaries and the production data flow after the 2026-09-07 repair/acceptance closeout.
 
 ## 1. Source-of-truth hierarchy
 
-BacklinkOS deliberately separates current contracts from historical implementation records.
+Default production behavior, highest authority first:
 
-Current authority, highest first:
+1. `.agents/skills/discovering-backlinks/SKILL.md` plus its current `references/`
+2. this architecture document
+3. `docs/V4_PRODUCT_STRATEGY.md`
+4. `BacklinkOS-HANDOFF.md`
+5. root `README.md`
 
-1. `.agents/skills/discovering-backlinks/SKILL.md` plus its `references/`
-2. `.agents/skills/screening-backlinks/SKILL.md` plus its `references/` *(Legacy / Optional)*
-3. this architecture document
-4. `docs/V4_PRODUCT_STRATEGY.md`
+`.agents/skills/screening-backlinks/` is **Legacy / Optional**. It is authoritative only when that legacy screening path is explicitly requested; it is not a required stage of the default production pipeline.
 
-Historical documents under `docs/V1_PRODUCT_PLAN.md`, `docs/V2_PRODUCT_PLAN.md`, `docs/superpowers/`, and `docs/live-runs/` remain useful evidence of earlier decisions but do not define current behavior.
+Historical documents under `docs/V1_PRODUCT_PLAN.md`, `docs/V2_PRODUCT_PLAN.md`, `docs/superpowers/`, and `docs/live-runs/` preserve earlier decisions and must not override current behavior.
 
-## 2. Repository responsibilities
-
-The system uses dedicated repositories with explicit boundaries.
+## 2. Repository boundaries
 
 ### `pyxm1618/BacklinkOS`
 
 Owns:
 
-- backlink candidate discovery and provenance tracking
-- the canonical `discovering-backlinks` Skill
-- the legacy/optional `screening-backlinks` Skill
-- canonical domain normalization and Master Sheet (`外链总表`) Upsert contracts
-- minimal Submission Entry Enrichment (Live Evidence + Policy Guard)
-- project-level execution materialization (`外链管理`)
-- operational helper automation and regression tests
-- Feishu compatibility persistence code
-- product and architecture documentation
+- candidate discovery and provenance;
+- canonical domain normalization;
+- `外链总表` Master Upsert and fact-protection contracts;
+- Project Backlog Projection into `外链管理`;
+- persisted Project Compatibility Hard Gate;
+- Submission Entry Live Verification and Policy Guard;
+- bounded execution preparation;
+- Ready cursor / orphan accounting;
+- Ready manifest / allowlist handoff;
+- production projection helpers and regression tests;
+- documentation for the above contracts.
 
-Canonical Skill paths:
-
-```text
-.agents/skills/discovering-backlinks/
-.agents/skills/screening-backlinks/
-```
-
-Claude compatibility entries:
-
-```text
-.claude/skills/discovering-backlinks
-→ ../../.agents/skills/discovering-backlinks
-
-.claude/skills/screening-backlinks
-→ ../../.agents/skills/screening-backlinks
-```
-
-The symlinks are compatibility entries only. There is one editable Skill source for each capability.
+BacklinkOS does **not** perform Final Submit.
 
 ### `pyxm1618/backlink-autofill`
 
-Owns real browser execution, authentication, account/profile creation, form interaction, email verification, final submission, and factual write-back to Google Sheets (`实测免费`, `实测需登录`, `实测登录方式`, `实测限制`, `实测链接属性`, `最后验证时间`, `结果链接`).
+Owns real browser execution:
 
-BacklinkOS does not execute form submission and does not decide verified runtime attributes.
+- authentication / account flows;
+- form interaction;
+- Existing Submission Preflight;
+- anonymous fail-closed behavior;
+- CAPTCHA / Turnstile / 2FA / SMS human blockers;
+- Final Submit;
+- factual project-state classification;
+- result URL and live DOM link-attribute verification;
+- Manual Post-submit Recheck;
+- production fact write-back.
 
 ### `pyxm1618/backlink-metrics-api`
 
-Owns deterministic provider integrations and provider-specific runtime behavior, including metric normalization, error semantics, tests, and Vercel deployment.
+Owns provider-specific deterministic metric integrations. Metric-runtime implementation is not duplicated in BacklinkOS.
 
-## 3. Current product flow
+## 3. Current production flow
 
 ```text
-Recent SEO projects / discovery sources
+PHASE A — Discover / Master Upsert
+recent SEO projects / discovery sources
                 ↓
        discovering-backlinks
                 ↓
        canonicalize & deduplicate
                 ↓
-       【外链总表】(Master Sheet Upsert, Source of Truth)
+       【外链总表】 Master Sheet
                 ↓
-       最低限度 Submission Entry Enrichment (Live Evidence + Policy Guard)
+PHASE B — Project Backlog Projection
+       0 network / pure data projection
+       candidate → project `待提交`
+       UNKNOWN != REJECT
                 ↓
-       为明确项目生成【外链管理】待提交行 (Materialization)
+PHASE C — Bounded Execution Preparation
+       bounded scan of existing `待提交` rows
+       live Entry verification
+       VerifiedEntry → Ready manifest
+       unresolved → stays `待提交`
                 ↓
-       backlink-autofill (独立执行仓库，真实浏览器执行)
+PHASE D — backlink-autofill
+       real browser execution + recheck
                 ↓
-       回写真实平台事实与项目执行结果
+       platform facts + project result write-back
 ```
 
-### Discovery boundary
+### Phase A — Master boundary
 
-Discovery may collect and pass facts such as:
+`外链总表` is a reusable platform-level fact store.
 
-- source projects
-- project Organic Traffic status/value
-- referring domain
-- backlinks count
-- Semrush Authority Score
-- first/last seen
-- historical `is_follow`
-- batch/provenance fields
-- verified submission entry URL
+Discovery may write:
 
-Discovery strictly does NOT write verified execution facts:
-- `实测免费`
-- `实测需登录`
-- `实测登录方式`
-- `实测限制`
-- `实测链接属性`
-- `最后验证时间`
+- canonical domain / backlink ID;
+- discovery source/provenance;
+- discovery timestamps;
+- base status (`候选 / 已排除 / 失效`);
+- verified Submission Entry only after actual Entry Live Verification.
 
-Discovery does not convert historical Semrush observations into claims about the current free route. Unknown fields remain unknown.
+Discovery must not invent runtime facts such as free status, login requirement, restrictions, live link rel, or verification time. Unknown facts remain empty.
 
-### Screening boundary (Legacy / Optional)
+### Phase B — Project Backlog Projection
 
-The old `screening-backlinks` capability has stepped down from the primary production workflow. It remains available as an optional offline inspection utility or historical reference, but does not dictate whether domains enter `外链总表` and does not reject candidates from the master candidate pool.
+This is the critical separation from older architecture.
 
-## 4. Active helper systems are not canonical decision engines
+- Project Backlog population is a **pure database/in-memory projection**;
+- no network request is required;
+- a Master candidate does not need a Submission Entry or `VerifiedEntry` to exist in `外链管理`;
+- `UNKNOWN != REJECT`;
+- only Master hard negatives (`已排除 / 失效`) or persisted, proven project incompatibility may prevent projection;
+- `project_id + backlink_id` is unique;
+- any existing project state is preserved and never reset by projection.
 
-### Master Sheet sync helper
+`外链管理` therefore represents the project's opportunity backlog and full execution lifecycle, not merely the subset ready to execute now.
 
-`scripts/master_sheet_sync.py` implements pure business transformation rules:
-- domain canonicalization
-- master sheet upsert with fact protection
-- submission entry policy guard and live verification helper
-- project management row materialization
-- bounded batch hydration
+### Phase C — Execution Readiness
 
-### Bulk triage crawler
+Execution readiness is bounded and separate from backlog size.
 
-The repository contains:
+- select current-project `待提交` rows;
+- use a cursor so unresolved head rows do not starve later candidates;
+- report and skip orphan rows rather than blocking the scan;
+- live revalidate stored entries and discover blank entries as needed;
+- apply current project compatibility using verified/persisted facts;
+- only a real `VerifiedEntry` can enter the Ready manifest;
+- unresolved verification leaves the project row untouched (`待提交`, attempt unchanged);
+- `target_ready_count` / `scan_limit` limit the current preparation batch only, never the size of the Project Backlog.
 
-```text
-scripts/screening_crawler.py
-.github/workflows/screening-crawler.yml
-```
+### Phase D — Autofill handoff
 
-This is an active bulk triage system. Discovery reuses its battle-tested mechanism detection and anchor-text link discovery without inheriting old screening rejection thresholds.
+The execution contract is:
 
-### Operational data
+> **Ready allowlist ∩ Sheet `待提交` rows**
 
-`data/screening-candidates/` and `data/screening-results/` are operational inputs/snapshots used by the triage workflow. They are not the formal backlink library and do not override Skill decisions.
+`待提交 != Ready`.
 
-## 5. Feishu persistence compatibility boundary
+Standalone Autofill execution without a Ready allowlist must fail closed. Autofill does not pull blindly from the thousands of backlog rows.
 
-The TypeScript APIs under:
+## 4. Google Sheets control plane
 
-```text
-POST /api/feishu/setup
-POST /api/feishu/persist
-```
+Google Sheets `@外链管理总控表` is the current business control plane.
 
-and implementation under `lib/feishu/` were production-validated under an earlier screening record contract. They are retained unchanged so existing integrations are not broken.
+### `外链总表`
 
-## 6. Missing-data discipline
+Platform-level unique facts. Base status is exactly:
 
-Across current Skills and provider evidence:
+- `候选`
+- `已排除`
+- `失效`
+
+Upsert protects real execution facts and cannot revive hard-negative status.
+
+### `外链管理`
+
+Project opportunity backlog + execution lifecycle.
+
+Valid lifecycle states include:
+
+- `待提交`
+- `处理中`
+- `已提交`
+- `审核中`
+- `已排期`
+- `已上线`
+- `需人工`
+- `失败`
+- `不适用`
+
+The early small project sheet has already been migrated to the full backlog model. Old plans describing a future migration from a few dozen rows to thousands are completed/superseded and must not be re-executed.
+
+## 5. Active helper systems
+
+### `scripts/master_sheet_sync.py`
+
+Implements core data contracts and readiness logic, including canonicalization, Master protection, materialization, compatibility, entry verification, cursor, and bounded preparation.
+
+### `scripts/project_backlog_projection.py`
+
+Production Project Backlog projection runner:
+
+- dry-run / commit;
+- 0-network projection;
+- reconciliation invariant;
+- timestamped backup;
+- dynamic row-capacity expansion;
+- batch writes;
+- exact read-back;
+- final completeness audit.
+
+### `scripts/prepare_execution_batch.py`
+
+Operational wrapper for bounded Phase C preparation.
+
+### `scripts/screening_crawler.py`
+
+An active historical/auxiliary triage and page-analysis helper. Current Discovery may reuse its mechanism/entry-analysis infrastructure, but crawler buckets are not the default production admission or final execution decision engine.
+
+## 6. Legacy Screening boundary
+
+`screening-backlinks` remains available for explicit historical/offline screening questions such as free-vs-paid and current Follow-opportunity analysis.
+
+It is not allowed to become an implicit gate between Master discovery and Project Backlog population. Ordinary candidates are not excluded from the current control plane merely because legacy Screening has not closed all facts.
+
+## 7. Missing-data discipline
+
+Across the default production flow:
 
 - lookup failure is not zero;
 - provider no-coverage is not zero;
-- parser failure is not zero;
-- historical `is_follow` is not proof of a current free Follow route;
-- `first_seen` is not an exact acquisition date;
-- missing entry point is missing evidence, not candidate rejection;
-- evidence not directly obtained should remain unknown rather than being guessed.
+- missing Entry is not candidate rejection;
+- unknown free/login/Follow facts are not rejection;
+- historical `is_follow` is not proof of current free-route Follow;
+- a candidate is project-incompatible only when a relevant hard constraint is supported by strong evidence;
+- ambiguous evidence fails closed for execution readiness but remains in the backlog unless a formal terminal decision exists.
 
-## 7. Expected operating scale
+## 8. Acceptance baseline
 
-BacklinkOS is a personal-use system. Typical screening/discovery batches are expected to be in the hundreds to low thousands. The system prefers bounded batches, deduplication, reusable evidence, and human-verifiable closure over unnecessary distributed infrastructure.
+The 2026-09-07 closeout validated the repaired architecture with production Sheet reads and bounded live checks.
 
-## 8. Repository hygiene rule
+Key outcomes:
 
-Current code and Skills stay in their functional locations. Historical plans are preserved but clearly labeled as history. Do not delete or move an operational file merely because its terminology is old. First establish whether automation, tests, deployment, or persistence still depends on it.
+- Projection reconciliation and idempotent `would_create=0` behavior passed;
+- Ready cursor advancement passed;
+- orphan reporting/skip behavior passed;
+- Ready allowlist and standalone fail-closed passed;
+- Manual Post-submit Recheck preserved attempts/scheduled state/master facts;
+- AI-only live verification was corrected after the real `navtools.ai` case and now blocks non-AI projects from Ready;
+- final BacklinkOS regression: Python 115 passed, Node 41 passed, TypeScript 0 errors.
+
+This closeout did not require or perform ten arbitrary real Final Submits. Production use should naturally exercise Ready candidates over time instead of manufacturing a submission quota for acceptance.
+
+## 9. Repository hygiene
+
+Current documents must describe the above architecture. Historical plans/specs/live-runs remain preserved as point-in-time evidence and should be labeled/indexed as historical rather than rewritten to look current.
