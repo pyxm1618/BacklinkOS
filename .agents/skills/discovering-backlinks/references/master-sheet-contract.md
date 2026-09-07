@@ -1,167 +1,366 @@
 # Master Sheet and Project Management Contract
 
-本文档定义 BacklinkOS 新控制面（`@外链管理总控表`）与 Discovery 之间的契约规范。
+本文档定义当前 BacklinkOS 控制面 `@外链管理总控表`、Project Backlog、Ready Preparation 与 `backlink-autofill` 的正式契约。
 
-## 1. 唯一控制面与分工原则
+## 1. 核心原则
 
 ```text
-Discovery:
-- 发现候选 referring domains
-- canonicalize / 去重
-- 外链总表 Upsert（平台 Source of Truth）
-- 最低限度 Submission Entry Enrichment
-- 为明确项目创建外链管理待提交行（Materialization）
-
-Autofill:
-- 真实浏览器执行
-- 登录、注册、邮箱核验、填写表单、Final Submit
-- 回写实际状态、结果链接、实测免费、实测需登录、实测登录方式、实测限制、实测链接属性
+PHASE A — Master Upsert
+Discovery 发现候选 + provenance
+        ↓
+【外链总表】
+        ↓
+PHASE B — Project Backlog Projection
+纯数据库投影，UNKNOWN != REJECT
+不要求 Submission Entry / VerifiedEntry
+        ↓
+【外链管理】待提交 Backlog
+        ↓
+PHASE C — Bounded Execution Preparation
+Live Verification
+只有 VerifiedEntry 才进入 Ready Allowlist
+        ↓
+PHASE D — backlink-autofill
+真实浏览器执行与事实回写
 ```
 
-**核心纪律：**
-Discovery 负责发现和最低限度执行入口准备；`backlink-autofill` 负责真正判断与执行。不要在中间重新创造一个新的 Screening 层。
+最重要的契约：
+
+> **Project Backlog Population != Execution Readiness。**
+>
+> `VerifiedEntry` 不是项目行存在的前提，只是 Ready for Autofill 的前提。
+
+不要在 Phase A/B 与 Phase C 之间重新创造默认 `screening-backlinks` gate。
 
 ---
 
-## 2. 表结构契约
+## 2. Tab 1 — `外链总表`
 
-### Tab 1: `外链总表`（平台级唯一事实库）
+固定平台级事实字段：
 
-固定 14 列：
+| 列名 | 角色 | 当前契约 |
+|---|---|---|
+| 外链ID | Discovery/系统 | canonical domain，稳定 join key |
+| 平台域名 | Discovery/系统 | canonical domain |
+| 提交入口 | Execution Preparation | 只有真实 Live Verification 后才允许写；未知为空 |
+| 发现来源 | Discovery | 真实 provenance |
+| 发现时间 | Discovery | 真实发现时间 |
+| 基础状态 | Discovery/审计 | 仅 `候选 / 已排除 / 失效` |
+| 基础排除原因 | 审计/历史迁移 | 仅硬负例有值 |
+| 实测免费 | Autofill | Discovery 严禁填写 |
+| 实测需登录 | Autofill | Discovery 严禁填写 |
+| 实测登录方式 | Autofill | Discovery 严禁填写 |
+| 实测限制 | Autofill | Discovery 严禁填写 |
+| 实测链接属性 | Autofill | Discovery 严禁填写 |
+| 最后验证时间 | Autofill/Recheck | Discovery 严禁填写 |
+| 平台备注 | 通用 | 真实备注，不得伪造事实 |
 
-| 列名 | 字段类型 | 填写角色 | 说明与取值约束 |
-|---|---|---|---|
-| 外链ID | 文本 | Discovery / 系统 | canonical domain，稳定 join key（如 `example.com`） |
-| 平台域名 | 文本 | Discovery / 系统 | canonical domain，便于人类阅读 |
-| 提交入口 | URL | Discovery | 真实验证的提交入口 URL，未验证时保持为空 |
-| 发现来源 | 文本 | Discovery | 本次真实发现来源（如 `semrush_competitor:xxx`, `toolify` 等） |
-| 发现时间 | 日期/时间 | Discovery | 本次首次发现时间（ISO 8601 或 YYYY-MM-DD） |
-| 基础状态 | 单选枚举 | Discovery / 审计 | 仅限：`候选`、`已排除`、`失效` |
-| 基础排除原因 | 文本/枚举 | 审计 / 历史迁移 | 如 `明确付费-only`、`无可执行入口`、`垃圾/PBN/负面SEO`、`自动报告页/非人工可获取`、`恶意/风险`、`已失效`；候选时为空 |
-| **实测免费** | 文本 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| **实测需登录** | 文本 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| **实测登录方式** | 文本 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| **实测限制** | 文本 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| **实测链接属性** | 文本 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| **最后验证时间** | 日期/时间 | **Autofill** | **Discovery 严禁填写！必须保持为空！** |
-| 平台备注 | 文本 | 通用 | 备注说明 |
+### Master Upsert
 
-### Tab 2: `外链管理`（项目级执行队列/历史）
+每个 referring domain 必须 canonicalize：
+
+- 去 http/https；
+- 去 `www.`；
+- 小写；
+- 去 path/query/fragment；
+- `外链ID = 平台域名 = canonical domain`。
+
+新域名：
+
+- 新增 `基础状态=候选`；
+- 提交入口为空；
+- 实测事实为空；
+- 写真实 provenance。
+
+已有域名：
+
+- 不重复创建；
+- 不覆盖已有真实实测字段；
+- 不把 `已排除` / `失效` 改回 `候选`；
+- 普通 Discovery Upsert 不更新 `提交入口`。
+
+### 硬黑名单
+
+不维护第二套业务黑名单。Master `基础状态=已排除/失效` 即当前硬负例来源。
+
+---
+
+## 3. Tab 2 — `外链管理`
+
+`外链管理` 是**项目机会全集 + 执行生命周期**，不是 Ready-only 表。
 
 固定 10 列：
 
-| 列名 | 字段类型 | UI 属性 | 填写角色 | 说明 |
-|---|---|---|---|---|
-| 项目ID | 文本 | 显示 | Discovery / 项目上下文 | 如 `quick-iching` |
-| 外链ID | 文本 | 可隐藏 | Discovery | canonical domain，精确 join `外链总表.外链ID` |
-| 外链域名 | 文本 | 显示 | Discovery | canonical domain |
-| 状态 | 单选枚举 | 显示 | Discovery / Autofill | `待提交`、`处理中`、`已提交`、`审核中`、`已排期`、`已上线`、`需人工`、`失败`、`不适用` |
-| 尝试次数 | 数字 | 可隐藏 | 系统 / Autofill | 初始为 0 |
-| 最近操作时间 | 时间 | 显示 | Autofill | 初始为空 |
-| 目标URL | URL | 可隐藏 | 项目配置 / 指定 | 初始为空（由项目 profile 使用默认 canonical URL），或显式指定深链 |
-| 结果链接 | URL | 显示 | Autofill | 最终建链成功的公开链接，初始为空 |
-| 原因/备注 | 文本 | 显示 | Autofill / 人工 | 初始为空 |
-| 证据摘要 | 文本 | 显示 | Autofill | 真实执行产生的证据摘要，初始为空 |
+| 列名 | 初始/业务规则 |
+|---|---|
+| 项目ID | 当前明确 project_id |
+| 外链ID | canonical domain |
+| 外链域名 | canonical domain |
+| 状态 | 新 Backlog 为 `待提交` |
+| 尝试次数 | 新 Backlog 为 `0` |
+| 最近操作时间 | 初始为空 |
+| 目标URL | 项目 canonical URL 或显式深链 |
+| 结果链接 | 初始为空；只有真实结果才写 |
+| 原因/备注 | 初始为空；真实执行/人工事实 |
+| 证据摘要 | 初始为空；真实执行证据 |
+
+有效生命周期包括：
+
+- `待提交`
+- `处理中`
+- `已提交`
+- `审核中`
+- `已排期`
+- `已上线`
+- `需人工`
+- `失败`
+- `不适用`
+
+### 唯一性与历史保护
+
+`project_id + backlink_id` 唯一。
+
+如果当前项目已经有任何状态的该外链行：
+
+- 不 duplicate；
+- 不重置为待提交；
+- 不重置 attempt；
+- 不覆盖历史结果/备注/证据。
 
 ---
 
-## 3. 总表 Upsert 与数据保护契约
+## 4. PHASE B — Project Backlog Projection
 
-每发现一个 referring domain，必须先进行规范化：
-- 剥离 http/https、www、小写、剥离 trailing slash 及 path/query；
-- 外链ID = canonical domain，平台域名 = canonical domain。
+正式函数语义：`materialize_project_backlog_rows(...)`。
 
-### 如果域名不存在
-- 新增行：`外链ID=canonical domain`、`平台域名=canonical domain`、`基础状态=候选`、`发现来源=本次真实来源`、`发现时间=本次时间`。
-- **提交入口严格保持为空**：`upsert_master_rows` 彻底禁止写入提交入口（无论普通字符串还是 VerifiedEntry），纯粹负责 domain 和 provenance upsert。提交入口只能由真实 Entry Enrichment orchestration 核验成功后写入。
-- 其余未知字段及 5 个实测事实字段严格留空。
+### 输入
 
-### 如果域名已存在
-- **绝不重复创建新行**；
-- **绝不覆盖已有真实执行字段**（`实测免费`、`实测需登录`、`实测登录方式`、`实测限制`、`实测链接属性`、`最后验证时间`）；
-- **绝不得把`已排除`或`失效`重新改成`候选`**；
-- 仅允许补充安全的 provenance 信息（如原有发现来源为空时补充），绝不更新 `提交入口`。
+- `master_rows`
+- `existing_project_rows`
+- `project_id`
+- `target_url`
+- `project_context`
 
-### 硬黑名单机制
-如果查询发现总表中域名的 `基础状态 == 已排除` 或 `基础状态 == 失效`：
-- 视为“历史已知硬负例”；
-- 不重复研究，不重新进入项目执行队列，不覆盖排除原因；
-- 不再维护第二套独立黑名单数据库。
+### 核心行为
 
----
+1. **禁止网络请求。**
+2. 只对 Master `基础状态=候选` 做项目投影。
+3. **禁止要求 `提交入口` 非空。**
+4. **禁止要求 `VerifiedEntry`。**
+5. UNKNOWN 默认 INCLUDE：
+   - Entry 未知；
+   - 免费未知；
+   - 登录未知；
+   - Follow 未知；
+   - 当前可执行性未知。
+6. 只有明确 hard incompatibility 才跳过该项目。
+7. 已存在项目行完整保护。
+8. 新项目行为 `待提交 / 尝试次数=0`，结果与证据字段为空。
 
-## 4. 最低限度 Submission Entry Enrichment
+### Project Compatibility Hard Gate
 
-针对 `基础状态 == '候选'` 且准备进入项目执行队列的平台，进行真实入口查找与现场核验（Live Verification）：
+Hard Gate 必须基于已持久化、明确、与项目相关的强事实。
 
-### 核心架构原则
-1. **Live Evidence（真实页面证据）**：
-   - 实际请求目标页面（HTTP 200，同源）；
-   - **正文机制文案仅作为 Hint，绝不得单独升级为 Entry：** 普通 SEO 文章、搜索结果页（`?q=`）、软文即便出现 "submit product"、"guest post" 等文字，若无真实提交表单或合规认证墙，坚决不判 Verified Entry；
-   - **Actionable Form 最低证据要求：**
-     - Directory / Tool Listing：必须包含至少一个资源身份字段（如 `url / website / site / tool / product / app / startup / business / listing`），再加 submit 按钮；**普通 Contact 表单（如姓名 + 邮箱 + Message + Submit）严格排除**；
-     - Guest Post：必须在“投稿/写文章”上下文（URL 路径或标题/正文含有 `write for us / guest post / submit article / contribute`）下，且表单包含投稿相关字段（如 `article / pitch / content / draft` 或 `url / website`）；
-   - **CTA Link 追踪（来源页绝不能当 Entry）：** 页面出现 `Submit a Tool` 等 CTA 按钮时只能作为 Candidate 链接，来源页本身不是 Entry；必须跟随打开目标页，只有目标页本身具备 Actionable Form 时，才以目标页为 Entry；
-   - **跨域 Form Action 拦截：** 表单 action 若指向外部第三方域名，直接判定为跨域非法表单并排除，防止把中间跳转 landing page 当 Entry；
-   - **Entry 表单与首页不因 noindex 筛掉：** Entry discovery 不以 indexability 淘汰。表单页或首页带 noindex 绝不阻断后续真实机制入口的发现；
-   - **支持真实 Auth Wall 回调证据：** 访问真实 candidate `/submit` 时同域跳转到登录页（`AUTH_PATH_RE`），且 redirect/callback 参数明确返回该提交流程时，认定为有效入口。
-     - **来源证明严格要求：** 页面缺少机制文案时，必须要求具备真实页面 CTA/link 发现依据（`ENTRY_HINTS` 只能用于探测，绝不得作为来源证据）；
-     - **历史 Master Entry 不默认放行：** 默认未经来源证明，不能因为跳转 `/login?redirect=/submit` 自动升级；
-     - **保留原始稳定 Submission URL：** `VerifiedEntry.url` 记录原始稳定的 entry URL，而不是带有会话参数的 `/login?...` 临时 URL，证据摘要不记录完整 query/token；
-     - **Callback 同源校验：** callback 若为绝对 URL，必须验证 hostname 与平台同源；外部跨域 callback 坚决拒绝；
-   - 首页必须确认页面本身具有明确的机制 CTA 文案（如 "Submit your tool", "Create profile to list"），不能无证据拿首页填空。
-2. **Policy Guard（政策守卫拦截与 Redirect 验证）**：
-   - 必须是 http/https 且同源；
-   - 严格拦截非入口路径：`pricing`、`plans`、`terms`、`privacy`、`category`、`tags`、`seo-report`、`stats` 等；
-   - **私有控制台保护：** 拦截 `/dashboard`、`/app/overview`、`/console` 等路径，除非 query 携带明确提交意图；
-   - **Redirect 后的 Final URL 重新校验：** 现场核验发生重定向时，跳转后的 `final_url` 必须重新通过 Policy Guard（拦截跳转到 pricing、私有控制台或跨域逃逸），未通过则核验失败。
-3. **写入决策**：
-   - 只有同时具备现场真实证据且通过 Policy Guard 的 URL，才允许记录 `提交入口` 并产生内部 `VerifiedEntry`；
-   - **普通新 discovery 阶段：** 提交入口默认保持为空；
-   - **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
-   - 严禁在这个阶段提前做免费/Follow/DR/资格等实测事实判定。
+例如：平台被明确证实为 AI-only，且 `project_context.ai_powered == False`，则不为该项目投影。
+
+规则：
+
+- strong fact → 可判 incompatible；
+- weak/ambiguous/missing fact → UNKNOWN → INCLUDE；
+- 项目不兼容不会自动把 Master 平台标为全局已排除。
+
+### Projection reconciliation
+
+候选总数必须被完整解释：
+
+```text
+candidate_count
+=
+duplicate_preserved_count
++ proven_project_incompatible_count
++ would_create_count
+```
+
+`would_create_count=0` 是合法幂等结果，不能因为“新增少于某个数量”失败。
 
 ---
 
-## 5. 项目 Backlog Projection 与 Execution Readiness 契约
+## 5. PHASE C — Submission Entry Live Verification
 
-Discovery 必须运行在**明确项目上下文**（例如 `project_id = quick-iching`）中：
+Submission Entry Enrichment 属于 **Execution Preparation**，不是 Backlog Population 的前置 gate。
 
-### A. 全量 Project Backlog Projection（纯数据库投影）
-- **核心原则：UNKNOWN != REJECT。**
-- 凡是 `外链总表.基础状态 == '候选'` 且无已持久化项目硬不兼容事实的平台，一律默认生成项目待提交行。
-- 严禁在该阶段要求 Master 提交入口非空，禁止做网络请求。
-- **通用 Project Compatibility Hard Gate：**
-  针对平台的已持久化强事实约束（如已确认 `AI-only` 且 `project_context.ai_powered == False`），纯数据库/内存逻辑拦截不为该项目生成行，Master 本身保持候选；若缺乏明确强事实，一律作为 UNKNOWN 默认生成待提交行。
-- **创建内容：**
-  `项目ID = project_id`, `外链ID = canonical domain`, `外链域名 = canonical domain`, `状态 = 待提交`, `尝试次数 = 0`, `目标URL = 指定或默认`, 结果列与证据列留空。
-- **保护历史唯一性：**
-  `project_id + backlink_id` 唯一。若已存在任何状态（待提交、处理中、已提交、审核中、已排期、已上线、需人工、失败、不适用），绝不重复创建，绝不重置状态和尝试次数。Quick I Ching 已有历史记录必须优先保护。
+### VerifiedEntry 最低原则
 
-### B. Bounded Execution Preparation（小批量执行就绪准备）
-- 从已有 `待提交` 记录中筛选小批量（如 `target_ready_count=10`，`scan_limit=50`）进行现场核验；
-- 只有经内部现场 Live Verification 核验通过产生真实证据（VerifiedEntry），才标记为 Ready for Autofill、写回 Master 提交入口，并生成 Ready Allowlist Manifest；
-- 未能验证或 unresolved 的项目行，继续保持在 Backlog 中（状态保持 `待提交`，尝试次数保持 0，不标失败）；
-- **Handoff 契约**：下游 `backlink-autofill` 只能消费该 Ready Allowlist 与待提交的交集，绝不能直接盲目拉取 Sheet 待提交行，防止将未准备就绪的合法 Backlog 误报失败。
+只有真实页面证据足够时才创建内部 `VerifiedEntry`。
+
+可接受证据包括：
+
+- Actionable Form；
+- 有真实 provenance/callback 的同域认证墙；
+- 可跟随并最终落到真实 Actionable Form 的明确 CTA。
+
+不可接受：
+
+- URL path 仅仅叫 `/submit`；
+- 普通正文提到 submit/add；
+- 搜索结果页；
+- pricing/terms/privacy/category/report；
+- generic Contact form；
+- 私有 dashboard 无提交上下文；
+- 跨域 form action 被误当平台自身 Entry。
+
+### Actionable Form
+
+Directory / Tool Listing：
+
+- 至少一个资源身份字段（URL/website/tool/product/app/startup/business/listing 等）；
+- 有真实 submit action/button；
+- 普通 name/email/message Contact form 不够。
+
+Guest Post：
+
+- 页面/路径存在 write-for-us / guest-post / submit-article / contribute 等投稿上下文；
+- 表单有投稿相关字段。
+
+### Auth Wall
+
+历史 Master Entry 不因为 `/login?redirect=/submit` 自动放行。
+
+必须建立真实来源关系，并验证：
+
+- 原 Entry 合法；
+- same-origin auth wall；
+- callback/redirect 指向合法提交流程；
+- callback 不跨域；
+- 保存稳定原始 Submission URL，不保存敏感 session query。
+
+### AI-only 等兼容性 Live Evidence
+
+Live Verification 可以产生项目兼容性强事实。
+
+AI-only 不能只靠页面偶尔出现 “AI”。应使用强组合证据（例如明确 AI submission object + AI eligibility/acceptance）并保留 inclusive guard（例如 `AI or SaaS` 不应误判为 AI-only）。
 
 ---
 
-## 6. 存量池严格双边界 Bounded Batch Hydration
+## 6. PHASE C — Bounded Execution Preparation
 
-支持对总表存量候选池进行按批次执行就绪准备（Execution Preparation）：
-- 必须显式传入 `project_id`、`target_count`（期望成功的项目行数量，默认 10）与 `scan_limit`（本次最多检查候选数，默认 30，且 `scan_limit >= target_count`）；
-- **已有入口现场核验：** 对总表已存在非空 `提交入口` 的候选，现场核验其有效性；通过则生成 VerifiedEntry 并进入 Ready 队列；未通过则保持候选，不进入 Ready 队列，不随意替换原 URL；
-- **空入口现场探测：** 现场探测真实入口，成功则更新总表入口并生成 VerifiedEntry；
-- **双边界严格停止：** 满足 `succeeded >= target_count` 或 `processed >= scan_limit` 任意一个立即停止退出；
-- **明确边界：** 此参数仅控制单次 Ready 批次规模，绝不限制 Project Backlog 总规模。
+正式语义：`prepare_execution_batch(...)`。
 
+### 输入池
+
+只从**已经存在于 `外链管理`、当前项目、状态=`待提交`**的行中准备 Ready。
+
+### 双边界
+
+典型参数：
+
+- `target_ready_count=10`
+- `scan_limit=50`
+
+`scan_limit >= target_ready_count`。
+
+停止条件是 Ready 目标达到或扫描上限达到。
+
+这两个参数只限制**当前 Ready preparation 批次**，绝不能限制 Project Backlog 总规模。
+
+### Cursor
+
+Ready scan 使用本地 cursor，从上一批最后扫描位置继续，防止 unresolved 头部候选长期饿死后续行。
+
+### Orphan
+
+Project 行找不到对应 Master 行时：
+
+- 明确计入/report orphan；
+- 不生成 Ready；
+- 不让 orphan 阻断 cursor 和后续扫描。
+
+### unresolved
+
+Entry 核验失败或仍未知：
+
+- 项目行保持 `待提交`；
+- attempt 保持原值（正常初始为 0）；
+- 不标失败；
+- 不删除；
+- 继续扫描后续候选。
+
+### Ready 输出
+
+只有 Live Verification 成功的 `VerifiedEntry` 可以进入 Ready manifest / allowlist。
 
 ---
 
-## 7. Sheet 读写纪律
+## 7. PHASE C → PHASE D Handoff
 
-所有真实 Google Sheet 读写：
-- 通过官方已授权 capability 执行；
-- 精确定位 target row；
-- 写入后立即进行 exact-row read-back 验证；
-- 确保幂等，杜绝 race condition 与重复行。
+`backlink-autofill` 只能消费：
+
+```text
+Ready Allowlist
+∩
+当前 project_id
+∩
+Sheet 状态=待提交
+```
+
+**待提交 != Ready。**
+
+没有 Ready allowlist 的 standalone 模式必须 fail closed，不能直接从数千条 Backlog 盲取。
+
+---
+
+## 8. PHASE D — Autofill Fact Ownership
+
+`backlink-autofill` 负责真实浏览器事实：
+
+- 是否免费；
+- 是否需登录；
+- 登录方式；
+- 平台限制；
+- Existing Submission Preflight；
+- Final Submit；
+- CAPTCHA/Turnstile/2FA/SMS human blocker；
+- 项目最终状态；
+- 结果链接；
+- live DOM rel；
+- 最后验证时间；
+- Manual Post-submit Recheck。
+
+### Fact protection
+
+- 没观察到的 Master fact 不得在 Recheck 中清空；
+- 结果 URL 只有公开 listing + identity verified 才写；
+- live DOM rel 只有实际检查目标 `<a rel>` 才写；
+- Recheck 不增加 attempt、不重新 Final Submit；
+- 已排期在无明确取消事实时不得被弱 `Pending/Review` 降级。
+
+---
+
+## 9. Production Projection Helper
+
+`scripts/project_backlog_projection.py` 是当前正式生产投影 helper。
+
+必须支持：
+
+- dry-run / commit；
+- 0-network projection；
+- reconciliation；
+- commit 前 timestamp backup；
+- 按需 grid row 扩容；
+- batch append；
+- exact read-back；
+- final duplicate/completeness audit。
+
+旧计划里写死“扩到 5000 行”“每批 500”“新增必须超过某数”不是当前契约；正式 helper 按实际需求动态执行。
+
+---
+
+## 10. Historical/Legacy Screening
+
+`screening-backlinks` 已退出默认主链路。
+
+它可以在用户明确要求时进行历史/offline 的免费/Follow opportunity 分析，但：
+
+- 不能作为 Master 候选进入 Project Backlog 的默认 gate；
+- 不能因未完成 legacy Screening 就排除普通候选；
+- legacy 输出表/CSV 不覆盖当前 Google Sheets 控制面。
