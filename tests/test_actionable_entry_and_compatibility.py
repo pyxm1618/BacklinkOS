@@ -623,6 +623,111 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(analysis_d["actionable_forms"]), 1, "D: 合法 Guest Post 表单必须识别为 guest_post！")
         self.assertEqual(analysis_d["actionable_forms"][0]["form_type"], "guest_post")
 
+    def test_p0_a_search_checker_form_rejected_even_on_submit_path(self):
+        # 真实形状回归：page=/submit, input name=keyword placeholder="Search AI Tools", input/button name=btnsearch
+        # 1. 真实 search form 即使在 /submit 路径下，也绝不能被误判为 directory_listing
+        html_search_form = """
+        <html>
+        <head><title>Search AI Tools Directory</title></head>
+        <body>
+            <div class="search-section">
+                <form action="/search" method="GET">
+                    <input type="text" name="keyword" placeholder="Search AI Tools" />
+                    <input type="submit" name="btnsearch" value="Search" />
+                </form>
+            </div>
+            <div class="another-search">
+                <form action="/submit" method="GET">
+                    <input type="text" name="query" placeholder="Explore top tools" />
+                    <button type="submit" name="searchBtn">Find Tools</button>
+                </form>
+            </div>
+            <div class="third-search">
+                <form action="/submit" method="POST">
+                    <input type="search" name="s" placeholder="Search directory..." />
+                    <input type="submit" name="btn_search" value="" />
+                </form>
+            </div>
+        </body>
+        </html>
+        """
+        analysis = analyze_html(html_search_form, "https://example.com/submit")
+        self.assertEqual(len(analysis["actionable_forms"]), 0, "P0-A: 即使路径是 /submit，所有 search/checker form 的 actionable_forms 必须为空！")
+
+        def fake_fetch(url):
+            return analysis | {"status": 200, "final_url": "https://example.com/submit"}
+
+        entry_obj, reason = verify_submission_entry("example.com", "https://example.com/submit", fetcher=fake_fetch)
+        self.assertIsNone(entry_obj, "P0-A: 搜索表单不得作为 VerifiedEntry！")
+        self.assertIn("未检测到真实可操作提交表单", reason)
+
+        # 2. 同时保证真正的 website_url + description + Submit Website 依然 PASS
+        html_real_form = """
+        <html>
+        <head><title>Submit Your Product</title></head>
+        <body>
+            <form action="/submit" method="POST">
+                <input type="text" name="tool_name" placeholder="Tool Name" />
+                <input type="url" name="website_url" placeholder="https://..." />
+                <textarea name="description" placeholder="Describe your product"></textarea>
+                <button type="submit">Submit Website</button>
+            </form>
+        </body>
+        </html>
+        """
+        real_analysis = analyze_html(html_real_form, "https://example.com/submit")
+        self.assertEqual(len(real_analysis["actionable_forms"]), 1, "P0-A: 真实的 directory_listing 必须保持 PASS！")
+        self.assertEqual(real_analysis["actionable_forms"][0]["form_type"], "directory_listing")
+
+    def test_p0_b_ai_only_strong_patterns_and_visalytica_inclusive_guard(self):
+        from screening_crawler import extract_ai_only_signals
+        from master_sheet_sync import get_persisted_project_incompatibility
+
+        quick_iching_context = {"ai_powered": False}
+
+        # 1. 至少覆盖 5 类通用强排他模式：
+        strong_cases = [
+            "Our platform is solely dedicated to AI tools and services.",
+            "This curated directory exclusively features AI tools.",
+            "The submission system only accepts AI-powered tools.",
+            "Submissions that are non-AI or not utilizing AI will be rejected by our editors.",
+            "Every listed product or tool must use AI in its core workflow.",
+        ]
+        for idx, text in enumerate(strong_cases):
+            signals = extract_ai_only_signals(text)
+            self.assertTrue(len(signals) > 0, f"Case {idx+1} 必须命中 AI-only 强排他证据: {text}")
+
+            # 模拟在 master row 中持久化了该限制或直接分析 HTML
+            html = f"<html><body><p>{text}</p><form action='/submit'><input name='website_url'><button type='submit'>Submit Website</button></form></body></html>"
+            analysis = analyze_html(html, "https://example.com/submit")
+            self.assertTrue(len(analysis["ai_only_signals"]) > 0)
+
+            # 在 quick-iching (非 AI) 项目下必须判定为 incompatible
+            incompat, match_str, reason = get_persisted_project_incompatibility(
+                {"限制/要求": text, "类型": "AI Directory"},
+                quick_iching_context
+            )
+            self.assertTrue(incompat, f"非 AI 项目遇到强排他表述必须判定 incompatible: {text}")
+            self.assertTrue(bool(match_str), f"必须返回匹配到的强事实短语: {text}")
+            self.assertIn("不兼容", reason)
+
+        # 2. 严格防误杀：像 Visalytica 这种明确接受 “AI or SaaS tool” 的必须 PASS
+        inclusive_cases = [
+            "We accept any AI or SaaS tool in our directory.",
+            "Submit your SaaS or AI product for review.",
+            "Open to both AI and non-AI software solutions.",
+            "Directory for AI and software tools.",
+        ]
+        for idx, text in enumerate(inclusive_cases):
+            signals = extract_ai_only_signals(text)
+            self.assertEqual(len(signals), 0, f"Inclusive Case {idx+1} 绝不能被判定为 AI-only: {text}")
+
+            incompat, match_str, reason = get_persisted_project_incompatibility(
+                {"限制/要求": text, "类型": "AI & SaaS Directory"},
+                quick_iching_context
+            )
+            self.assertFalse(incompat, f"包含 AI or SaaS 的平台绝不能误杀非 AI 项目: {text}")
+
 
 if __name__ == "__main__":
     unittest.main()

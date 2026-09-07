@@ -51,9 +51,12 @@ COMMON_PATHS = ['/submit','/add','/submit-site','/submit-website','/submit-tool'
 # Actionable Form / CTA 强模式定义
 RESOURCE_FIELD_RE = re.compile(r'\b(url|website|site|tool|product|app|startup|business|listing|project)\b', re.I)
 
-# 明确拒绝的检测器/分析器意图 (Checker / Analyzer intent)
+# 明确拒绝的检测器/分析器/搜索器意图 (Checker / Analyzer / Search intent)
+# 覆盖复合词: btnsearch, searchBtn, btn_search, search_btn, search_button, searchsubmit 等
 CHECKER_INTENT_RE = re.compile(
-    r'\b(check|analyze|analyse|scan|lookup|search|audit|test|calculate|report|verify|ping|generate)\b',
+    r'\b(?:check|analyze|analyse|scan|lookup|search|audit|test|calculate|report|verify|ping|generate)\b'
+    r'|(?:^|[\W_])(?:btn[-_]?search|search[-_]?btn|search[-_]?button|search[-_]?submit|search[-_]?bar)(?:[\W_]|$)'
+    r'|(?:btnsearch|searchbtn|btn_search|search_btn|btn-search|searchbutton|searchsubmit)',
     re.I
 )
 
@@ -85,23 +88,83 @@ GP_SUBMIT_INTENT_RE = re.compile(
 
 GUEST_POST_CONTEXT_RE = re.compile(r'\b(write[-_\s]for[-_\s]us|contribute|guest[-_\s]?post|guest[-_\s]?article|submit[-_\s]article)\b', re.I)
 GUEST_POST_FIELD_RE = re.compile(r'\b(pitch|article|content|story|topic|outline|draft|post_content)\b', re.I)
-SEARCH_FIELD_RE = re.compile(r'^(?:q|s|query|search|keyword|k)$', re.I)
+
+# 搜索相关的输入字段命名 (q, s, query, search, keyword, keywords 等)
+SEARCH_FIELD_RE = re.compile(
+    r'^(?:q|s|query|search|keyword|keywords|k|search_query|search_term|search_keyword|searchterm|searchtext)$'
+    r'|(?:^|[\W_])(?:search|keyword|keywords|query)(?:[\W_]|$)'
+    r'|(?:^search_|_search$)',
+    re.I
+)
+
+# 搜索相关的占位符文案 (用于拦截 Search AI Tools 等把 placeholder 当 resource 的误判)
+SEARCH_PLACEHOLDER_RE = re.compile(
+    r'\b(?:search|find|lookup|explore|filter|query)\b',
+    re.I
+)
+
 SUBMISSION_CTA_ANCHOR_RE = re.compile(
     r'\b(submit|add|list|register|claim|post)\s+(?:your\s+)?(?:tool|product|website|site|startup|app|project|business|link)\b'
     r'|\b(submit|add)\s+(?:a\s+)?(?:tool|product|website|site|startup|app|link)\b'
     r'|\b(get\s+listed|write\s+for\s+us|become\s+an?\s+author|become\s+a\s+contributor)\b',
     re.I
 )
+
+# AI-Only 强排他证据模式 (不硬编码域名，覆盖排他表述)
 AI_ONLY_STRONG_PATTERNS = [
-    r'\bonly\s+ai\s+(?:tools?|products?|startups?|apps?|projects?|software|sites?)\b',
+    # 1. 明确排他 dedicated / exclusively
+    r'\bsolely\s+dedicated\s+to\s+(?:ai|artificial intelligence)\b',
+    r'\bexclusively\s+(?:features?|focuses?\s+on|dedicated\s+to|lists?|showcases?|curates?|for)\s+(?:ai|artificial intelligence)\b',
+    # 2. 仅接受 / strictly accepts
+    r'\b(?:we\s+)?(?:only|strictly)\s+accepts?\s+(?:ai|ai[- ]powered|artificial intelligence)\b',
+    r'\bonly\s+ai\s+(?:tools?|products?|startups?|apps?|projects?|software|sites?|submissions?)\b',
     r'\bai\s+(?:tools?|products?|startups?|apps?|sites?)\s+only\b',
-    r'\bnon[- ]ai\s+(?:tools?|products?)\s+(?:are\s+)?rejected\b',
-    r'\b(?:product|tool|site|app|startup)\s+must\s+(?:be|use|feature)\s+ai\b',
-    r'\b(?:we\s+)?only\s+accept\s+ai\b',
     r'\bexclusively\s+for\s+ai\b',
-    r'\bmust\s+be\s+an?\s+ai\b',
     r'\bai[- ]only\b',
+    # 3. 产品必须使用/基于 AI: product/tool must use AI
+    r'\b(?:products?|tools?|sites?|apps?|startups?|submissions?)\s+must\s+(?:be|use|feature|leverage|incorporate|utilize)\s+(?:an?\s+)?ai\b',
+    r'\bmust\s+be\s+an?\s+ai\b',
+    # 4. 非 AI 明确拒绝: non-AI / not utilizing AI causes rejection / rejected
+    r'\b(?:non[- ]ai|not\s+(?:utilizing|using|leveraging)\s+ai|without\s+ai)\b.*?\b(?:causes?\s+(?:rejection|denial)|(?:are|will\s+be)\s+rejected|not\s+accepted)\b',
+    r'\bnon[- ]ai\s+(?:tools?|products?)\s+(?:are\s+)?rejected\b',
 ]
+
+# 允许非 AI / SaaS / 通用工具的包容性模式（防误杀 Visalytica 等声明 "AI or SaaS tool" 的平台）
+AI_INCLUSIVE_PATTERNS = [
+    re.compile(r'\b(?:ai\s+or\s+(?:saas|software|web|tech|digital|developer|other|tools?|products?|apps?))\b', re.I),
+    re.compile(r'\b(?:saas|software|web|tech|digital|developer|other)\s+or\s+ai\b', re.I),
+    re.compile(r'\b(?:ai\s*(?:,|/|and)\s*(?:saas|software|digital|tech))\b', re.I),
+    re.compile(r'\b(?:ai\s+and\s+non[- ]ai)\b', re.I),
+]
+
+
+def extract_ai_only_signals(text: str) -> list[str]:
+    """提取通用 AI-only 强排他证据。
+    
+    规则：
+    1. 覆盖通用排他表述（solely dedicated, exclusively features, only accepts, non-AI causes rejection, must use AI）；
+    2. 严格防误杀：若存在“AI or SaaS tool”等明确包容性声明，绝不判定为 AI-only。
+    """
+    if not text:
+        return []
+
+    # 全文若包含通用接受声明（如明确包含 "AI or SaaS"），直接放行，避免误杀 Visalytica
+    if any(p.search(text) for p in AI_INCLUSIVE_PATTERNS):
+        return []
+
+    hits = []
+    for pat in AI_ONLY_STRONG_PATTERNS:
+        for m in re.finditer(pat, text, re.I):
+            matched_str = m.group(0)
+            # 检查上下文窗口内是否有包容性表述
+            start = max(0, m.start() - 60)
+            end = min(len(text), m.end() + 60)
+            window = text[start:end]
+            if any(p.search(window) for p in AI_INCLUSIVE_PATTERNS):
+                continue
+            hits.append(matched_str)
+
+    return list(dict.fromkeys(hits))
 
 
 class Parser(HTMLParser):
@@ -281,7 +344,7 @@ def analyze_html(raw_html, base_url):
     )
 
     # 2. 判定 AI-Only 强限制
-    ai_only_signals = _hits(full, AI_ONLY_STRONG_PATTERNS)
+    ai_only_signals = extract_ai_only_signals(full)
 
     # 3. 结构化分析可操作表单（Actionable Forms）
     actionable_forms = []
@@ -340,61 +403,80 @@ def analyze_html(raw_html, base_url):
         gp_submit_buttons = []
         for c in controls:
             tag = c.get('tag')
-            ctype = c.get('type', '')
-            cname = (c.get('name') or '').lower()
-            cid = (c.get('id') or '').lower()
-            cplaceholder = (c.get('placeholder') or '').lower()
-            cvalue = (c.get('value') or '').lower()
-            ctext = (c.get('text') or '').lower()
+            ctype = (c.get('type') or '').lower().strip()
+            cname = (c.get('name') or '').lower().strip()
+            cid = (c.get('id') or '').lower().strip()
+            cplaceholder = (c.get('placeholder') or '').lower().strip()
+            cvalue = (c.get('value') or '').lower().strip()
+            ctext = (c.get('text') or '').lower().strip()
             field_desc = re.sub(r'[\W_]+', ' ', f"{cname} {cid} {cplaceholder} {ctype}").strip()
             btn_desc = re.sub(r'[\W_]+', ' ', f"{ctext} {cvalue} {cname} {cid}").strip()
+
+            # P0-A 核心防守 1：判断是否为 search/checker 控件
+            is_search_field = (
+                ctype == 'search' or
+                bool(SEARCH_FIELD_RE.search(cname)) or
+                bool(SEARCH_FIELD_RE.search(cid)) or
+                bool(SEARCH_PLACEHOLDER_RE.search(cplaceholder))
+            )
+
+            is_checker_or_search_btn = bool(
+                CHECKER_INTENT_RE.search(btn_desc) or
+                CHECKER_INTENT_RE.search(cname) or
+                CHECKER_INTENT_RE.search(cid) or
+                is_search_field
+            )
 
             # 检查提交按钮及意图 (严格区分显式文案与 plain submit)
             is_potential_btn = (ctype == 'submit' or tag == 'button' or ctype in ('button', 'image'))
             if is_potential_btn:
-                has_explicit_text = bool(ctext.strip() or cvalue.strip())
-                if has_explicit_text:
-                    # 规则 1: 显式按钮文案，明确拒绝 checker intent 与 comment/reply intent
-                    if not CHECKER_INTENT_RE.search(btn_desc) and not COMMENT_SUBMIT_CONTROL_RE.search(btn_desc):
+                # P0-A 核心防守 2：btnsearch/searchBtn 等 checker control 必须直接拒绝，绝不能被 local_submit_intent 救活
+                if not is_checker_or_search_btn and not COMMENT_SUBMIT_CONTROL_RE.search(btn_desc):
+                    has_explicit_text = bool(ctext.strip() or cvalue.strip())
+                    if has_explicit_text:
                         if DIRECTORY_SUBMIT_INTENT_RE.search(btn_desc):
                             btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
                             submit_buttons.append(btn_name[:50])
                         elif GP_SUBMIT_INTENT_RE.search(btn_desc):
                             btn_name = ctext.strip() or cvalue.strip() or cname or 'Submit'
                             gp_submit_buttons.append(btn_name[:50])
-                else:
-                    # 规则 2: 无 text/value 的 plain <input type=submit> 或纯提交按钮
-                    # 绝不能单独构成 submission intent，必须依赖且仅依赖不含 checker 的 LOCAL context
-                    if ctype == 'submit' or tag == 'button':
-                        if local_submit_intent and not COMMENT_PATH_RE.search(action_path):
-                            btn_name = cname or 'Submit'
-                            submit_buttons.append(btn_name[:50])
-                        elif local_gp_intent and not COMMENT_PATH_RE.search(action_path):
-                            btn_name = cname or 'Submit'
-                            gp_submit_buttons.append(btn_name[:50])
+                    else:
+                        # 规则 2: 无 text/value 的 plain <input type=submit> 或纯提交按钮
+                        if ctype == 'submit' or tag == 'button':
+                            if local_submit_intent and not COMMENT_PATH_RE.search(action_path):
+                                btn_name = cname or 'Submit'
+                                submit_buttons.append(btn_name[:50])
+                            elif local_gp_intent and not COMMENT_PATH_RE.search(action_path):
+                                btn_name = cname or 'Submit'
+                                gp_submit_buttons.append(btn_name[:50])
 
-            # 检查字段用途
-            if RESOURCE_FIELD_RE.search(field_desc):
-                resource_fields_found.append(cname or cid or cplaceholder or 'resource_field')
-                is_pure_search = False
-
-            if GUEST_POST_FIELD_RE.search(field_desc):
-                gp_fields_found.append(cname or cid or cplaceholder or 'gp_field')
-                is_pure_search = False
-
-            if 'email' in field_desc or ctype == 'email':
-                has_email = True
-                is_pure_search = False
-
-            if 'message' in field_desc or 'comment' in field_desc or tag == 'textarea':
-                has_message = True
-                is_pure_search = False
-
-            if not SEARCH_FIELD_RE.match(cname):
-                if ctype not in ('hidden', 'search'):
+            # P0-A 核心防守 3：SEARCH_FIELD_RE / search type 必须优先于 RESOURCE_FIELD_RE
+            if is_search_field:
+                # Search-like field 绝不能因为 placeholder 中有 "tool" 等就升级为 resource field！
+                pass
+            else:
+                if RESOURCE_FIELD_RE.search(field_desc):
+                    resource_fields_found.append(cname or cid or cplaceholder or 'resource_field')
                     is_pure_search = False
 
-        if is_pure_search:
+                if GUEST_POST_FIELD_RE.search(field_desc):
+                    gp_fields_found.append(cname or cid or cplaceholder or 'gp_field')
+                    is_pure_search = False
+
+                if 'email' in field_desc or ctype == 'email':
+                    has_email = True
+                    is_pure_search = False
+
+                if 'message' in field_desc or 'comment' in field_desc or tag == 'textarea':
+                    has_message = True
+                    is_pure_search = False
+
+                if not SEARCH_FIELD_RE.match(cname):
+                    if ctype not in ('hidden', 'search'):
+                        is_pure_search = False
+
+        # P0-A 核心防守 4：如果表单没有任何 resource/gp 字段，或者全是 search 控件，绝对不是 actionable form
+        if is_pure_search or not (resource_fields_found or gp_fields_found):
             continue
 
         # 检查是否为纯订阅 newsletter 表单 (仅 email + subscribe)

@@ -780,8 +780,21 @@ def resolve_project_context(project_id: str, context: dict[str, Any] | None = No
 
 # 持久化强限制排他正则：仅用于已持久化且明确的强事实，不能因模糊文案误判
 PERSISTED_AI_ONLY_STRONG_PATTERNS = [
-    re.compile(r"\b(?:ai[- ]only|only[- ]ai|ai[- ]tools?[- ]only|only\s+accepts?\s+ai|non[- ]ai\s+rejected|strictly\s+ai)\b", re.I),
+    re.compile(r"\b(?:ai[- ]only|only[- ]ai|ai[- ]tools?[- ]only|strictly\s+ai)\b", re.I),
+    re.compile(r"\bsolely\s+dedicated\s+to\s+(?:ai|artificial intelligence)\b", re.I),
+    re.compile(r"\bexclusively\s+(?:features?|focuses?\s+on|dedicated\s+to|lists?|showcases?|curates?|for)\s+(?:ai|artificial intelligence)\b", re.I),
+    re.compile(r"\b(?:we\s+)?(?:only|strictly)\s+accepts?\s+(?:ai|ai[- ]powered|artificial intelligence)\b", re.I),
+    re.compile(r"\b(?:products?|tools?|sites?|apps?|startups?|submissions?)\s+must\s+(?:be|use|feature|leverage|incorporate|utilize)\s+(?:an?\s+)?ai\b", re.I),
+    re.compile(r"\b(?:non[- ]ai|not\s+(?:utilizing|using|leveraging)\s+ai|without\s+ai)\b.*?\b(?:causes?\s+(?:rejection|denial)|(?:are|will\s+be)\s+rejected|not\s+accepted)\b", re.I),
     re.compile(r"(?:仅接受|仅限|只接受|只收录|仅支持)\s*(?:ai|人工智能)\s*(?:工具|产品|项目)?(?:\b|$)|(?:非\s*ai|非人工智能).*(?:不收|拒绝|不接受)", re.I),
+]
+
+# 允许非 AI / SaaS / 通用工具的包容性模式（防误杀 Visalytica 等声明 "AI or SaaS tool" 的平台）
+PERSISTED_AI_INCLUSIVE_PATTERNS = [
+    re.compile(r'\b(?:ai\s+or\s+(?:saas|software|web|tech|digital|developer|other|tools?|products?|apps?))\b', re.I),
+    re.compile(r'\b(?:saas|software|web|tech|digital|developer|other)\s+or\s+ai\b', re.I),
+    re.compile(r'\b(?:ai\s*(?:,|/|and)\s*(?:saas|software|digital|tech))\b', re.I),
+    re.compile(r'\b(?:ai\s+and\s+non[- ]ai)\b', re.I),
 ]
 
 
@@ -802,14 +815,17 @@ def get_persisted_project_incompatibility(
     """
     p_ctx = resolve_project_context("", project_context)
     if p_ctx.get("ai_powered") is False:
-        # 检查持久化文本：实测限制、平台备注、基础排除原因
-        restriction = str(master_row.get("实测限制") or "").strip()
+        # 检查持久化文本：实测限制、限制/要求、平台备注、基础排除原因
+        restriction = str(master_row.get("实测限制") or master_row.get("限制/要求") or "").strip()
         notes = str(master_row.get("平台备注") or "").strip()
         reason_text = str(master_row.get("基础排除原因") or "").strip()
         persisted_candidates = [restriction, notes, reason_text]
         
         for candidate_text in persisted_candidates:
             if not candidate_text:
+                continue
+            # 若包含包容性模式（如 "AI or SaaS"），直接跳过防误杀
+            if any(p.search(candidate_text) for p in PERSISTED_AI_INCLUSIVE_PATTERNS):
                 continue
             for pat in PERSISTED_AI_ONLY_STRONG_PATTERNS:
                 m = pat.search(candidate_text)
