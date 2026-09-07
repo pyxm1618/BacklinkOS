@@ -782,6 +782,26 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
         analysis_inc = analyze_html(inclusive_html, "https://example.com/submit")
         self.assertEqual(len(analysis_inc["ai_only_signals"]), 0, "包含 AI or SaaS 等包容性声明绝不得标 ai_only")
 
+        # 2b. Regression case: 页面包含 "Any tools violating our submission policy will be rejected."
+        # 绝不能被裸 "any tools" 误作为包容性声明而清空 ai_only 强证据
+        regression_policy_html = """
+        <html>
+        <head><title>Submit Your AI Tool - AI Directory</title></head>
+        <body>
+          <h1>Submit Your AI Tool</h1>
+          <p>We accept all types of AI-powered tools and services.</p>
+          <p class="policy">Any tools violating our submission policy will be rejected.</p>
+          <form action="/submit" method="POST">
+            <input name="toolName" placeholder="Your AI Tool Name">
+            <input name="websiteUrl" placeholder="https://example.com">
+            <button type="submit">Submit AI Tool</button>
+          </form>
+        </body>
+        </html>
+        """
+        analysis_regr = analyze_html(regression_policy_html, "https://example.com/submit")
+        self.assertTrue(len(analysis_regr["ai_only_signals"]) > 0, "合规说明中的 'Any tools' 绝不能导致 ai_only 强证据被错误清空")
+
         # 3. 通用目录表单 + 页面偶尔出现 AI 单词
         casual_ai_html = """
         <html>

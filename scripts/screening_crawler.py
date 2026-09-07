@@ -135,7 +135,7 @@ AI_INCLUSIVE_PATTERNS = [
     re.compile(r'\b(?:saas|software|web|tech|digital|developer|other|general|traditional)\s+or\s+ai\b', re.I),
     re.compile(r'\b(?:ai\s*(?:,|/|and)\s*(?:saas|software|digital|tech))\b', re.I),
     re.compile(r'\b(?:ai\s+and\s+non[- ]ai)\b', re.I),
-    re.compile(r'\b(?:general|any)\s+(?:tools?|products?|websites?|apps?)\b', re.I),
+    re.compile(r'\bgeneral\s+(?:tools?|products?|websites?|apps?)\b', re.I),
 ]
 
 # 组合强证据：明确 AI 提交主体 (A: Submission Object)
