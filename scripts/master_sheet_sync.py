@@ -23,12 +23,23 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 DEFAULT_BACKLINKOS_RUNTIME_DIR = os.path.expanduser("~/.backlinkos/runtime")
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def validate_project_id(project_id: str) -> str:
+    if not isinstance(project_id, str):
+        raise ValueError("project_id must be a string")
+    pid = project_id.strip()
+    if pid in {"", ".", ".."} or not _PROJECT_ID_RE.fullmatch(pid):
+        raise ValueError(f"invalid project_id: {project_id!r}")
+    return pid
+
 
 def get_ready_cursor_path(project_id: str, runtime_dir: str | None = None) -> Path:
+    validated_pid = validate_project_id(project_id)
     base_dir = Path(runtime_dir or os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
     base_dir.mkdir(parents=True, exist_ok=True)
-    safe_pid = re.sub(r'[^a-zA-Z0-9_-]', '_', project_id)
-    return base_dir / f"ready_cursor_{safe_pid}.json"
+    return base_dir / f"ready_cursor_{validated_pid}.json"
 
 def load_ready_cursor(project_id: str, runtime_dir: str | None = None) -> str | None:
     path = get_ready_cursor_path(project_id, runtime_dir)
@@ -1112,12 +1123,15 @@ def prepare_execution_batch(
         cid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
         raw_bid = str(prow.get("外链ID") or prow.get("外链域名") or "").strip()
 
+        # 每访问一个待提交行，先计入本轮扫描边界并推进游标
+        scanned_count += 1
+        last_scanned_id = cid or raw_bid
+
         # 检查是否为 Orphan Row (在 Master Sheet 中不存在对应 row)
         if not cid or cid not in master_map:
             orphan_count += 1
             orphan_id = raw_bid or cid or "unknown"
             orphan_backlink_ids.append(orphan_id)
-            last_scanned_id = cid or raw_bid
             if progress_callback:
                 progress_callback({
                     "scanned_count": scanned_count,
@@ -1134,10 +1148,19 @@ def prepare_execution_batch(
         mrow = master_map[cid]
         m_status = str(mrow.get("基础状态") or "").strip()
         if m_status != MASTER_STATUS_CANDIDATE:
+            if progress_callback:
+                progress_callback({
+                    "scanned_count": scanned_count,
+                    "domain": cid,
+                    "outcome": "master_non_candidate",
+                    "entry_url": None,
+                    "ready_count": len(ready_rows),
+                    "target_ready_count": target_ready_count,
+                    "scan_limit": scan_limit,
+                    "orphan_count": orphan_count,
+                })
             continue
 
-        scanned_count += 1
-        last_scanned_id = cid
         current_entry = str(mrow.get("提交入口") or "").strip()
         verified_obj: VerifiedEntry | None = None
         verify_reason: str = ""

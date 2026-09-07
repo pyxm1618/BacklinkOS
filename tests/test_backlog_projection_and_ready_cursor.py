@@ -303,6 +303,131 @@ class TestReadyScanCursor(unittest.TestCase):
         self.assertEqual(load_ready_cursor("proj-beta", runtime_dir=self.runtime_dir), "site-beta.com")
         self.assertIsNone(load_ready_cursor("proj-gamma", runtime_dir=self.runtime_dir))
 
+    def test_e_orphan_consumes_scan_boundary_and_advances_cursor(self):
+        """测试 E (问题 5): orphan 消耗 scan 边界并推进 cursor"""
+        from scripts.master_sheet_sync import prepare_execution_batch, load_ready_cursor, VerifiedEntry
+
+        master_rows = [
+            {"外链ID": "site-valid.com", "平台域名": "site-valid.com", "基础状态": "候选", "提交入口": "https://site-valid.com/submit"},
+        ]
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "orphan1.com", "外链域名": "orphan1.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "orphan2.com", "外链域名": "orphan2.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site-valid.com", "外链域名": "site-valid.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+
+        # scan_limit 设为 2，正好只能扫描 orphan1.com 和 orphan2.com
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=2,
+            scan_limit=2,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        # 严格消耗了 2 个 scan 额度，未超限扫描第三条
+        self.assertEqual(res["scanned_count"], 2)
+        self.assertEqual(res["orphan_count"], 2)
+        self.assertEqual(res["ready_count"], 0)
+        # cursor 推进到 orphan2.com
+        saved_cursor = load_ready_cursor(self.project_id, runtime_dir=self.runtime_dir)
+        self.assertEqual(saved_cursor, "orphan2.com")
+
+        # 下一轮扫描，将从 orphan2.com 之后开始，直接命中 site-valid.com
+        res2 = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=2,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res2["ready_count"], 1)
+        self.assertEqual(res2["ready_rows"][0]["verified_entry"].domain, "site-valid.com")
+
+    def test_f_master_non_candidate_advances_cursor_and_consumes_boundary(self):
+        """测试 F (问题 5): Master 非候选行消耗 scan 边界，cursor 不会反复停留"""
+        from scripts.master_sheet_sync import prepare_execution_batch, load_ready_cursor, VerifiedEntry
+
+        master_rows = [
+            {"外链ID": "site-excluded.com", "平台域名": "site-excluded.com", "基础状态": "已排除", "提交入口": ""},
+            {"外链ID": "site-valid.com", "平台域名": "site-valid.com", "基础状态": "候选", "提交入口": "https://site-valid.com/submit"},
+        ]
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "site-excluded.com", "外链域名": "site-excluded.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site-valid.com", "外链域名": "site-valid.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+
+        # scan_limit=1，只能扫描第一条非候选行
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=1,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res["scanned_count"], 1)
+        self.assertEqual(res["ready_count"], 0)
+        # cursor 成功推进到 site-excluded.com，不会停留在它之前
+        saved_cursor = load_ready_cursor(self.project_id, runtime_dir=self.runtime_dir)
+        self.assertEqual(saved_cursor, "site-excluded.com")
+
+        # 下一轮扫描，直接从 site-valid.com 开始
+        res2 = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=1,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res2["ready_count"], 1)
+        self.assertEqual(res2["ready_rows"][0]["verified_entry"].domain, "site-valid.com")
+
+    def test_g_invalid_project_id_rejected(self):
+        """测试 G (问题 5): 非法 project_id 严格拒绝，抛出 ValueError"""
+        from scripts.master_sheet_sync import get_ready_cursor_path, validate_project_id
+
+        for invalid_id in ("", " ", "../escape", "project/slash", "project$bad", ".hidden", "a"*150):
+            with self.assertRaises(ValueError):
+                validate_project_id(invalid_id)
+            with self.assertRaises(ValueError):
+                get_ready_cursor_path(invalid_id, runtime_dir=self.runtime_dir)
+
+    def test_h_strict_project_id_physical_isolation_dot_and_underscore(self):
+        """测试 H (问题 5): a.b 与 a_b cursor 物理隔离，不发生碰撞"""
+        from scripts.master_sheet_sync import save_ready_cursor, load_ready_cursor, get_ready_cursor_path
+
+        p1 = "proj.test"
+        p2 = "proj_test"
+
+        path1 = get_ready_cursor_path(p1, runtime_dir=self.runtime_dir)
+        path2 = get_ready_cursor_path(p2, runtime_dir=self.runtime_dir)
+        self.assertNotEqual(path1, path2)
+        self.assertTrue(path1.name.endswith("ready_cursor_proj.test.json"))
+        self.assertTrue(path2.name.endswith("ready_cursor_proj_test.json"))
+
+        save_ready_cursor(p1, "cursor-dot.com", runtime_dir=self.runtime_dir)
+        save_ready_cursor(p2, "cursor-underscore.com", runtime_dir=self.runtime_dir)
+
+        self.assertEqual(load_ready_cursor(p1, runtime_dir=self.runtime_dir), "cursor-dot.com")
+        self.assertEqual(load_ready_cursor(p2, runtime_dir=self.runtime_dir), "cursor-underscore.com")
+
 
 class TestProjectOrphanRowHandling(unittest.TestCase):
     """测试问题 7: Project orphan row 显式统计与报告，消除 silent continue。"""

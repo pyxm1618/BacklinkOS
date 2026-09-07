@@ -138,19 +138,6 @@ AI_INCLUSIVE_PATTERNS = [
 ]
 
 
-# 受信任的第三方托管表单服务域名
-TRUSTED_HOSTED_FORM_DOMAINS = {
-    "tally.so",
-    "airtable.com",
-    "forms.gle",
-    "docs.google.com",
-    "typeform.com",
-    "fillout.com",
-    "cognitoforms.com",
-    "jotform.com",
-}
-
-
 def extract_ai_only_signals(text: str) -> list[str]:
     """提取通用 AI-only 强排他证据。
     
@@ -341,17 +328,6 @@ def analyze_html(raw_html, base_url):
                 if clean_target != clean_base or pu.query != parsed_base.query:
                     if not any(item['url'] == u for item in submission_cta_links):
                         submission_cta_links.append({'url': u, 'text': visible_cta_text[:100]})
-        else:
-            # 跨域链接：只有当目标域名属于受信任第三方托管表单且页面存在明确提交 CTA 关联时才保留为 candidate
-            tgt_host = (pu.hostname or '').lower()
-            if tgt_host.startswith("www."):
-                tgt_host = tgt_host[4:]
-            is_trusted_hosted = any(tgt_host == d or tgt_host.endswith('.' + d) for d in TRUSTED_HOSTED_FORM_DOMAINS)
-            if is_trusted_hosted and is_cta_submit:
-                if u not in strong:
-                    strong.append(u)
-                if not any(item['url'] == u for item in submission_cta_links):
-                    submission_cta_links.append({'url': u, 'text': visible_cta_text[:100]})
 
         if pu.hostname and pu.hostname.lower() != host:
             tokens = set((rel or '').lower().split())

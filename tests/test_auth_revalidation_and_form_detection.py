@@ -207,34 +207,6 @@ class TestFormClassificationAndHostedForms(unittest.TestCase):
         res = analyze_html(html, "https://mysite.com/search")
         self.assertEqual(len(res["actionable_forms"]), 0)
 
-    def test_d_page_clear_cta_to_hosted_form_retains_candidate(self):
-        """测试 D: 页面明确 CTA 指向受信任的第三方 hosted form (如 tally.so) 保留为 candidate"""
-        html = """
-        <html>
-        <body>
-            <h1>Featured AI Tools</h1>
-            <a href="https://tally.so/r/mK9xYz">Submit your tool</a>
-        </body>
-        </html>
-        """
-        res = analyze_html(html, "https://mysite.com/")
-        self.assertIn("https://tally.so/r/mK9xYz", res["candidate_urls"])
-        cta_urls = [c["url"] for c in res["submission_cta_links"]]
-        self.assertIn("https://tally.so/r/mK9xYz", cta_urls)
-
-    def test_e_unrelated_third_party_form_without_provenance_rejected(self):
-        """测试 E: 无来源关系的任意 third-party form / 链接 坚决拒绝"""
-        html = """
-        <html>
-        <body>
-            <h1>Random Partners</h1>
-            <a href="https://unknown-third-party.com/form">Partner Link</a>
-        </body>
-        </html>
-        """
-        res = analyze_html(html, "https://mysite.com/")
-        self.assertNotIn("https://unknown-third-party.com/form", res["candidate_urls"])
-
 
 if __name__ == "__main__":
     unittest.main()
