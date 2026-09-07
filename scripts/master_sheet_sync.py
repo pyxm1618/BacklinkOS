@@ -12,14 +12,44 @@
 5. Bounded Batch Hydration: 严格双边界（target_count + scan_limit），对总表现有入口同样强制 live verification，未验证通过不 materialize。
 """
 
-from __future__ import annotations
-
+import datetime
+import json
 import os
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
+DEFAULT_BACKLINKOS_RUNTIME_DIR = os.path.expanduser("~/.backlinkos/runtime")
+
+def get_ready_cursor_path(project_id: str, runtime_dir: str | None = None) -> Path:
+    base_dir = Path(runtime_dir or os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe_pid = re.sub(r'[^a-zA-Z0-9_-]', '_', project_id)
+    return base_dir / f"ready_cursor_{safe_pid}.json"
+
+def load_ready_cursor(project_id: str, runtime_dir: str | None = None) -> str | None:
+    path = get_ready_cursor_path(project_id, runtime_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("last_scanned_backlink_id")
+    except Exception:
+        return None
+
+def save_ready_cursor(project_id: str, last_scanned_backlink_id: str, runtime_dir: str | None = None) -> None:
+    path = get_ready_cursor_path(project_id, runtime_dir)
+    data = {
+        "project_id": project_id,
+        "last_scanned_backlink_id": last_scanned_backlink_id,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 # 复用已有且经过全面测试的 screening_crawler 能力
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -948,24 +978,28 @@ def prepare_execution_batch(
     project_context: dict[str, Any] | None = None,
     fetcher: Callable[[str], dict] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    use_cursor: bool = False,
+    runtime_dir: str | None = None,
 ) -> dict[str, Any]:
     """从已有项目 Backlog 中筛选待提交记录，执行有界的现场 Entry 核验，产出 Ready for Autofill 队列。
     
     契约规则：
     1. 从 project_rows 中选择 项目ID == project_id AND 状态 == '待提交' 的小批量项目记录；
     2. target_ready_count 控制目标 Ready 数量，scan_limit 控制最多扫描候选数；
-    3. 逐个关联 Master Row：
+    3. 支持轻量本地 Ready scan cursor：定位上次扫描 ID，从后继续，末尾 wrap；
+    4. 逐个关联 Master Row：
        - 若 Master 已有'提交入口'：Live Revalidate existing entry；
        - 若 Master 无'提交入口'：现场探测 discover_and_verify_entry；
-    4. 验证成功：
+       - 若 Master 缺失该行 (Orphan Row)：显式统计 orphan_count，记录 orphan IDs，不进 ready，不阻断后续；
+    5. 验证成功：
        - 更新 Master 提交入口（如原为空或需要规范化更新）；
        - 加入 ready_rows 批次；
        - ready_count += 1；
-    5. 验证失败 / unresolved：
+    6. 验证失败 / unresolved：
        - 项目行仍然存在，状态仍为'待提交'，尝试次数仍为 0；
        - 不得标记为'失败'，不得标记为'不适用'；
        - batch 继续扫描下一个候选；
-    6. 仅当 ready_count >= target_ready_count 或 scanned_count >= scan_limit 时停止。
+    7. 仅当 ready_count >= target_ready_count 或 scanned_count >= scan_limit 时停止。
     """
     proj = str(project_id or "").strip()
     if not proj:
@@ -988,22 +1022,60 @@ def prepare_execution_batch(
         if cid:
             master_map[cid] = mrow
 
+    # 筛选当前项目且状态为待提交的候选行
+    eligible_project_rows: list[dict[str, Any]] = []
+    for prow in project_rows:
+        p_proj = str(prow.get("项目ID") or "").strip()
+        p_status = str(prow.get("状态") or "").strip()
+        if p_proj == proj and p_status == PROJECT_STATUS_TO_SUBMIT:
+            eligible_project_rows.append(prow)
+
+    # 游标处理 (从上次 last_scanned_backlink_id 后面继续，到末尾 wrap)
+    scan_sequence = eligible_project_rows
+    if use_cursor and eligible_project_rows:
+        last_id = load_ready_cursor(proj, runtime_dir=runtime_dir)
+        if last_id:
+            cursor_idx = -1
+            for idx, prow in enumerate(eligible_project_rows):
+                bid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+                if bid == last_id:
+                    cursor_idx = idx
+                    break
+            if cursor_idx != -1:
+                scan_sequence = eligible_project_rows[cursor_idx + 1:] + eligible_project_rows[:cursor_idx + 1]
+
     ready_rows: list[dict[str, Any]] = []
     scanned_count = 0
     skipped_incompatible = 0
     failed_verification_count = 0
+    orphan_count = 0
+    orphan_backlink_ids: list[str] = []
+    last_scanned_id: str | None = None
 
-    for prow in project_rows:
+    for prow in scan_sequence:
         if len(ready_rows) >= target_ready_count or scanned_count >= scan_limit:
             break
 
-        p_proj = str(prow.get("项目ID") or "").strip()
-        p_status = str(prow.get("状态") or "").strip()
-        if p_proj != proj or p_status != PROJECT_STATUS_TO_SUBMIT:
-            continue
-
         cid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+        raw_bid = str(prow.get("外链ID") or prow.get("外链域名") or "").strip()
+
+        # 检查是否为 Orphan Row (在 Master Sheet 中不存在对应 row)
         if not cid or cid not in master_map:
+            orphan_count += 1
+            orphan_id = raw_bid or cid or "unknown"
+            orphan_backlink_ids.append(orphan_id)
+            last_scanned_id = cid or raw_bid
+            if progress_callback:
+                progress_callback({
+                    "scanned_count": scanned_count,
+                    "domain": cid or raw_bid,
+                    "outcome": "orphan",
+                    "entry_url": None,
+                    "ready_count": len(ready_rows),
+                    "target_ready_count": target_ready_count,
+                    "scan_limit": scan_limit,
+                    "orphan_count": orphan_count,
+                })
             continue
 
         mrow = master_map[cid]
@@ -1012,6 +1084,7 @@ def prepare_execution_batch(
             continue
 
         scanned_count += 1
+        last_scanned_id = cid
         current_entry = str(mrow.get("提交入口") or "").strip()
         verified_obj: VerifiedEntry | None = None
         verify_reason: str = ""
@@ -1070,7 +1143,12 @@ def prepare_execution_batch(
                 "ready_count": len(ready_rows),
                 "target_ready_count": target_ready_count,
                 "scan_limit": scan_limit,
+                "orphan_count": orphan_count,
             })
+
+    # 扫描结束保存本地原子游标
+    if use_cursor and last_scanned_id:
+        save_ready_cursor(proj, last_scanned_id, runtime_dir=runtime_dir)
 
     return {
         "ready_rows": ready_rows,
@@ -1079,6 +1157,8 @@ def prepare_execution_batch(
         "scanned_count": scanned_count,
         "skipped_incompatible": skipped_incompatible,
         "failed_verification_count": failed_verification_count,
+        "orphan_count": orphan_count,
+        "orphan_backlink_ids": orphan_backlink_ids,
     }
 
 

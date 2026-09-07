@@ -158,6 +158,7 @@ def run_phase_c_preparation(
             "ready": "✅ READY",
             "incompatible": "⚠️ INCOMPATIBLE (AI-only)",
             "unresolved": "❌ UNRESOLVED (无有效入口)",
+            "orphan": "⚠️ ORPHAN (Master 中无对应行)",
         }.get(outcome, outcome)
         print(
             f"  [{idx:03d}/{limit:03d}] {dom:<30} {outcome_tag}{url_str} | 已就绪: {ready_now}/{target}",
@@ -176,18 +177,23 @@ def run_phase_c_preparation(
         project_context=project_context,
         fetcher=fast_fetcher,
         progress_callback=on_progress,
+        use_cursor=True,
     )
 
     ready_rows = batch_result["ready_rows"]
     scanned_count = batch_result["scanned_count"]
     skipped_incompatible = batch_result["skipped_incompatible"]
     failed_verification_count = batch_result["failed_verification_count"]
+    orphan_count = batch_result.get("orphan_count", 0)
+    orphan_ids = batch_result.get("orphan_backlink_ids", [])
 
     print(f"\n[3/5] 批次现场核验完成统计:")
     print(f"  - 扫描项目待提交候选数: {scanned_count}")
     print(f"  - 成功 Ready 数量:      {len(ready_rows)} (目标: {target_ready_count})")
     print(f"  - 兼容性排除数:          {skipped_incompatible}")
     print(f"  - 核验失败/无入口数:    {failed_verification_count}")
+    if orphan_count:
+        print(f"  - 孤儿记录统计 (Orphan): {orphan_count} (IDs: {', '.join(orphan_ids)})")
 
     # 3. 汇总 Master 写回需求
     updates_to_master: list[dict[str, Any]] = []
@@ -286,6 +292,8 @@ def run_phase_c_preparation(
         "ready_count": len(ready_rows),
         "skipped_incompatible": skipped_incompatible,
         "failed_verification_count": failed_verification_count,
+        "orphan_count": orphan_count,
+        "orphan_backlink_ids": orphan_ids,
         "ready_domains": ready_domains,
         "ready_items": ready_items,
     }

@@ -17,3 +17,7 @@ __pycache__/
 .env.*
 !.env.example
 .DS_Store
+
+# Local runtime checkpoints and state
+.backlinkos/
+ready_cursor_*.json

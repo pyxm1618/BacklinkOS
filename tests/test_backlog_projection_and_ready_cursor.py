@@ -161,5 +161,206 @@ class TestProjectBacklogProjectionReconciliation(unittest.TestCase):
         self.assertIn("对账失败", str(ctx.exception))
 
 
+class TestReadyScanCursor(unittest.TestCase):
+    """测试问题 3: Ready 扫描游标本地 Checkpoint / Cursor 机制。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.runtime_dir = self.tmp_dir.name
+        self.project_id = "proj-cursor"
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_a_run1_scans_1_2_run2_scans_from_3_and_gets_ready(self):
+        """测试 A:
+        1 unresolved
+        2 unresolved
+        3 ready
+        scan_limit=2
+        Run 1: 只扫描 1、2
+        Run 2: 必须从 3 开始，并得到 Ready
+        """
+        from scripts.master_sheet_sync import prepare_execution_batch, VerifiedEntry
+
+        master_rows = [
+            {"外链ID": "site1.com", "平台域名": "site1.com", "基础状态": "候选", "提交入口": "https://site1.com/submit"},
+            {"外链ID": "site2.com", "平台域名": "site2.com", "基础状态": "候选", "提交入口": "https://site2.com/submit"},
+            {"外链ID": "site3.com", "平台域名": "site3.com", "基础状态": "候选", "提交入口": "https://site3.com/submit"},
+        ]
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "site1.com", "外链域名": "site1.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site2.com", "外链域名": "site2.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site3.com", "外链域名": "site3.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            if domain == "site3.com":
+                return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+            return None, "unresolved"
+
+        # Run 1: scan_limit=2, target_ready_count=1
+        res1 = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=2,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res1["scanned_count"], 2)
+        self.assertEqual(res1["ready_count"], 0)
+
+        # Run 2: scan_limit=2, target_ready_count=1
+        # 必须从 site3.com 开始扫描并成功就绪
+        res2 = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=2,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res2["ready_count"], 1)
+        self.assertEqual(res2["ready_rows"][0]["verified_entry"].domain, "site3.com")
+
+    def test_b_wraps_around_at_end(self):
+        """测试 B: 扫描到末尾后可以 wrap 回开头"""
+        from scripts.master_sheet_sync import prepare_execution_batch, save_ready_cursor, VerifiedEntry
+
+        master_rows = [
+            {"外链ID": "site1.com", "平台域名": "site1.com", "基础状态": "候选", "提交入口": "https://site1.com/submit"},
+            {"外链ID": "site2.com", "平台域名": "site2.com", "基础状态": "候选", "提交入口": "https://site2.com/submit"},
+        ]
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "site1.com", "外链域名": "site1.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site2.com", "外链域名": "site2.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+
+        # 事先保存 cursor 在最后一条 site2.com
+        save_ready_cursor(self.project_id, "site2.com", runtime_dir=self.runtime_dir)
+
+        # 执行扫描，应该从头 wrap 到 site1.com
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=1,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res["ready_count"], 1)
+        self.assertEqual(res["ready_rows"][0]["verified_entry"].domain, "site1.com")
+
+    def test_c_missing_or_disappeared_id_resets_safely_without_crash(self):
+        """测试 C: cursor 指向已不存在 ID 时不会 crash，安全从头开始"""
+        from scripts.master_sheet_sync import prepare_execution_batch, save_ready_cursor, VerifiedEntry
+
+        master_rows = [
+            {"外链ID": "site1.com", "平台域名": "site1.com", "基础状态": "候选", "提交入口": "https://site1.com/submit"},
+        ]
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "site1.com", "外链域名": "site1.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+
+        # cursor 指向一个已删除的不存在 ID
+        save_ready_cursor(self.project_id, "deleted-domain.com", runtime_dir=self.runtime_dir)
+
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=1,
+            entry_verifier=fake_verifier,
+            runtime_dir=self.runtime_dir,
+            use_cursor=True,
+        )
+        self.assertEqual(res["ready_count"], 1)
+        self.assertEqual(res["ready_rows"][0]["verified_entry"].domain, "site1.com")
+
+    def test_d_project_isolation(self):
+        """测试 D: 不同 project 的 cursor 严格隔离"""
+        from scripts.master_sheet_sync import save_ready_cursor, load_ready_cursor
+
+        save_ready_cursor("proj-alpha", "site-alpha.com", runtime_dir=self.runtime_dir)
+        save_ready_cursor("proj-beta", "site-beta.com", runtime_dir=self.runtime_dir)
+
+        self.assertEqual(load_ready_cursor("proj-alpha", runtime_dir=self.runtime_dir), "site-alpha.com")
+        self.assertEqual(load_ready_cursor("proj-beta", runtime_dir=self.runtime_dir), "site-beta.com")
+        self.assertIsNone(load_ready_cursor("proj-gamma", runtime_dir=self.runtime_dir))
+
+
+class TestProjectOrphanRowHandling(unittest.TestCase):
+    """测试问题 7: Project orphan row 显式统计与报告，消除 silent continue。"""
+
+    def setUp(self):
+        self.project_id = "proj-orphan"
+
+    def test_orphan_explicit_reporting_and_non_blocking(self):
+        """测试 A-E:
+        A. project row 无 master -> orphan_count=1
+        B. 输出 backlink_id
+        C. 不进入 ready
+        D. 不影响后续合法候选继续扫描
+        E. 不 silent continue (progress_callback 也上报 orphan)
+        """
+        from scripts.master_sheet_sync import prepare_execution_batch, VerifiedEntry
+
+        # Master 中只有 site-valid.com，没有 orphan-site.com
+        master_rows = [
+            {"外链ID": "site-valid.com", "平台域名": "site-valid.com", "基础状态": "候选", "提交入口": "https://site-valid.com/submit"},
+        ]
+        # Project 中有 orphan-site.com (在前) 和 site-valid.com (在后)
+        project_rows = [
+            {"项目ID": self.project_id, "外链ID": "orphan-site.com", "外链域名": "orphan-site.com", "状态": "待提交", "尝试次数": "0"},
+            {"项目ID": self.project_id, "外链ID": "site-valid.com", "外链域名": "site-valid.com", "状态": "待提交", "尝试次数": "0"},
+        ]
+
+        def fake_verifier(domain, url):
+            return VerifiedEntry(url=url, domain=domain, evidence_type="actionable_form", evidence_summary="verified", form_details={}), "ok"
+
+        progress_events = []
+
+        res = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id=self.project_id,
+            target_ready_count=1,
+            scan_limit=5,
+            entry_verifier=fake_verifier,
+            use_cursor=False,
+            progress_callback=lambda p: progress_events.append(p),
+        )
+
+        # A. orphan_count 明确统计为 1
+        self.assertEqual(res.get("orphan_count"), 1)
+        # B. 输出 orphan backlink IDs
+        self.assertEqual(res.get("orphan_backlink_ids"), ["orphan-site.com"])
+        # C. orphan 绝不进入 ready
+        ready_domains = [r["verified_entry"].domain for r in res["ready_rows"]]
+        self.assertNotIn("orphan-site.com", ready_domains)
+        # D. 不影响后续合法候选 site-valid.com 成功进入 ready
+        self.assertIn("site-valid.com", ready_domains)
+        self.assertEqual(res["ready_count"], 1)
+        # E. 不 silent continue: progress_events 中明确有 orphan 汇报
+        orphan_events = [p for p in progress_events if p.get("outcome") == "orphan"]
+        self.assertEqual(len(orphan_events), 1)
+        self.assertEqual(orphan_events[0]["domain"], "orphan-site.com")
+
+
 if __name__ == "__main__":
     unittest.main()
