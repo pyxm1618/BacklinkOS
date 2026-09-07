@@ -131,10 +131,27 @@ AI_ONLY_STRONG_PATTERNS = [
 
 # 允许非 AI / SaaS / 通用工具的包容性模式（防误杀 Visalytica 等声明 "AI or SaaS tool" 的平台）
 AI_INCLUSIVE_PATTERNS = [
-    re.compile(r'\b(?:ai\s+or\s+(?:saas|software|web|tech|digital|developer|other|tools?|products?|apps?))\b', re.I),
-    re.compile(r'\b(?:saas|software|web|tech|digital|developer|other)\s+or\s+ai\b', re.I),
+    re.compile(r'\b(?:ai\s+or\s+(?:saas|software|web|tech|digital|developer|other|tools?|products?|apps?|general|traditional))\b', re.I),
+    re.compile(r'\b(?:saas|software|web|tech|digital|developer|other|general|traditional)\s+or\s+ai\b', re.I),
     re.compile(r'\b(?:ai\s*(?:,|/|and)\s*(?:saas|software|digital|tech))\b', re.I),
     re.compile(r'\b(?:ai\s+and\s+non[- ]ai)\b', re.I),
+    re.compile(r'\bgeneral\s+(?:tools?|products?|websites?|apps?)\b', re.I),
+]
+
+# 组合强证据：明确 AI 提交主体 (A: Submission Object)
+AI_SUBMISSION_OBJECT_PATTERNS = [
+    r'\b(?:submit|add|list|register|post|claim)\s+(?:your\s+|an?\s+)?ai\s+(?:tool|product|startup|service|app|project|solution)s?\b',
+    r'\bget\s+your\s+ai\s+tool\s+discovered\b',
+    r'\b(?:your|enter)\s+ai\s+(?:tool|product|startup|service|app|project)\s+name\b',
+]
+
+# 组合强证据：明确 AI 准入资格/接受范围语义 (B: Eligibility & Acceptance)
+AI_ELIGIBILITY_ACCEPTANCE_PATTERNS = [
+    r'\b(?:we\s+)?accept(?:s|ing)?\s+(?:all\s+types\s+of\s+)?(?:ai|ai[- ]powered)\s+(?:tools?|services?|products?|startups?|apps?)\b',
+    r'\b(?:types\s+of\s+)?ai\s+tools?\s+(?:do\s+you\s+)?accept\b',
+    r'\b(?:submit|submission\s+of)\s+an?\s+(?:ai|ai[- ]powered)\s+(?:tool|service|product|startup|app)\b',
+    r'\bai\s+tool\s+submission\b',
+    r'\bsubmission\s+for\s+ai\s+tools?\b',
 ]
 
 
@@ -143,7 +160,8 @@ def extract_ai_only_signals(text: str) -> list[str]:
     
     规则：
     1. 覆盖通用排他表述（solely dedicated, exclusively features, only accepts, non-AI causes rejection, must use AI）；
-    2. 严格防误杀：若存在“AI or SaaS tool”等明确包容性声明，绝不判定为 AI-only。
+    2. 组合强证据判定：明确 AI 提交主体 (A) + 明确 AI 准入资格语义 (B)；
+    3. 严格防误杀：若存在“AI or SaaS tool”等明确包容性声明，绝不判定为 AI-only。
     """
     if not text:
         return []
@@ -153,6 +171,7 @@ def extract_ai_only_signals(text: str) -> list[str]:
         return []
 
     hits = []
+    # 1. 单一明确排他模式
     for pat in AI_ONLY_STRONG_PATTERNS:
         for m in re.finditer(pat, text, re.I):
             matched_str = m.group(0)
@@ -163,6 +182,30 @@ def extract_ai_only_signals(text: str) -> list[str]:
             if any(p.search(window) for p in AI_INCLUSIVE_PATTERNS):
                 continue
             hits.append(matched_str)
+
+    # 2. 组合强证据判定 (A + B)
+    obj_hits = []
+    for pat in AI_SUBMISSION_OBJECT_PATTERNS:
+        for m in re.finditer(pat, text, re.I):
+            matched_str = m.group(0)
+            start = max(0, m.start() - 60)
+            end = min(len(text), m.end() + 60)
+            window = text[start:end]
+            if not any(p.search(window) for p in AI_INCLUSIVE_PATTERNS):
+                obj_hits.append(matched_str)
+
+    elig_hits = []
+    for pat in AI_ELIGIBILITY_ACCEPTANCE_PATTERNS:
+        for m in re.finditer(pat, text, re.I):
+            matched_str = m.group(0)
+            start = max(0, m.start() - 60)
+            end = min(len(text), m.end() + 60)
+            window = text[start:end]
+            if not any(p.search(window) for p in AI_INCLUSIVE_PATTERNS):
+                elig_hits.append(matched_str)
+
+    if obj_hits and elig_hits:
+        hits.append(f"{obj_hits[0]} + {elig_hits[0]}")
 
     return list(dict.fromkeys(hits))
 
