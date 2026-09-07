@@ -2,173 +2,207 @@
 
 ## Status
 
-**Current product strategy as of 2026-08-22.**
+**Current product strategy as of 2026-09-07.**
 
-BacklinkOS is a personal SEO backlink opportunity system for discovering and maintaining a reusable database of **general-purpose backlink opportunities**.
+BacklinkOS is a personal SEO backlink opportunity operating system built around a reusable platform fact store, a per-project opportunity backlog, bounded execution-readiness preparation, and safe real-browser execution through `backlink-autofill`.
 
-It has two implemented intelligence capabilities:
+The product is not a backlink spam bot and does not require all business facts to be known before preserving a candidate.
 
-1. **Discover** — systematically find new backlink candidates from projects that already show SEO results.
-2. **Screen** — verify whether each candidate currently exposes a reusable, executable backlink opportunity.
+## 1. Product model
 
-The system intentionally does **not** evaluate topical relevance to a promoted website and does not perform Project × Opportunity matching.
+The current model has four distinct responsibilities:
 
-## 1. Core workflow
+1. **Discover / Master Upsert** — find real candidate domains and maintain platform-level facts.
+2. **Project Backlog Projection** — project reusable candidates into a specific project's full opportunity backlog without requiring live execution readiness.
+3. **Bounded Execution Preparation** — live-verify a small batch and produce a Ready allowlist.
+4. **Autofill Execution** — perform real browser actions and write back actual execution facts.
 
-```text
-Discover
-   ↓
-Screen
-   ↓
-Operational persistence / execution
-```
+The key product rule is:
 
-Discovery and Screening must remain separate. A historical backlink observation can identify a candidate, but it cannot prove that the current public route is free, Follow, or still executable.
+> **UNKNOWN != REJECT, and Project Backlog != Ready Queue.**
 
-## 2. `discovering-backlinks`
+## 2. Phase A — Discover / Master Upsert
 
-The canonical Discovery Skill is:
+The canonical current Skill is:
 
 ```text
 .agents/skills/discovering-backlinks/
 ```
 
-Its job is to find candidate referring domains and preserve factual provenance.
+Discovery finds candidate referring domains from real sources such as SEO-success projects and Semrush Referring Domains, then canonicalizes and Upserts them into `外链总表`.
 
-Current operating model:
+Discovery preserves provenance and directly observed facts. It does not guess current free status, login requirements, current Follow status, or execution outcomes.
 
-1. build batches of recently successful projects from sources such as Toolify, There’s An AI For That, TrustMRR, and similar sources;
-2. deduplicate projects against prior batches;
-3. use the validated `sem.3ue.com` Semrush relay rather than relying on unavailable official API units;
-4. query project Organic Traffic and retain explicit `no_data` / error semantics;
-5. by default, continue to Referring Domains for projects with Global Organic Traffic `>= 500`;
-6. page Referring Domains according to the returned total rather than silently truncating;
-7. preserve raw facts such as source projects, referring domain, backlinks count, Authority Score, first/last seen, and historical `is_follow`;
-8. aggregate repeated referring domains across successful projects;
-9. hand candidates to `screening-backlinks`.
+A candidate may legitimately exist with:
 
-Discovery does not decide current pricing, current free availability, current final-link attributes, or project fit. Unknown facts remain unknown.
+- blank Submission Entry;
+- unknown free/paid state;
+- unknown authentication requirements;
+- unknown final-link attributes.
 
-## 3. `screening-backlinks`
+Those unknowns are not rejection evidence.
 
-The canonical Screening Skill is:
+## 3. Phase B — Project Backlog Projection
 
-```text
-.agents/skills/screening-backlinks/
-```
+`外链管理` is the project-level opportunity backlog and lifecycle table.
 
-Its job is to answer:
+Projection rules:
 
-> Can an ordinary user currently obtain an effective Follow backlink without paying?
+- operate without network I/O;
+- include Master `候选` rows by default;
+- do not require Submission Entry or `VerifiedEntry`;
+- exclude only Master `已排除/失效` or proven project hard incompatibility;
+- preserve `project_id + backlink_id` uniqueness;
+- preserve all existing project states and attempts;
+- create new backlog rows as `待提交 / 尝试次数=0`.
 
-Current acquisition classifications are exactly:
+This is intentionally a large pool. Batch size limits belong to execution preparation, not backlog population.
 
-- `免费`
-- `免费换链`
-- `付费`
-- `不确定`
+## 4. Project compatibility
 
-A formal reusable opportunity must have all of the following confirmed:
+BacklinkOS still does not implement a general black-box topical relevance score or weighted Project × Opportunity ranking system.
 
-- a current ordinary-user execution route;
-- no required payment (`免费换链` is tracked separately when a reciprocal backlink is required);
-- a direct external link on the final public page;
-- no `nofollow`, `ugc`, or `sponsored` token on the final link;
-- an indexable final page.
+However, the current product **does** enforce explicit hard compatibility when strong platform facts require it. Example: a verified AI-only submission platform must not become Ready for a project whose `project_context.ai_powered` is false.
 
-Paid opportunities, Nofollow/UGC/Sponsored placements, missing external URLs, dead routes, noindex pages, and verified spam/link-network placements do not enter the formal opportunity table.
+Rules:
 
-Critical facts that cannot be closed are `不确定`; they are not guessed.
+- strong, relevant, persisted/verified constraint → may block that project;
+- ambiguous or missing constraint → include in backlog;
+- a project-specific incompatibility does not globally mark the Master platform as bad for all projects.
 
-## 4. No A/B/C/D/F decision model
+## 5. Phase C — Bounded Execution Preparation
 
-V4 no longer uses A/B/C/D/F as the current screening/admission system.
+Execution preparation answers a narrower question:
 
-DR, traffic, successful-project coverage, first-seen dates, and similar metrics may help prioritize work or provide context, but they do not determine whether a candidate belongs in the formal opportunity table.
+> Is this backlog row sufficiently verified to hand to the browser executor now?
 
-Some compatibility persistence code still contains historical rating fields. Those fields are retained only to avoid silently breaking existing integrations; they are not current V4 business semantics.
+It is intentionally bounded, for example by `target_ready_count` and `scan_limit`.
 
-## 5. General-purpose opportunity model
+Preparation performs current Entry Live Verification and produces `VerifiedEntry` objects only when evidence is sufficient.
 
-BacklinkOS stores reusable opportunities, not destination-project matches.
+Rules:
 
-The system may describe source-site metadata and operational restrictions, but it does not answer questions such as:
+- stored historical entries are revalidated;
+- blank entries may be discovered live;
+- invalid pricing/terms/category/report pages are rejected by Policy Guard;
+- ordinary body text or URL path alone cannot manufacture a submission entry;
+- auth-wall acceptance requires valid same-origin submission callback/provenance evidence;
+- unresolved verification leaves the backlog row as `待提交`, attempt unchanged;
+- a cursor prevents unresolved front rows from starving later candidates;
+- orphan project rows are reported and skipped rather than blocking progress.
 
-- whether Quick I Ching is eligible for a specific opportunity;
-- whether an opportunity is topically relevant to a particular site;
-- whether one destination project deserves a higher relevance score than another.
+Only verified rows enter the Ready manifest.
 
-Those decisions are outside the V4 opportunity database contract.
+## 6. Phase D — `backlink-autofill`
 
-## 6. Evidence discipline
-
-BacklinkOS distinguishes direct facts from interpretations.
-
-Examples:
-
-- Semrush historical `is_follow` is discovery evidence, not proof that the current free route is Follow;
-- `first_seen` is Semrush’s first observation, not a precise acquisition date;
-- provider missing data is not zero;
-- failed lookup is not a negative business conclusion;
-- network-level rejection requires evidence of a common operator, mechanism, template, or other closed family-level proof rather than visual similarity alone.
-
-## 7. Supporting runtime
-
-### Metrics
-
-Provider-specific deterministic metric runtime belongs in:
+Real browser execution belongs to the separate repository:
 
 ```text
-pyxm1618/backlink-metrics-api
+pyxm1618/backlink-autofill
 ```
 
-BacklinkOS should consume metric evidence without duplicating provider implementation code inside the Skills.
+The handoff contract is:
 
-### Bulk triage crawler
+> **Ready allowlist ∩ current project `待提交` rows**
 
-`scripts/screening_crawler.py` and its GitHub Actions workflow remain active helpers for large candidate pools.
+`待提交 != Ready`.
 
-They are a **pre-screening triage mechanism**, not the V4 final decision engine. Their machine buckets may prioritize follow-up, but final admission/rejection must meet the evidence contract in `screening-backlinks`.
+Autofill owns:
 
-### Persistence
+- authentication and account flows;
+- form filling;
+- Existing Submission Preflight;
+- anonymous fail-closed rules;
+- CAPTCHA / Turnstile / 2FA / SMS human blockers;
+- Final Submit;
+- lifecycle classification;
+- result URLs;
+- actual DOM link attributes;
+- Manual Post-submit Recheck.
 
-The current user-facing output contract is defined by:
+Execution must fail closed when evidence is ambiguous rather than improvising an unsafe submit.
+
+## 7. Google Sheets as control plane
+
+The current control plane is Google Sheets `@外链管理总控表`.
+
+### `外链总表`
+
+Platform-level reusable facts.
+
+### `外链管理`
+
+Project-level backlog and lifecycle.
+
+This architecture is intentionally sufficient at the current scale; moving to a separate database is not a prerequisite for normal operation.
+
+## 8. Legacy `screening-backlinks`
+
+The historical `screening-backlinks` Skill remains available as **Legacy / Optional** for explicit free/Follow opportunity screening, historical investigations, or special offline review.
+
+It is no longer the default admission gate between discovery and the control plane.
+
+Therefore older statements such as:
 
 ```text
-.agents/skills/screening-backlinks/references/output-schema.md
+Discover → Screen → only formal opportunities enter the database
 ```
 
-Existing Feishu API/library code is retained as compatibility infrastructure from an earlier record schema. Any migration of that runtime to the new output schema is a separate behavior-changing project and is not part of repository hygiene cleanup.
+are historical semantics, not the current production pipeline.
 
-## 8. Current completion state
+## 9. Evidence discipline
 
-Implemented:
+Current evidence rules include:
 
-- dedicated `discovering-backlinks` Skill;
-- validated Semrush relay workflow and batch runner;
-- dedicated `screening-backlinks` Skill;
-- current free / reciprocal / paid / uncertain screening semantics;
-- network-level evidence rules;
-- current formal output-table schema;
-- operational bulk triage crawler;
-- compatibility Feishu persistence runtime;
-- deterministic metric-runtime separation.
+- missing data stays unknown;
+- historical Semrush `is_follow` is discovery evidence, not current-route proof;
+- `first_seen` is not an exact acquisition date;
+- missing Entry is not rejection;
+- generic AI mentions are not enough for AI-only classification;
+- AI-only requires strong submission-object/eligibility evidence with inclusive guards;
+- public result URL is only written after a public listing and identity are verified;
+- live `rel` is only written after actual DOM inspection;
+- Recheck must preserve unobserved historical Master facts.
 
-The main work now is operational: continue discovery batches, screen candidates to closure, improve the evidence library from real cases, and change runtime code only when real usage demonstrates a concrete need.
+## 10. Current completion state
 
-## 9. Explicit non-goals
+The core production architecture is implemented and accepted.
 
-V4 does not build:
+Completed:
 
-- topical relevance scoring;
-- Project × Opportunity matching;
-- destination-site eligibility decisions;
+- Master Upsert and fact protection;
+- full Project Backlog Projection;
+- idempotent reconciliation;
+- production backup / capacity / batch-write / exact-readback projection helper;
+- bounded execution preparation;
+- Ready cursor;
+- orphan reporting;
+- Ready allowlist handoff;
+- standalone Autofill fail-closed;
+- anonymous preflight fail-closed;
+- Manual Post-submit Recheck;
+- scheduled-state and Master-fact preservation;
+- AI-only project compatibility after real live verification failure exposed the gap.
+
+Final BacklinkOS regression at closeout: Python 115 passed, Node 41 passed, TypeScript 0 errors.
+
+The next product phase is **normal production use**, not another architecture redesign. New fixes should be driven by concrete real-run failures.
+
+## 11. Explicit non-goals
+
+Current V4 does not require:
+
+- general topical relevance scoring;
+- black-box backlink quality scoring;
 - an Ahrefs/Semrush replacement;
 - a massive backlink crawler/index;
-- 100K-scale distributed processing infrastructure;
-- uncontrolled automated backlink spam;
-- a black-box weighted SEO score.
+- distributed 100K-scale infrastructure;
+- a scheduler/worker platform merely for architectural completeness;
+- a forced quota of ten arbitrary real submissions as acceptance evidence;
+- uncontrolled automated backlink spam.
 
-## 10. Product rule
+## 12. Historical-document rule
 
-When product documentation conflicts with a canonical Skill, the Skill is authoritative. Historical plans are retained to preserve decision history, not to override the current operating contract.
+`V1_PRODUCT_PLAN.md`, `V2_PRODUCT_PLAN.md`, `docs/superpowers/`, and `docs/live-runs/` preserve earlier product reasoning. They may describe architectures that have since been replaced.
+
+Do not execute an old plan simply because its document still exists. Compare it to the current Skill and main implementation first; completed/superseded plans remain historical records.

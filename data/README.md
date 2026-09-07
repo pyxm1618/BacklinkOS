@@ -1,32 +1,52 @@
 # Operational Data
 
-This directory contains workflow inputs and machine-generated snapshots. It is not the canonical backlink opportunity database and it does not define product rules.
+This directory contains repository-local workflow inputs and machine-generated snapshots. It is **not** the current business control plane and it does not define product rules.
+
+## Current source-of-truth rule
+
+Current production state lives in Google Sheets `@外链管理总控表`:
+
+- `外链总表` — platform-level fact store;
+- `外链管理` — project opportunity backlog and execution lifecycle.
+
+Repository-local CSV/JSONL snapshots must never override newer Sheet facts or current Skill contracts.
 
 ## `screening-candidates/`
 
-Contains candidate-domain batches consumed by `.github/workflows/screening-crawler.yml`.
+Historical/operational candidate-domain batches consumed by the bulk triage crawler workflow.
 
-`RUN` is an operational workflow trigger. The numbered candidate files are inputs to the bulk triage crawler.
+`RUN` is an operational trigger for that legacy/auxiliary workflow. These files are not the current Project Backlog.
 
 ## `screening-results/`
 
-`latest.jsonl` and `latest.summary.json` are the latest committed **triage snapshots** produced by the crawler workflow.
+`latest.jsonl` and `latest.summary.json` are crawler **triage snapshots**.
 
-They may be large and may contain preliminary `dead`, `paid`, `pending`, or `unverified` classifications. Those machine classifications do not override the final evidence standard in `.agents/skills/screening-backlinks/`.
+Historical buckets such as `dead`, `paid`, `pending`, or `unverified` were created for the older screening workflow. They are useful as observations/debugging evidence, but they are not the default admission logic for the current production pipeline.
 
-`unverified` means "no entry point found", which is missing evidence rather than a rejection. Those candidates must re-enter screening on the next run; only `dead` and `paid` are settled.
+Current rules:
 
-The latest snapshots remain tracked for compatibility with the current workflow. Changing that persistence behavior (for example, moving results entirely to GitHub Actions artifacts or another store) is an operational behavior change and must be handled separately.
+- `unverified` means missing Entry evidence, not rejection;
+- a crawler's inability to close free/Follow facts does not stop a Master `候选` from entering Project Backlog;
+- current execution readiness is established separately by Phase C Live Verification / `VerifiedEntry`;
+- actual free/login/restriction/link-attribute facts come from `backlink-autofill` real execution.
 
 ## `opportunities/`
 
-Produced by `scripts/verify_opportunity.py`.
+Produced by the historical/auxiliary `scripts/verify_opportunity.py` flow.
 
-- `opportunities.csv` — 机器已闭环 免费 + Follow + 可索引 的候选
-- `internal-status.csv` — 全部候选的当前状态，含 `下一步` 列
+Files such as `opportunities.csv` and `internal-status.csv` are legacy machine-evaluation outputs. They are not `外链总表` and are not `外链管理`.
 
-这是**待复核的机器初判**，不是正式外链总表。按 Skill，写入正式总表前仍需人工确认免费档。`internal-status.csv` 里 `下一步` 以 `★` 开头的行是"链接已确认 Follow、只差确认免费档"的高优先候选。
+Do not use an old `正式机会 / 回收 / 付费排除` snapshot as a substitute for the current Master/Project control plane unless the user explicitly asks to investigate the legacy screening dataset.
 
-## Source-of-truth rule
+## Historical-data discipline
 
-For final backlink decisions, use the canonical Skills. Data files record observations/results from a run; they are not instructions.
+Repository data may contain classifications that were correct for an older workflow or date but no longer represent current product semantics.
+
+When repository snapshots conflict with current sources, use this order:
+
+1. current Google Sheets facts;
+2. current `discovering-backlinks` Skill/current references;
+3. current architecture/handoff documentation;
+4. repository-local historical snapshots.
+
+Do not re-run old migrations or rebuild Project Backlog from these snapshots merely because they are committed in Git.

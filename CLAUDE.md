@@ -1,99 +1,157 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with this repository.
 
 ## 项目性质
 
-BacklinkOS 是**Agent Skill 的宿主仓库**加上支撑基础设施。仓库里的 TypeScript / Python 代码是辅助设施，产品业务规范写在 `.agents/skills/*/SKILL.md` 里，靠散文契约 + 回归测试保证。
+BacklinkOS 是 **Agent Skill 宿主仓库 + 外链控制面支撑基础设施**。当前默认生产行为由 `discovering-backlinks` Skill 与其 current references 定义；Python/TypeScript 是实现这些契约的支撑代码。
 
-## 常用命令
+## 当前权威层级
 
-```bash
-npm test           # 编译到 .test-dist 后用 node --test 跑全部 TS 测试，跑完删除产物
-npm run typecheck  # tsc --noEmit（api/ lib/ tests/）
-npm run build      # test + typecheck
+默认生产主链路的权威顺序：
 
-# 跑单个 TS 测试
-npx tsc -p tsconfig.test.json && node --test .test-dist/tests/skill-contracts.test.js
+1. `.agents/skills/discovering-backlinks/SKILL.md` + current `references/`
+2. `docs/REPOSITORY_ARCHITECTURE.md`
+3. `docs/V4_PRODUCT_STRATEGY.md`
+4. `BacklinkOS-HANDOFF.md`
+5. root `README.md`
 
-# Python 回归测试（包含新控制面契约、守卫、爬虫回归测试）
-pytest -v
+`.agents/skills/screening-backlinks/` 是 **Legacy / Optional**。只有用户明确要求旧式 Screening/历史排查时才以其 Skill 与 references 定义该旁路行为；它不能覆盖默认主链路。
 
-# 仅跑新控制面与入口同步测试
-pytest -v tests/test_master_sheet_sync.py
-```
+历史文档：
 
-ESM + `module: NodeNext`，`api/` 和 `lib/` 里的相对 import **必须写 `.js` 后缀**（指向编译产物），`tests/runtime-imports.test.ts` 会在写成 `.ts` 时失败。
+- `docs/V1_PRODUCT_PLAN.md`
+- `docs/V2_PRODUCT_PLAN.md`
+- `docs/superpowers/`
+- `docs/live-runs/`
 
-## 权威层级（改动前先确认自己在哪一层）
+历史文档保留 point-in-time 决策，不定义当前行为。不要从历史“未实现”“待开发”文字推断当前 main 仍缺功能。
 
-1. `.agents/skills/discovering-backlinks/SKILL.md` + `references/`
-2. `.agents/skills/screening-backlinks/SKILL.md` + `references/` *(Legacy / Optional)*
-3. `docs/REPOSITORY_ARCHITECTURE.md`
-4. `docs/V4_PRODUCT_STRATEGY.md`
+Skill 的唯一可编辑源在 `.agents/skills/`；`.claude/skills/` 是 symlink compatibility entry，不要复制成第二套 Skill。
 
-`docs/V1_PRODUCT_PLAN.md`、`docs/V2_PRODUCT_PLAN.md`、`docs/superpowers/`、`docs/live-runs/` 只是历史记录，**不定义当前行为**。
-
-Skill 的唯一可编辑源在 `.agents/skills/`；`.claude/skills/` 下两项是指向它的 symlink，不是第二套 Skill，不要在那边编辑或复制。
-
-## 核心架构与职责分工
-
-当前生产架构中：
+## 当前四阶段架构
 
 ```text
-discovering-backlinks
+PHASE A — Discover / Master Upsert
+referring domains → canonicalize → 【外链总表】
         ↓
-发现真实 referring domains
+PHASE B — Project Backlog Projection
+纯数据库/内存，0 网络
+Master 候选默认进入【外链管理】待提交池
+UNKNOWN != REJECT
         ↓
-canonicalize / 去重
+PHASE C — Bounded Execution Preparation
+从现有待提交池小批量 live verify Entry
+VerifiedEntry → Ready Allowlist
+unresolved → 保持待提交、attempt 不增加
         ↓
-写入或合并【外链总表】（Master Sheet Upsert）
-        ↓
-最低限度 Submission Entry Enrichment (Live Evidence + Policy Guard)
-        ↓
-为明确项目创建【外链管理】待提交行 (Materialization)
-        ↓
-backlink-autofill (独立仓库，真实浏览器执行)
-        ↓
-回写真实平台事实和项目执行结果
+PHASE D — backlink-autofill
+真实浏览器执行 / Final Submit / 状态与事实回写 / Manual Recheck
 ```
 
-### 1. 唯一控制面：`@外链管理总控表`
-- **Tab: `外链总表`**（平台级唯一事实库）：
-  - 基础状态仅有：`候选`、`已排除`、`失效`。
-  - **字段隔离：** Discovery 严格只写发现事实，绝对禁止填写 `实测免费`、`实测需登录`、`实测登录方式`、`实测限制`、`实测链接属性`、`最后验证时间`。这些属于 `backlink-autofill` 真实执行之后的事实。UNKNOWN 必须为空。
-  - **Upsert 保护：** 新域名新增为候选；已有域名不重复创建，不得覆盖已有真实实测字段，**绝不得将`已排除`或`失效`改回`候选`**。
-  - **硬黑名单：** 直接来自总表 `已排除` 或 `失效` 状态，不重复研究，不重新进入项目执行队列。不维护第二套独立黑名单。
+### 核心语义
 
-### 2. 最低限度 Submission Entry Enrichment
-- 对准备进入项目队列的平台确认真实可执行入口（Submit, Add Product, Write for Us, Create Profile 等）。
-- 严格区分两层：
-  - **Live Evidence（真实页面证据）：** 必须实际打开页面确认机制文案/控件（`mechanism_signals`）或首页明确 CTA。**禁止仅凭 URL 路径类似 `/submit` 升级为真入口**。
-  - **登录/注册墙 noindex 防误杀：** 复用 `AUTH_PATH_RE`；登录/注册墙页面带 noindex 是正常现象，只要有机制文案或登录跳转特征，绝不误杀。
-  - **Policy Guard（政策守卫）：** 排除 pricing, terms, privacy, category, seo-report 等页面。
-- 首页绝不能仅凭 URL 冒充入口；无页面 CTA 证据的首页一律拦截。
-- **找不到入口时：提交入口保持为空，基础状态保持为候选。绝对不因找不到入口而淘汰候选！**
+**Project Backlog Population != Execution Readiness。**
 
-### 3. 项目执行行 Materialization
-- 必须运行在明确项目上下文（如 `quick-iching`）下。
-- **历史提交入口强制重新核验：** 总表现存历史 `提交入口` 必须通过现场 Live Verification 生成 `VerifiedEntry`，才能 materialize 为待提交行；未通过现场核验不生成项目行。
-- 仅当满足：`总表基础状态==候选` AND `具备现场核验通过的 VerifiedEntry` AND `当前 project_id + backlink_id 尚不存在` 时，才生成 `待提交` 行。
-- **项目行不重复：** `project_id + backlink_id` 唯一。已存在任何状态均不重复创建或重置。Quick I Ching 已有历史记录必须保护。
-- **存量批次双边界有界：** 存量候选 Hydration 必须显式指定 `project_id`、`target_count` 与 `scan_limit`，满足 `succeeded >= target_count` 或 `processed >= scan_limit` 任一条件即刻停止，绝不因大量失败而无限扫完 3000+。
+- Project Backlog 可以在 Submission Entry 未知时存在；
+- Phase B 禁止要求 `VerifiedEntry`、禁止网络请求；
+- 入口未知、免费未知、登录未知、Follow 未知都属于 UNKNOWN，不阻断 Backlog；
+- 只有明确 Master `已排除/失效` 或已持久化的项目 hard incompatibility 才跳过；
+- 只有 Phase C 进入 Ready 时要求 `VerifiedEntry`；
+- `待提交 != Ready`；Autofill 只消费 Ready allowlist 与当前待提交行的交集。
 
+## 唯一控制面
 
-### 4. `screening-backlinks` 定位
-- 旧的筛选 Skill 已退出主工作流。不要删除其历史文件。
-- 不再作为发现流程的必经节点，不决定域名是否进入新外链总表，不因为离线判断淘汰普通候选。
-- 仅作为 legacy / optional 旁路保留。
+Google Sheets `@外链管理总控表`：
 
-## 支撑模块与助手系统
+### `外链总表`
 
-- `scripts/master_sheet_sync.py`：实现域名规范化、总表 Upsert 合并、Submission Entry 守卫与真实核验、项目待提交行 Materialization 及有界批次 Hydration 核心纯业务契约。
-- `scripts/screening_crawler.py`：包含经过全面测试的锚文本入口匹配、ENTRY_HINTS、COMMON_PATHS、机制检测等基础设施。新 Discovery 复用其入口发现能力。
-- 本仓库不维护生产 Google 凭据；真实 Google Sheet 读写由运行环境的官方 capability 负责，且遵循：精确定位 row → mutation → exact-row read-back 验证。
-- Provider-specific 指标运行时在独立仓库 `pyxm1618/backlink-metrics-api`；自动化执行与表单填写在独立仓库 `pyxm1618/backlink-autofill`。
+- 平台级唯一事实库；
+- `基础状态 = 候选 / 已排除 / 失效`；
+- Discovery 不写 `实测免费 / 实测需登录 / 实测登录方式 / 实测限制 / 实测链接属性 / 最后验证时间`；
+- Master Upsert 不覆盖真实实测字段，不把已排除/失效恢复为候选；
+- Submission Entry 可为空；只有真实 Live Verification 后才写 verified entry。
 
-## 修改 Skill 时的特殊约束
+### `外链管理`
 
-`tests/skill-contracts.test.ts` 用正则直接断言 `SKILL.md` 和 `references/*.md` 的行文内容。改写 Skill 文案时：**先确认是有意的契约变更，再同步更新断言**，不要随手删改断言。
+- 项目机会全集 + 执行生命周期；
+- `project_id + backlink_id` 唯一；
+- 新 Backlog 行默认 `待提交 / 尝试次数=0`；
+- 已有任何状态不得重复创建或重置；
+- 当前生产 Backlog 已完成数千行投影，不要重新执行早期“几十行 → 数千行”迁移计划。
+
+## 当前核心 helper
+
+### `scripts/master_sheet_sync.py`
+
+核心业务逻辑：
+
+- canonical domain；
+- Master Upsert 与事实保护；
+- Project Backlog materialization；
+- Project Compatibility Hard Gate；
+- Submission Entry Policy Guard / Live Verification；
+- bounded execution preparation；
+- Ready cursor / orphan accounting。
+
+注意：该 Python 文件顶部若仍有历史 docstring 描述，不得以旧注释覆盖当前函数实现与 canonical Skill 契约；本轮文档同步仅修改 Markdown 文档，不修改代码文件。
+
+### `scripts/project_backlog_projection.py`
+
+正式 Project Backlog Projection runner：
+
+- dry-run / commit；
+- 0 网络投影；
+- reconciliation invariant；
+- 时间戳备份；
+- 按需 Sheet 扩容；
+- 分批写入；
+- exact read-back；
+- 完整性审计。
+
+### `scripts/prepare_execution_batch.py`
+
+Phase C bounded Ready preparation helper。
+
+### `scripts/screening_crawler.py`
+
+历史/辅助 triage 与 Entry discovery 基础设施。可被当前流程复用底层页面分析能力，但 crawler bucket 不是默认生产最终决策层。
+
+## `backlink-autofill` 边界
+
+独立仓库 `pyxm1618/backlink-autofill` 负责：
+
+- 真实浏览器；
+- 登录/注册/填表；
+- Existing Submission Preflight；
+- anonymous fail-closed；
+- CAPTCHA/Turnstile/2FA/SMS human blockers；
+- Final Submit；
+- 项目状态分类；
+- 结果链接、DOM rel；
+- Manual Post-submit Recheck。
+
+Manual Recheck 不得调用 execution-start、不增加 attempt、不重复 Final Submit。
+
+## 当前验收基线
+
+2026-09-07 closeout：
+
+- BacklinkOS 代码基线（文档同步前）`533272bf8561125a6823ba9570bea42ff433102a`；
+- Python `115 passed`；
+- Node `41 passed`；
+- TypeScript `0 errors`；
+- `backlink-autofill/main = 0d82d921bbcc0e2b7b192b71b24abde1d202fa0f`；
+- 本轮没有为了验收强行跑 10 个真实提交，新增 Final Submit = 0。
+
+真实 Gate B 曾发现 `navtools.ai` 是 AI-only，而非 AI 项目 Quick I Ching 被错误放入 Ready；该 AI-only live verification 漏判已修复并合入 main。未来不可硬编码域名，仍使用通用强证据 + inclusive guard。
+
+## 常用验证命令
+
+```bash
+npm test
+npm run typecheck
+pytest -v
+```
+
+修改 Skill Markdown 时先读 `tests/skill-contracts.test.ts`，避免无意破坏文档契约；若用户明确限定“仅文档”，不要为了让文案看起来一致而修改 Python/TypeScript 实现。

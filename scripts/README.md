@@ -1,62 +1,114 @@
 # Operational Helper Scripts
 
-Scripts in this directory are executable helpers. They do not automatically define BacklinkOS business semantics.
+Scripts in this directory are executable helpers. Current product semantics come from the canonical `discovering-backlinks` contract and the current architecture docs, not from an old helper's historical purpose.
 
-## `screening_crawler.py`
+## Current production helpers
 
-This crawler is currently used by `.github/workflows/screening-crawler.yml` for large-batch **triage**.
+### `master_sheet_sync.py`
 
-It intentionally performs cheap machine checks and emits preliminary buckets. Those buckets are useful for reducing follow-up work, but they are not equivalent to the final decisions required by the canonical `screening-backlinks` Skill.
+Core business transformation/helper module used by the current four-phase flow. It contains capabilities for:
 
-Buckets, and what each one is allowed to mean:
+- canonical domain normalization;
+- Master Upsert/fact protection;
+- Project Backlog materialization;
+- persisted project hard-compatibility checks;
+- Submission Entry Policy Guard and Live Verification;
+- bounded execution preparation;
+- Ready cursor and orphan accounting.
 
-| bucket | 含义 | 会不会再被捞回 |
-|---|---|---|
-| `dead` | 已确认淘汰——404/DNS 死亡/卖链信号/真实入口页 noindex | 不会 |
-| `paid` | 入口出现付费信号且无免费层证据 | 不会 |
-| `pending` | 发现可执行机制，或抓取被阻止——差最后一步证据 | 会 |
-| `unverified` | **没找到入口。这是证据缺失，不是淘汰结论** | 会，下一轮必须重新参与 |
+Important current semantic:
 
-`unverified` 与 `dead` 必须分开。SKILL 硬规则 11 明确「没找到入口 ≠ 回收」，把两者混成一个 `recycle` 桶会让几千条从没被真正筛过的候选看起来像已经淘汰。
+> **Project Backlog does not require `VerifiedEntry`; Ready for Autofill does.**
 
-Important boundary:
+If an old Python module docstring or historical comment conflicts with the current Skill/functions, do not treat the comment as a product contract.
 
-- the crawler may fail to discover a valid current publishing mechanism;
-- a crawler `unverified` result is never sufficient evidence for a final opportunity rejection;
-- final free/reciprocal/paid/uncertain classification, Follow verification, indexability verification, and evidence closure belong to `.agents/skills/screening-backlinks/`.
+### `project_backlog_projection.py`
 
-误杀防护（改动前先读，避免改回去）：
+Production Project Backlog Projection runner.
 
-- **noindex 只认能代表站点的页面。** 盲探 `COMMON_PATHS` 命中的多是 SPA 软 404 或登录墙，它们的 noindex 不能代表站点（`hashnode.com`、`dev.to` 都曾因此被误杀）。
-- **`path:` 前缀的机制信号是探测到真实入口路径时注入的伪信号**，不是文案证据，不能作为 noindex 淘汰的依据。
-- **裸域和 `www` 都要试。** `toolify.ai` 裸域 403 / `www` 200，`medium.com` 相反。
-- **不要用首页文案给子页探测加守卫。** 旧的 `should_probe_common()` 让 99% 的"无机制"判定只看过首页，`softwaretestinghelp.com/add` 这类真实入口因此被漏掉。
+Responsibilities:
 
-一个子页的 noindex 想淘汰整个域名，必须同时满足下面四条。每条都对应实测到的误杀，
-实跑 4180 条时这组守卫把 66 条 noindex 判死收敛到 23 条，救回 43 条：
+- read current Master + Project Sheet rows;
+- pure data/in-memory projection with zero crawler/network requirement for materialization;
+- `UNKNOWN != REJECT`;
+- preserve all existing project states/attempts;
+- reconciliation invariant;
+- dry-run / commit modes;
+- timestamped backup before production append;
+- dynamic row-capacity expansion;
+- batched writes;
+- exact read-back verification;
+- final completeness audit.
 
-1. **不是盲探来的。** SPA 对任意不存在路径返回软 200 + noindex，壳里的文案还可能撞上机制正则——`polymarket.com` 的 `/submit`、`/add`、`/submit-site` 全是这样。
-2. **和站点同源。** `aitools.fyi` 曾被第三方表单站 `tally.so` 的页面判死，`aicloudbase.com` 被另一个域名的页面判死。判同源要按前缀剥 `www.`，**不能用 `lstrip('www.')`**——那是按字符集剥，`wow.com` 会变成 `o.com`。
-3. **不是登录墙、也不是跳转后的落地页。** 登录页 noindex 天经地义；而且跳转参数里写着 `redirectTo=/submit` 恰恰证明投稿机制存在，这种必须留 `pending`（`peerpush.com`、`whatlaunched.today`）。
-4. **路径本身像投稿入口。** 目录站每个页面的导航/页脚都写着 "Submit your tool"，所以页面文案命中机制正则根本说明不了这一页是入口。只看路径才能把 `/submit/`、`/claim-your-tool/` 和 `/category/news/`、`/products`、`/forum` 分开（`kulfiy.com`、`topreviewed.ai`、`promoteproject.com` 都是这样被误杀的，其中 `promoteproject.com` 救回后成了已确认的正式机会）。
+This helper replaced the early architecture where only candidates with a live `VerifiedEntry` could appear in the project sheet.
 
-已知仍会误判的一例：`timothe.ai/tools/pdf-add-link` 是个 PDF 工具页，路径里的 `add-link` 命中了入口词。子页 noindex 判死目前保留在契约里（`test_noindex_on_real_entry_page_is_dead`）；要不要收紧成"只有首页 noindex 才判死"是一次显式的契约变更，不要顺手改。
+### `prepare_execution_batch.py`
 
-入口链接的识别与排序：
+Phase C bounded execution-readiness helper.
 
-- **锚文本必须参与匹配。** 入口常常只在可见文字里表明意图（`<a href="/s/new">Submit a tool</a>`），href 和 title 都看不出来。只匹配 href+title 会整条漏掉这类入口。
-- **强弱两档排序。** `DISCOVERY_HINTS` 太宽（`blog`/`product`/`tool`/`news` 都算），命中的泛导航链接会把候选列表占满，真正的 `/submit` 挤不进 probe 的请求预算。`ENTRY_HINTS` 只收几乎必然是投稿入口的词，排在前面。
-- **`ENTRY_HINTS` 必须带词边界。** `disclaimer` 里含 `claim`——实测没有 `\b` 时，新增命中里有 4/10 是 `/disclaimer`，纯属浪费预算。
-- 每个域名的探测预算由 `--max-probes` 控制（默认 20）。`COMMON_PATHS` 按命中概率排序，靠前的先试。
+It operates on existing project `待提交` rows and is intentionally bounded by Ready target / scan limit. It may live-verify stored entries or discover blank entries.
 
-## `verify_opportunity.py`
+Rules:
 
-把爬虫留下的 `mechanism_needs_link_verification` 候选推过最后一公里：抓一个**用户产出的详情页**，确认最终外链的 `rel`、页面可索引性和免费/付费信号，产出 `data/opportunities/`。
+- only a real `VerifiedEntry` can enter the Ready manifest;
+- unresolved rows remain `待提交` and do not gain attempts;
+- Ready cursor prevents unresolved head rows from starving later rows;
+- orphan joins are reported/skipped rather than blocking the scan;
+- `target_ready_count` / `scan_limit` limit the current preparation run, not total Backlog population.
 
-样例页必须是详情页。首页、分类页、标签页上的外链是站点自己的导航，不能证明"用户提交之后产出的那条链接"是什么 rel——用它们判定会把 `dev.to/t/productivity` 这种聚合页当成证据，得出偏乐观的结论。
+## Auxiliary / legacy triage helpers
 
-它同样不是最终决策引擎：`处理结果=正式机会` 表示机器已闭环 Follow + 可索引 + 免费措辞，仍应按 Skill 复核后才写入正式外链总表。
+### `screening_crawler.py`
 
-The crawler and its regression tests are retained unchanged during repository hygiene cleanup because the GitHub Actions workflow actively depends on them.
+This crawler and `.github/workflows/screening-crawler.yml` are retained as bulk triage/page-analysis infrastructure.
 
-Any future change that makes crawler output authoritative must be treated as a separate behavior change with explicit regression tests and a corresponding Screening Skill update.
+Historical buckets such as `dead`, `paid`, `pending`, and `unverified` are **not the current default production admission model**.
+
+Current boundary:
+
+- Discovery may reuse battle-tested page parsing, anchor discovery, Entry hints, mechanism detection, and related low-level helpers;
+- a crawler result must not become an implicit gate that prevents ordinary Master candidates from entering Project Backlog;
+- `unverified` means missing evidence, never automatic rejection;
+- current runtime free/login/restriction/link-attribute facts belong to `backlink-autofill`;
+- final execution readiness belongs to Phase C `VerifiedEntry` preparation, not to crawler bucket labels.
+
+Historical noindex/soft-404/entry-detection regression knowledge remains valuable when modifying `screening_crawler.py`, including:
+
+- noindex on soft-404/login pages must not automatically kill a domain;
+- probe hints are not equivalent to verified mechanism evidence;
+- bare/www variants may behave differently;
+- anchor text matters for Entry discovery;
+- same-origin and auth-wall callback validation are mandatory;
+- generic contact forms and unrelated pages must not be promoted to Submission Entry.
+
+Do not reintroduce old behavior where failure to find an entry removes a candidate from the current Master/Project opportunity pool.
+
+### `verify_opportunity.py`
+
+Historical/auxiliary verification helper for the older screening/opportunity dataset. Its outputs are not the current Google Sheets control plane and do not override the four-stage production pipeline.
+
+Use it only when explicitly working with the legacy screening dataset/workflow.
+
+## Execution repository boundary
+
+Real browser work is not performed by these BacklinkOS helpers. It belongs to `pyxm1618/backlink-autofill`, including:
+
+- login/account flows;
+- Existing Submission Preflight;
+- form fill;
+- CAPTCHA / Turnstile / 2FA / SMS blockers;
+- Final Submit;
+- project-state classification;
+- result URL / live DOM rel;
+- Manual Post-submit Recheck.
+
+## Modification rule
+
+Before changing a helper, identify which phase it belongs to:
+
+- Phase A: Master discovery/upsert;
+- Phase B: Project Backlog Projection;
+- Phase C: Ready preparation;
+- Phase D: Autofill (separate repo).
+
+Do not blur these boundaries merely because an older helper once combined screening and admission decisions.
