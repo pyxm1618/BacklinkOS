@@ -138,6 +138,19 @@ AI_INCLUSIVE_PATTERNS = [
 ]
 
 
+# 受信任的第三方托管表单服务域名
+TRUSTED_HOSTED_FORM_DOMAINS = {
+    "tally.so",
+    "airtable.com",
+    "forms.gle",
+    "docs.google.com",
+    "typeform.com",
+    "fillout.com",
+    "cognitoforms.com",
+    "jotform.com",
+}
+
+
 def extract_ai_only_signals(text: str) -> list[str]:
     """提取通用 AI-only 强排他证据。
     
@@ -309,6 +322,8 @@ def analyze_html(raw_html, base_url):
 
         ltxt = (href + ' ' + atitle + ' ' + atext).lower()
         is_same_host = (pu.hostname or '').lower() == host
+        visible_cta_text = (atext + ' ' + atitle).strip()
+        is_cta_submit = bool(SUBMISSION_CTA_ANCHOR_RE.search(visible_cta_text)) or any(re.search(x, ltxt, re.I) for x in MECHANISM_PATTERNS)
 
         if is_same_host:
             if any(re.search(x, ltxt, re.I) for x in MECHANISM_PATTERNS) or ENTRY_HINTS.search(ltxt):
@@ -319,7 +334,6 @@ def analyze_html(raw_html, base_url):
                     weak.append(u)
 
             # 结构化 CTA Link 识别：可见文本明确匹配提交流程动词短语
-            visible_cta_text = (atext + ' ' + atitle).strip()
             if SUBMISSION_CTA_ANCHOR_RE.search(visible_cta_text):
                 # 排除指向当前页面本身的自循环链接
                 clean_target = pu.path.rstrip('/') or '/'
@@ -327,6 +341,17 @@ def analyze_html(raw_html, base_url):
                 if clean_target != clean_base or pu.query != parsed_base.query:
                     if not any(item['url'] == u for item in submission_cta_links):
                         submission_cta_links.append({'url': u, 'text': visible_cta_text[:100]})
+        else:
+            # 跨域链接：只有当目标域名属于受信任第三方托管表单且页面存在明确提交 CTA 关联时才保留为 candidate
+            tgt_host = (pu.hostname or '').lower()
+            if tgt_host.startswith("www."):
+                tgt_host = tgt_host[4:]
+            is_trusted_hosted = any(tgt_host == d or tgt_host.endswith('.' + d) for d in TRUSTED_HOSTED_FORM_DOMAINS)
+            if is_trusted_hosted and is_cta_submit:
+                if u not in strong:
+                    strong.append(u)
+                if not any(item['url'] == u for item in submission_cta_links):
+                    submission_cta_links.append({'url': u, 'text': visible_cta_text[:100]})
 
         if pu.hostname and pu.hostname.lower() != host:
             tokens = set((rel or '').lower().split())
@@ -386,11 +411,6 @@ def analyze_html(raw_html, base_url):
                 GP_SUBMIT_INTENT_RE.search(form_text)
             )
         )
-
-        # 排除包含密码的登录/注册表单
-        has_password = any(c.get('type') == 'password' or 'password' in (c.get('name') or '').lower() for c in controls)
-        if has_password:
-            continue
 
         # 提取字段特征
         resource_fields_found = []
@@ -478,6 +498,22 @@ def analyze_html(raw_html, base_url):
         # P0-A 核心防守 4：如果表单没有任何 resource/gp 字段，或者全是 search 控件，绝对不是 actionable form
         if is_pure_search or not (resource_fields_found or gp_fields_found):
             continue
+
+        # 区分 Pure login/auth form vs Signup + submission combo form
+        # 纯登录 (Pure login/auth form, 如仅 email/user + password + Login) 坚决排除；
+        # 组合表单 (具备 password 但同时具备 resource_fields 且具备明确提交意图) 予以识别为候选
+        has_password = any(c.get('type') == 'password' or 'password' in (c.get('name') or '').lower() for c in controls)
+        if has_password:
+            has_submit_intent = bool(submit_buttons or gp_submit_buttons)
+            has_intent_text = bool(
+                DIRECTORY_SUBMIT_INTENT_RE.search(form_text) or
+                GP_SUBMIT_INTENT_RE.search(form_text) or
+                DIRECTORY_SUBMIT_INTENT_RE.search(page_path) or
+                GP_SUBMIT_INTENT_RE.search(page_path)
+            )
+            is_combo_form = bool(resource_fields_found or gp_fields_found) and (has_submit_intent or has_intent_text)
+            if not is_combo_form:
+                continue
 
         # 检查是否为纯订阅 newsletter 表单 (仅 email + subscribe)
         if has_email and not resource_fields_found and not gp_fields_found and not has_message:

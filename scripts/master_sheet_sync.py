@@ -430,6 +430,55 @@ def evaluate_page_for_actionable_entry(
                 evidence_summary=auth_reason,
                 ai_only=bool(page_res.get("ai_only_signals")),
             ), "现场核验通过 (认证墙回调证据)"
+        elif not is_discovered_candidate and fetcher:
+            # 最小正确方案：当 persisted entry 跳到 auth wall 且 verifier 缺少来源证据
+            # 则重新验证来源关系：检查 Homepage 是否存在明确指向当前 entry 的 Submit/Add/List CTA
+            # 且 auth callback 仍指向合法提交路径
+            req_parsed = urlparse(req_url)
+            req_path = (req_parsed.path or "/").rstrip("/") or "/"
+            reverified_entry: VerifiedEntry | None = None
+            reverified_reason: str = ""
+
+            for scheme in ("https", "http"):
+                home_res = fetcher(f"{scheme}://{cd}/")
+                if home_res and home_res.get("status") == 200:
+                    cta_links = home_res.get("submission_cta_links") or []
+                    for cta in cta_links:
+                        cta_u = cta.get("url") or ""
+                        cta_parsed = urlparse(cta_u)
+                        cta_host = (cta_parsed.hostname or "").lower()
+                        if cta_host.startswith("www."):
+                            cta_host = cta_host[4:]
+                        cta_path = (cta_parsed.path or "/").rstrip("/") or "/"
+
+                        if (not cta_host or cta_host == cd) and cta_path == req_path:
+                            # 首页证实存在明确指向当前 entry 的提交 CTA
+                            cb_ok, cb_reason = check_auth_wall_callback_evidence(
+                                req_url=req_url,
+                                final_url=final_url,
+                                domain=cd,
+                                is_discovered_candidate=True,
+                            )
+                            if cb_ok:
+                                summary = f"通过首页明确 CTA ('{cta.get('text', 'CTA')}') 重新建立来源证据 -> {cb_reason}"
+                                reverified_entry = VerifiedEntry(
+                                    url=req_url,
+                                    domain=cd,
+                                    evidence_type="auth_wall_submission",
+                                    evidence_summary=summary,
+                                    ai_only=bool(page_res.get("ai_only_signals") or home_res.get("ai_only_signals")),
+                                )
+                                reverified_reason = "现场核验通过 (通过首页CTA重新建立认证墙来源证据)"
+                                break
+                            else:
+                                auth_reason = cb_reason
+                                break
+                    if reverified_entry:
+                        break
+
+            if reverified_entry:
+                return reverified_entry, reverified_reason
+            return None, auth_reason
         else:
             return None, auth_reason
 
@@ -625,6 +674,10 @@ def discover_and_verify_entry(
 
     base_url = home.get("final_url") or f"https://{cd}/"
     candidate_urls = list(home.get("candidate_urls") or [])
+    for cta in home.get("submission_cta_links") or []:
+        u = cta.get("url")
+        if u and u not in candidate_urls:
+            candidate_urls.append(u)
     
     # 将 COMMON_PATHS 与 candidate_urls 合并，优先试探 candidate_urls，再试探常见路径
     probe_targets: list[str] = []
