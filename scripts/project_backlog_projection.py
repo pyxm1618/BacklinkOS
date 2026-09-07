@@ -235,11 +235,22 @@ def run_projection(
         for item in stats["incompatible_details"]:
             print(f"  - 域名: {item['domain']}, 证据: '{item['evidence']}', 原因: {item['reason']}")
 
-    # Sanity check
-    if stats["would_create_count"] < 100:
+    # 完整性对账校验（Reconciliation Invariant）
+    # 候选总数必须能够通过：已有完全保护 + 已证实硬不兼容 + 本轮将新建 100% 对账
+    candidate_count = stats.get("candidate_count", 0)
+    reconciled_sum = (
+        stats.get("duplicate_preserved_count", 0)
+        + stats.get("proven_project_incompatible_count", 0)
+        + stats.get("would_create_count", 0)
+    )
+    if candidate_count != reconciled_sum:
+        diff = candidate_count - reconciled_sum
         raise RuntimeError(
-            f"Projection 异常拦截：would_create_count={stats['would_create_count']} 远低于合理预期（千级）！"
-            f"请检查是否错误复用了 Entry Verification 过滤。"
+            f"Projection 数据完整性对账失败：Master 候选总数={candidate_count} "
+            f"!= 已有保护({stats.get('duplicate_preserved_count', 0)}) "
+            f"+ 证实不兼容({stats.get('proven_project_incompatible_count', 0)}) "
+            f"+ 本轮新增({stats.get('would_create_count', 0)}) = {reconciled_sum}，"
+            f"存在未解释缺口 {diff} 条！"
         )
 
     if not commit:
