@@ -728,6 +728,148 @@ class ActionableEntryAndCompatibilityTests(unittest.TestCase):
             )
             self.assertFalse(incompat, f"包含 AI or SaaS 的平台绝不能误杀非 AI 项目: {text}")
 
+    def test_p0_c_ai_only_composite_evidence_and_navtools_case(self):
+        """测试用户确认的 Gate B Blocker：AI-only 组合强证据识别与包容性守卫。
+        
+        覆盖：
+        1. NavTools 真实等价结构：Submit AI Tool + Your AI Tool Name + We accept all types of AI-powered tools -> ai_only=True
+        2. 包容性声明：Submit your AI or SaaS tool -> ai_only=False
+        3. 通用提交表单 + 页面偶现 AI -> ai_only=False
+        4. AI 目录普通浏览页无 submission eligibility -> ai_only=False
+        5. prepare_execution_batch 下对 ai_powered=False (如 Quick I Ching) 拦截 vs ai_powered=True 放行
+        """
+        from screening_crawler import extract_ai_only_signals, analyze_html
+        from master_sheet_sync import VerifiedEntry, prepare_execution_batch
+
+        # 1. NavTools 等价真实 HTML
+        navtools_html = """
+        <html>
+        <head><title>Submit Your AI Tool - Free Listing - NavTools AI</title></head>
+        <body>
+          <h1>Get Your AI Tool Discovered</h1>
+          <form action="/submit" method="POST">
+            <label for="toolName">Your AI Tool Name</label>
+            <input id="toolName" name="toolName" placeholder="Your AI Tool Name">
+            <input id="websiteUrl" name="websiteUrl" placeholder="https://your-tool-website.com">
+            <input id="email" name="email" placeholder="your@email.com">
+            <button type="submit">Submit AI Tool</button>
+          </form>
+          <div class="faq">
+            <h3>What types of AI tools do you accept?</h3>
+            <p>We accept all types of AI-powered tools and services that provide genuine value to users.</p>
+          </div>
+        </body>
+        </html>
+        """
+        analysis_nav = analyze_html(navtools_html, "https://navtools.ai/submit")
+        self.assertTrue(len(analysis_nav["ai_only_signals"]) > 0, "NavTools 真实等价结构必须识别出 ai_only 强排他信号")
+
+        # 2. 包容性：Submit your AI or SaaS tool
+        inclusive_html = """
+        <html>
+        <head><title>Submit Your Tool - Inclusive Directory</title></head>
+        <body>
+          <h1>Submit your AI or SaaS tool</h1>
+          <p>We accept all types of AI-powered tools and services, as well as traditional SaaS software.</p>
+          <form action="/submit" method="POST">
+            <input name="name" placeholder="Tool Name">
+            <input name="website" placeholder="Website URL">
+            <button type="submit">Submit Tool</button>
+          </form>
+        </body>
+        </html>
+        """
+        analysis_inc = analyze_html(inclusive_html, "https://example.com/submit")
+        self.assertEqual(len(analysis_inc["ai_only_signals"]), 0, "包含 AI or SaaS 等包容性声明绝不得标 ai_only")
+
+        # 3. 通用目录表单 + 页面偶尔出现 AI 单词
+        casual_ai_html = """
+        <html>
+        <head><title>Web Directory - Add Listing</title></head>
+        <body>
+          <h1>Submit Your Website</h1>
+          <p>Welcome to our tech catalog. Explore modern technologies including cloud, web, and AI articles.</p>
+          <form action="/submit" method="POST">
+            <input name="site_title" placeholder="Website Title">
+            <input name="site_url" placeholder="https://example.com">
+            <button type="submit">Submit Site</button>
+          </form>
+        </body>
+        </html>
+        """
+        analysis_casual = analyze_html(casual_ai_html, "https://example.com/submit")
+        self.assertEqual(len(analysis_casual["ai_only_signals"]), 0, "通用表单偶现 AI 营销文案绝不得标 ai_only")
+
+        # 4. AI 目录普通浏览页无 submission eligibility
+        browse_ai_html = """
+        <html>
+        <head><title>Best AI Tools Directory 2026</title></head>
+        <body>
+          <h1>Top AI Tools Directory</h1>
+          <p>Browse the best artificial intelligence tools, chatbots, and generators.</p>
+          <div><a href="/tools/tool-1">Tool 1</a></div>
+          <div><a href="/tools/tool-2">Tool 2</a></div>
+        </body>
+        </html>
+        """
+        analysis_browse = analyze_html(browse_ai_html, "https://example.com/browse")
+        self.assertEqual(len(analysis_browse["ai_only_signals"]), 0, "普通浏览页无提交流程绝不得标 ai_only")
+
+        # 5. prepare_execution_batch 集成验证
+        master_rows = [{
+            "_sheet_row_num": 10,
+            "外链ID": "navtools.ai",
+            "平台域名": "navtools.ai",
+            "提交入口": "https://navtools.ai/submit",
+            "基础状态": "候选",
+        }]
+        project_rows = [{
+            "_sheet_row_num": 20,
+            "项目ID": "quick-iching",
+            "外链ID": "navtools.ai",
+            "外链域名": "navtools.ai",
+            "状态": "待提交",
+            "尝试次数": "0",
+            "目标URL": "https://quickiching.com/",
+        }]
+
+        # Mock verifier 返回包含 ai_only=True 的 VerifiedEntry
+        mock_verified = VerifiedEntry(
+            url="https://navtools.ai/submit",
+            domain="navtools.ai",
+            evidence_type="actionable_form",
+            evidence_summary="AI tool form",
+            ai_only=True,
+        )
+
+        # 5a: Quick I Ching (ai_powered=False) -> 必须被排除，不进入 Ready
+        res_non_ai = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=1,
+            scan_limit=5,
+            project_context={"ai_powered": False},
+            entry_verifier=lambda d, u: (mock_verified, "OK"),
+            use_cursor=False,
+        )
+        self.assertEqual(len(res_non_ai["ready_rows"]), 0, "非 AI 项目 (Quick I Ching) 遇到 AI-only 平台绝不能进入 Ready")
+        self.assertEqual(res_non_ai["skipped_incompatible"], 1, "必须计入 skipped_incompatible 统计")
+
+        # 5b: AI 项目 (ai_powered=True) -> 必须可正常进入 Ready
+        res_ai = prepare_execution_batch(
+            master_rows=master_rows,
+            project_rows=project_rows,
+            project_id="quick-iching",
+            target_ready_count=1,
+            scan_limit=5,
+            project_context={"ai_powered": True},
+            entry_verifier=lambda d, u: (mock_verified, "OK"),
+            use_cursor=False,
+        )
+        self.assertEqual(len(res_ai["ready_rows"]), 1, "AI 项目遇到 AI-only 平台必须正常进入 Ready")
+        self.assertEqual(res_ai["ready_rows"][0]["verified_entry"].domain, "navtools.ai")
+
 
 if __name__ == "__main__":
     unittest.main()
