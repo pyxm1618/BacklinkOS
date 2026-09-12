@@ -9,7 +9,26 @@ BacklinkOS 拥有两个 Agent Skills：
 
 它维护的是**通用外链机会库**，不负责判断某条外链是否与某个具体网站主题相关，也不做 Project × Opportunity 匹配。
 
-## 怎么调用
+## 正式使用入口 (Formal Submission Workflow)
+
+在配置好浏览器与 Google Sheets 权限的 AI 环境中，打开新会话直接输入：
+
+```text
+按本项目正式流程，为 quick-iching 提交外链，本轮目标新增成功提交 200 个。
+```
+
+AI 将自动识别正式入口，闭环完成：
+**读取候选快照 → 自动有界准备 (Phase C) → 分批提交 (Phase D) → 记录与回读 → 跨项目排除同步 → 继续下一批**，直到达到目标或候选耗尽。
+不要求手动提供 Ready 清单或运行脚本。
+
+正式提交流程支撑命令：
+```bash
+python3 scripts/run_submission_cycle.py --project-id quick-iching --target-success 200
+```
+
+👉 完整正式流程与规范详见：**[docs/FORMAL_SUBMISSION_WORKFLOW.md](docs/FORMAL_SUBMISSION_WORKFLOW.md)**
+
+## 怎么调用 Skills（单独调试）
 
 前提：你的 Agent / IDE 已经安装或加载了本仓库的 Skills。
 

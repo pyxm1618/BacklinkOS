@@ -12,15 +12,80 @@
 5. Bounded Batch Hydration: 严格双边界（target_count + scan_limit），对总表现有入口同样强制 live verification，未验证通过不 materialize。
 """
 
+import concurrent.futures
 import datetime
 import json
 import os
 import re
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
+
+
+class DaemonProbeExecutor:
+    """具备守护线程属性、任务取消令牌与并发上限的探测执行器 (F5)。"""
+    _semaphore = threading.BoundedSemaphore(4)  # 限制最多 4 个活跃探测线程，杜绝连续超时堆积
+
+    @classmethod
+    def execute(
+        cls,
+        func: Callable[[], Any],
+        timeout: float,
+        deadline: float | None = None,
+    ) -> tuple[bool, Any, bool]:
+        """在守护线程中执行 func。
+        返回: (is_success, result_or_exc, is_timeout)
+        """
+        now = time.time()
+        wall_remaining = (deadline - now) if deadline is not None else timeout
+        effective_timeout = max(0.001, min(timeout, wall_remaining))
+        if effective_timeout <= 0.001 and wall_remaining <= 0:
+            return False, "SITE_PROBE_TIMEOUT (deadline exceeded)", True
+
+        token = {"canceled": False}
+        result_box: list[tuple[str, Any]] = []
+        done_event = threading.Event()
+
+        acquired = cls._semaphore.acquire(blocking=False)
+        if not acquired:
+            acquired = cls._semaphore.acquire(blocking=True, timeout=min(0.2, effective_timeout))
+            if not acquired:
+                return False, "SITE_PROBE_TIMEOUT (worker concurrency saturated)", True
+
+        def _worker():
+            try:
+                res = func()
+                if not token["canceled"]:
+                    result_box.append(("ok", res))
+            except Exception as exc:
+                if not token["canceled"]:
+                    result_box.append(("err", exc))
+            finally:
+                cls._semaphore.release()
+                done_event.set()
+
+        # 启动守护线程 (daemon=True)，进程退出时绝不被 join 拖住卡死
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        completed = done_event.wait(timeout=effective_timeout)
+        if not completed:
+            token["canceled"] = True  # 标记取消，迟到响应绝不更新状态或返回
+            return False, "SITE_PROBE_TIMEOUT (wall-clock deadline exceeded)", True
+
+        if not result_box:
+            token["canceled"] = True
+            return False, "UNKNOWN_WORKER_ERROR", False
+
+        status, val = result_box[0]
+        if status == "ok":
+            return True, val, False
+        else:
+            return False, val, False
 
 DEFAULT_BACKLINKOS_RUNTIME_DIR = os.path.expanduser("~/.backlinkos/runtime")
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -234,11 +299,35 @@ def canonical_domain(raw: str) -> str:
     return d.rstrip(".")
 
 
+def normalize_canonical_url(url: str) -> str:
+    """规范化 URL 便于比对：去除前后空格、协议差异、末尾斜杠及 www 前缀。"""
+    if not url or not isinstance(url, str):
+        return ""
+    u = url.strip()
+    if not u:
+        return ""
+    try:
+        parsed = urlparse(u if "://" in u else f"https://{u}")
+        netloc = (parsed.hostname or parsed.netloc or "").strip().lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+        path = parsed.path.rstrip("/")
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"{netloc}{port_str}{path}{query}"
+    except Exception:
+        return u.lower().rstrip("/")
+
+
 # ==========================================
 # 3. Submission Entry Policy Guard
 # ==========================================
 
-def submission_entry_policy_guard(url: str, domain: str = "") -> tuple[bool, str]:
+def submission_entry_policy_guard(
+    url: str,
+    domain: str = "",
+    negated_entries: set[str] | list[str] | None = None,
+) -> tuple[bool, str]:
     """对候选提交入口 URL 进行政策和语法层面的守卫检查（Guard）。
     
     注意：Guard 仅负责拦截明显错误的 URL，不能单独凭 Guard 宣称 URL 是真实验证的入口。
@@ -277,6 +366,14 @@ def submission_entry_policy_guard(url: str, domain: str = "") -> tuple[bool, str
         q = (parsed.query or "").lower()
         if not re.search(r'\b(submit|add|listing|new|action=)\b', q):
             return False, f"命中私有控制台排除规则（无提交意图参数）: {path}"
+
+    # 检查是否命中已否定入口 (negated entries guard)
+    if negated_entries:
+        norm_u = u.rstrip("/")
+        for neg in negated_entries:
+            norm_neg = str(neg).strip().rstrip("/")
+            if norm_neg and (norm_u == norm_neg or norm_u.startswith(norm_neg + "/") or norm_u.startswith(norm_neg + "?")):
+                return False, f"命中已否定入口（历史已核实非公开提交流程）: {norm_neg}"
 
     return True, "通过 Policy Guard"
 
@@ -535,39 +632,85 @@ def evaluate_page_for_actionable_entry(
     return None, "页面虽返回 200 但未检测到真实可操作提交表单（Actionable Form）或有效认证墙（拒绝正文文字臆想）"
 
 
+def extract_negated_entries_from_row(master_row: dict[str, Any]) -> set[str]:
+    """从总表行的平台备注与基础排除原因中提取已否定的入口 URL 集合。"""
+    res = set()
+    text = f"{master_row.get('平台备注', '')} {master_row.get('基础排除原因', '')}"
+    for match in re.finditer(r'(?:否定入口|已否定入口|negated_entry|错误入口)\s*[:：]\s*(https?://[^\s,;，；\)]+)', text, re.I):
+        u = match.group(1).strip().rstrip("/")
+        if u:
+            res.add(u)
+    return res
+
+
+
 def verify_submission_entry(
     domain: str,
     entry_url: str,
     fetcher: Callable[[str], dict] | None = None,
     is_discovered_candidate: bool = False,
+    negated_entries: set[str] | list[str] | None = None,
+    site_timeout_budget: float = 15.0,
 ) -> tuple[VerifiedEntry | None, str]:
-    """对已有（例如历史存量或指定）的 entry_url 进行现场真实页面证据核验（Live Verification）。
-    
-    契约规则：
-    1. 必须先通过 Policy Guard；
-    2. 现场打开页面：
-       - 检查 final_url 是否依然通过 Policy Guard；
-       - 若是首页：若有内嵌表单，以首页为准；若有明确提交 CTA，必须跟随打开子页面核验；
-       - 若是子页面：必须包含真实 Actionable Form、合法 Auth Wall 回调，或跟随 CTA 到达真实表单；
-       - 严禁正文 mechanism_signals 单独升级！
-    3. 验证成功返回 (VerifiedEntry, 成功说明)；
-    4. 验证失败返回 (None, 失败理由)。
-    """
+    """对已有（例如历史存量或指定）的 entry_url 进行现场真实页面证据核验（Live Verification）。"""
     cd = canonical_domain(domain)
     if not cd:
         return None, "域名无效"
-        
-    allowed, guard_reason = submission_entry_policy_guard(entry_url, domain=cd)
+
+    t0 = time.time()
+    deadline = t0 + site_timeout_budget
+    _raw_fetch = fetcher or fetch_page
+    neg_set = {str(x).strip().rstrip("/") for x in (negated_entries or []) if str(x).strip()}
+
+    clean_entry = str(entry_url).strip().rstrip("/")
+    if clean_entry in neg_set or any(clean_entry == n or clean_entry.startswith(n + "/") for n in neg_set):
+        return None, f"未通过 Policy Guard: 命中已否定入口 ({clean_entry})"
+
+    allowed, guard_reason = submission_entry_policy_guard(entry_url, domain=cd, negated_entries=neg_set)
     if not allowed:
         return None, f"未通过 Policy Guard: {guard_reason}"
-        
-    _fetch = fetcher or fetch_page
-    res = _fetch(entry_url)
+
+    def _budgeted_fetch(url: str, timeout: float | None = None) -> dict:
+        now = time.time()
+        remaining = deadline - now
+        if remaining <= 0:
+            return {"status": 0, "error": "SITE_PROBE_TIMEOUT", "timeout": True}
+        call_timeout = min(timeout if timeout is not None else 5.0, remaining)
+
+        def _do_call():
+            try:
+                return _raw_fetch(url, timeout=call_timeout, deadline=deadline)
+            except TypeError:
+                try:
+                    return _raw_fetch(url, timeout=call_timeout)
+                except TypeError:
+                    return _raw_fetch(url)
+
+        is_succ, res_or_err, is_to = DaemonProbeExecutor.execute(
+            func=_do_call,
+            timeout=call_timeout,
+            deadline=deadline,
+        )
+        if is_to:
+            return {"status": 0, "error": str(res_or_err), "timeout": True}
+        if not is_succ:
+            err_str = str(res_or_err).lower()
+            to_kw = "timed out" in err_str or "timeout" in err_str or (time.time() - t0) >= site_timeout_budget
+            return {"status": 0, "error": str(res_or_err), "timeout": to_kw}
+        return res_or_err
+
+    _fetch = _budgeted_fetch
+    res = _budgeted_fetch(entry_url)
+    if res.get("timeout") or (time.time() - t0) >= site_timeout_budget:
+        return None, "已有入口核验超时，保留为未知/候选"
     if res.get("status") != 200:
         return None, f"页面不可达 (HTTP {res.get('status', 0)})"
-        
+
     final_url = res.get("final_url") or entry_url
-    allowed_final, final_guard_reason = submission_entry_policy_guard(final_url, domain=cd)
+    clean_final = str(final_url).strip().rstrip("/")
+    if clean_final in neg_set or any(clean_final == n or clean_final.startswith(n + "/") for n in neg_set):
+        return None, f"最终跳转 URL 命中已否定入口: {clean_final}"
+    allowed_final, final_guard_reason = submission_entry_policy_guard(final_url, domain=cd, negated_entries=neg_set)
     if not allowed_final:
         return None, f"最终跳转 URL 未通过 Policy Guard: {final_guard_reason}"
 
@@ -595,14 +738,14 @@ def verify_submission_entry(
             tgt_text = cta.get("text") or "CTA"
             if not tgt_url:
                 continue
-            allowed_tgt, _ = submission_entry_policy_guard(tgt_url, domain=cd)
+            allowed_tgt, _ = submission_entry_policy_guard(tgt_url, domain=cd, negated_entries=negated_entries)
             if not allowed_tgt:
                 continue
             tgt_res = _fetch(tgt_url)
             if tgt_res.get("status") != 200:
                 continue
             tgt_final = tgt_res.get("final_url") or tgt_url
-            allowed_tgt_final, _ = submission_entry_policy_guard(tgt_final, domain=cd)
+            allowed_tgt_final, _ = submission_entry_policy_guard(tgt_final, domain=cd, negated_entries=negated_entries)
             if not allowed_tgt_final:
                 continue
             sub_verified, sub_reason = evaluate_page_for_actionable_entry(
@@ -656,31 +799,84 @@ def discover_and_verify_entry(
     domain: str,
     fetcher: Callable[[str], dict] | None = None,
     max_probes: int = 15,
+    site_timeout_budget: float = 15.0,
+    negated_entries: set[str] | list[str] | None = None,
 ) -> tuple[VerifiedEntry | None, str]:
-    """使用已有经过测试的爬虫机制，对指定域名进行真实页面探测，寻找最低限度提交入口。"""
+    """使用已有经过测试的爬虫机制，对指定域名进行真实页面探测，寻找最低限度提交入口。
+    
+    硬约束：
+    1. site_timeout_budget 真正约束整站整条链路的所有网络请求（主页、www、子路径、跳转等）；
+    2. 剩余预算耗尽时立即终止探测，返回超时（未知/候选），绝不无限阻塞；
+    3. 支持 negated_entries 守卫，防止重复将已否定入口选为 Ready。
+    """
     cd = canonical_domain(domain)
     if not cd:
         return None, "域名无效"
         
-    _fetch = fetcher or fetch_page
-    
+    t0 = time.time()
+    deadline = t0 + site_timeout_budget
+    _raw_fetch = fetcher or fetch_page
+    neg_set = {str(x).strip().rstrip("/") for x in (negated_entries or []) if str(x).strip()}
+
+    def _budgeted_fetch(url: str, timeout: float | None = None) -> dict:
+        now = time.time()
+        remaining = deadline - now
+        if remaining <= 0:
+            return {"status": 0, "error": "SITE_PROBE_TIMEOUT", "timeout": True}
+        call_timeout = min(timeout if timeout is not None else 5.0, remaining)
+
+        def _do_call():
+            try:
+                return _raw_fetch(url, timeout=call_timeout, deadline=deadline)
+            except TypeError:
+                try:
+                    return _raw_fetch(url, timeout=call_timeout)
+                except TypeError:
+                    return _raw_fetch(url)
+
+        is_succ, res_or_err, is_to = DaemonProbeExecutor.execute(
+            func=_do_call,
+            timeout=call_timeout,
+            deadline=deadline,
+        )
+        if is_to:
+            return {"status": 0, "error": str(res_or_err), "timeout": True}
+        if not is_succ:
+            err_str = str(res_or_err).lower()
+            to_kw = "timed out" in err_str or "timeout" in err_str or (time.time() - t0) >= site_timeout_budget
+            return {"status": 0, "error": str(res_or_err), "timeout": to_kw}
+        return res_or_err
+
     # 尝试 https 和 http 首页
     home = None
+    had_timeout = False
     for scheme in ("https", "http"):
-        res = _fetch(f"{scheme}://{cd}/")
+        if (time.time() - t0) >= site_timeout_budget:
+            return None, "站点整条探测超时 (主页探测前预算耗尽)，保留为未知/候选"
+        res = _budgeted_fetch(f"{scheme}://{cd}/")
+        if res.get("timeout"):
+            had_timeout = True
+            break
         if res.get("status") == 200:
             home = res
             break
             
-    if not home or home.get("status") != 200:
+    if not home and not had_timeout:
         # 尝试 www
         for scheme in ("https", "http"):
-            res = _fetch(f"{scheme}://www.{cd}/")
+            if (time.time() - t0) >= site_timeout_budget:
+                return None, "站点整条探测超时 (www 主页探测前预算耗尽)，保留为未知/候选"
+            res = _budgeted_fetch(f"{scheme}://www.{cd}/")
+            if res.get("timeout"):
+                had_timeout = True
+                break
             if res.get("status") == 200:
                 home = res
                 break
                 
     if not home or home.get("status") != 200:
+        if had_timeout or (time.time() - t0) >= site_timeout_budget:
+            return None, "站点整条探测超时 (主页连接超时)，保留为未知/候选"
         return None, f"站点首页不可达 (HTTP {home.get('status') if home else 0})"
 
     base_url = home.get("final_url") or f"https://{cd}/"
@@ -705,16 +901,25 @@ def discover_and_verify_entry(
     
     # 逐个探测子页面
     for target_url in probe_targets:
-        allowed, guard_reason = submission_entry_policy_guard(target_url, domain=cd)
-        if not allowed:
+        if (time.time() - t0) >= site_timeout_budget:
+            return None, "站点整条探测超时 (子页面探测预算耗尽)，保留为未知/候选"
+            
+        clean_target = str(target_url).strip().rstrip("/")
+        if clean_target in neg_set or any(clean_target == n or clean_target.startswith(n + "/") for n in neg_set):
             continue
             
-        page_res = _fetch(target_url)
+        allowed_target, _ = submission_entry_policy_guard(target_url, domain=cd, negated_entries=neg_set)
+        if not allowed_target:
+            continue
+
+        page_res = _budgeted_fetch(target_url)
+        if page_res.get("timeout") or (time.time() - t0) >= site_timeout_budget:
+            return None, "站点整条探测超时 (子页面请求超时)，保留为未知/候选"
         if page_res.get("status") != 200:
             continue
             
         final_url = page_res.get("final_url") or target_url
-        allowed_final, _ = submission_entry_policy_guard(final_url, domain=cd)
+        allowed_final, _ = submission_entry_policy_guard(final_url, domain=cd, negated_entries=neg_set)
         if not allowed_final:
             continue
 
@@ -723,11 +928,16 @@ def discover_and_verify_entry(
             page_res=page_res,
             req_url=target_url,
             domain=cd,
-            fetcher=_fetch,
+            fetcher=_budgeted_fetch,
             is_discovered_candidate=is_from_candidate_list,
             allow_cta_follow=True,
         )
         if sub_verified:
+            # 守卫：若命中了已否定入口，拒绝该入口继续探测后续
+            u_clean = str(sub_verified.url).strip().rstrip("/")
+            if u_clean in neg_set or any(u_clean == n or u_clean.startswith(n + "/") for n in neg_set):
+                continue
+
             # 继承主页的 ai_only_signals
             if home and home.get("ai_only_signals") and not sub_verified.ai_only:
                 sub_verified = VerifiedEntry(
@@ -742,15 +952,20 @@ def discover_and_verify_entry(
 
     # 首页检查
     if home.get("actionable_forms"):
-        top_form = home["actionable_forms"][0]
-        return VerifiedEntry(
-            url=base_url,
-            domain=cd,
-            evidence_type="homepage_actionable",
-            evidence_summary=f"首页内嵌真实表单: {top_form['form_type']} (字段: {top_form['resource_fields']})",
-            form_details=top_form,
-            ai_only=bool(home.get("ai_only_signals")),
-        ), "通过首页真实表单闭环入口"
+        u_clean = str(base_url).strip().rstrip("/")
+        if u_clean not in neg_set and not any(u_clean == n or u_clean.startswith(n + "/") for n in neg_set):
+            top_form = home["actionable_forms"][0]
+            return VerifiedEntry(
+                url=base_url,
+                domain=cd,
+                evidence_type="homepage_actionable",
+                evidence_summary=f"首页内嵌真实表单: {top_form['form_type']} (字段: {top_form['resource_fields']})",
+                form_details=top_form,
+                ai_only=bool(home.get("ai_only_signals")),
+            ), "通过首页真实表单闭环入口"
+
+    if (time.time() - t0) >= site_timeout_budget:
+        return None, "站点整条探测超时 (探测耗尽预算)，保留为未知/候选"
 
     return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA，保持候选状态）"
 
@@ -867,9 +1082,149 @@ def upsert_master_rows(
 # ==========================================
 
 
+def load_project_profile_facts(project_id: str) -> dict[str, Any]:
+    """读取项目 profile 权威事实配置，缺失或证据不足时保持未知 (None)，绝不盲目猜测。
+
+    规则约束：
+    1. 项目属性未知不能默认成否定。
+    2. “没有付费预算配置”不能自动推断 accepts_paid=False。
+    3. “禁止声称 AI-powered”也不能单独证明 ai_powered=False。
+    4. 优先读取现有权威配置；缺失或证据不足时保持未知。只根据明确项目属性和政策进行排除。
+    """
+    proj = str(project_id or "").strip()
+    if not proj:
+        return {}
+
+    candidate_paths: list[Path] = []
+    custom_dir = os.environ.get("BACKLINK_PROJECTS_DIR")
+    if custom_dir:
+        candidate_paths.append(Path(custom_dir) / f"{proj}.json")
+        candidate_paths.append(Path(custom_dir) / f"{proj}.md")
+
+    base_proj_dir = Path(__file__).resolve().parent.parent
+    candidate_paths.append(base_proj_dir / "projects" / f"{proj}.json")
+    candidate_paths.append(base_proj_dir / "projects" / f"{proj}.md")
+    candidate_paths.append(base_proj_dir.parent / "backlink-autofill" / "plugins" / "backlink-autofill" / "references" / "projects" / f"{proj}.md")
+    candidate_paths.append(Path.home() / ".backlink-autofill" / "projects" / proj / "profile.json")
+    candidate_paths.append(Path.home() / ".backlink-autofill" / "projects" / proj / "assets.json")
+    candidate_paths.append(Path.home() / ".backlinkos" / "projects" / f"{proj}.json")
+
+    facts: dict[str, Any] = {}
+    for p in candidate_paths:
+        if not p.exists():
+            continue
+        if p.suffix == ".json":
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    if "ai_powered" in data and data["ai_powered"] is not None:
+                        facts["ai_powered"] = bool(data["ai_powered"])
+                    if "accepts_paid" in data and data["accepts_paid"] is not None:
+                        facts["accepts_paid"] = bool(data["accepts_paid"])
+            except Exception:
+                pass
+        elif p.suffix == ".md":
+            try:
+                text = p.read_text(encoding="utf-8")
+                # 1. 严格解析 ai_powered:
+                # 只有结合权威审查事实声明（如 reviewed facts 明确不兼容 AI 工具且禁止声称 AI）才确立为 False
+                # 单独的禁止声称不能证明 ai_powered=False
+                reviewed_incompat_ai = bool(
+                    re.search(r"incompatible\s+with\s+this\s+project\s+under\s+the\s+current\s+reviewed\s+facts", text, re.I)
+                    and re.search(r"restricted\s+to\s+AI\s+products", text, re.I)
+                )
+                forbidden_ai = bool(re.search(r"(?:Do\s+not\s+state\s+or\s+imply|Forbidden).*?AI[- ]powered", text, re.I | re.S))
+                explicit_non_ai = bool(re.search(r"\bAI[- ]powered\s*:\s*(?:false|no)\b", text, re.I))
+                explicit_ai = bool(re.search(r"\bAI[- ]powered\s*:\s*(?:true|yes)\b", text, re.I))
+
+                if explicit_non_ai or (reviewed_incompat_ai and forbidden_ai):
+                    facts["ai_powered"] = False
+                elif explicit_ai:
+                    facts["ai_powered"] = True
+                # 否则保持未知 None，不盲目猜测
+
+                # 2. 严格解析 accepts_paid:
+                # 只有显式声明政策才确立布尔值，“没有付费预算配置”绝对不能推断为 accepts_paid=False
+                explicit_no_paid = bool(
+                    re.search(r"\baccepts?[-_ ]paid\s*:\s*(?:false|no)\b", text, re.I)
+                    or re.search(r"(?:policy|政策).*?(?:仅限免费|不接受付费|只提交免费|free\s+submissions?\s+only|no\s+paid\s+listings?)", text, re.I)
+                )
+                explicit_paid = bool(
+                    re.search(r"\baccepts?[-_ ]paid\s*:\s*(?:true|yes)\b", text, re.I)
+                    or re.search(r"(?:policy|政策).*?(?:接受付费|有付费预算|paid\s+listings?\s+accepted)", text, re.I)
+                )
+                if explicit_no_paid:
+                    facts["accepts_paid"] = False
+                elif explicit_paid:
+                    facts["accepts_paid"] = True
+                # 否则保持未知 None，不盲目猜测
+            except Exception:
+                pass
+
+        if "ai_powered" in facts and "accepts_paid" in facts:
+            break
+
+    return facts
+
+
 def resolve_project_context(project_id: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """通用项目上下文解析器。返回项目上下文 dict，严禁硬编码任何具体项目名称。"""
-    return dict(context or {})
+    """通用项目上下文解析器。返回项目上下文 dict，严禁硬编码任何具体项目名称。
+    
+    规则约束：
+    1. 显式传入的 context 优先；
+    2. 未指定属性通过 load_project_profile_facts 自动加载权威事实；
+    3. 缺失或证据不足时保持未知 (None)，严禁猜测否定。
+    """
+    resolved = dict(context or {})
+    proj = str(project_id or "").strip()
+    if not proj:
+        return resolved
+
+    if "ai_powered" not in resolved or "accepts_paid" not in resolved:
+        profile_facts = load_project_profile_facts(proj)
+        for k, v in profile_facts.items():
+            if k not in resolved and v is not None:
+                resolved[k] = v
+
+    return resolved
+
+
+def get_persisted_paid_incompatibility(
+    master_row: dict[str, Any],
+    project_context: dict[str, Any] | None = None,
+) -> tuple[bool, str, str]:
+    """纯数据库/内存逻辑：判断已有 Master 记录与当前项目是否存在已持久化的付费限制不兼容事实。
+    
+    硬约束：
+    1. 绝对不发起任何网络请求；
+    2. 只有当当前项目明确声明 accepts_paid is False 时才进行排除；
+    3. 若 accepts_paid 未知 (None) 或为 True，绝对不排除 (UNKNOWN -> INCLUDE，返回 False)；
+    4. 只有总表明确证实为非免费 (实测免费 == '非免费' 或明确纯付费/paid-only 且无免费收录通道) 才生效。
+    
+    返回: (is_incompatible, evidence_text, reason)
+    """
+    p_ctx = resolve_project_context("", project_context)
+    if p_ctx.get("accepts_paid") is False:
+        m_free = str(master_row.get("实测免费") or "").strip()
+        if m_free == "非免费":
+            return True, "非免费", "总表已持久化实测非免费，与当前项目明确不接受付费政策不兼容"
+
+        restriction = str(master_row.get("实测限制") or master_row.get("限制/要求") or "").strip()
+        notes = str(master_row.get("平台备注") or "").strip()
+        reason_text = str(master_row.get("基础排除原因") or "").strip()
+        persisted_candidates = [restriction, notes, reason_text]
+
+        for text in persisted_candidates:
+            if not text:
+                continue
+            # 若有包容性免费通道声明 (如 "free or paid", "免费或付费", "含免费收录")，跳过
+            if re.search(r"\b(?:free\s+or\s+paid|paid\s+or\s+free|含免费|支持免费|有免费)\b", text, re.I):
+                continue
+            if re.search(r"\b(?:paid[- ]only|纯付费|仅限付费|只接受付费|必须付费|强制付费)\b", text, re.I):
+                return True, text, f"总表已持久化付费限制 '{text}'，与当前项目明确不接受付费政策不兼容"
+
+    return False, "", ""
+
 
 
 # 持久化强限制排他正则：仅用于已持久化且明确的强事实，不能因模糊文案误判
@@ -880,7 +1235,7 @@ PERSISTED_AI_ONLY_STRONG_PATTERNS = [
     re.compile(r"\b(?:we\s+)?(?:only|strictly)\s+accepts?\s+(?:ai|ai[- ]powered|artificial intelligence)\b", re.I),
     re.compile(r"\b(?:products?|tools?|sites?|apps?|startups?|submissions?)\s+must\s+(?:be|use|feature|leverage|incorporate|utilize)\s+(?:an?\s+)?ai\b", re.I),
     re.compile(r"\b(?:non[- ]ai|not\s+(?:utilizing|using|leveraging)\s+ai|without\s+ai)\b.*?\b(?:causes?\s+(?:rejection|denial)|(?:are|will\s+be)\s+rejected|not\s+accepted)\b", re.I),
-    re.compile(r"(?:仅接受|仅限|只接受|只收录|仅支持)\s*(?:ai|人工智能)\s*(?:工具|产品|项目)?(?:\b|$)|(?:非\s*ai|非人工智能).*(?:不收|拒绝|不接受)", re.I),
+    re.compile(r"(?:仅接受|仅限|只接受|只收录|仅支持)\s*(?:ai|人工智能)|(?:非\s*ai|非人工智能).*(?:不收|拒绝|不接受)", re.I),
 ]
 
 # 允许非 AI / SaaS / 通用工具的包容性模式（防误杀 Visalytica 等声明 "AI or SaaS tool" 的平台）
@@ -1031,40 +1386,114 @@ def materialize_project_backlog_rows(
     return new_rows, stats
 
 
-def prepare_execution_batch(
-    master_rows: list[dict[str, Any]],
-    project_rows: list[dict[str, Any]],
+def load_scan_ledger_facts(
     project_id: str,
-    target_ready_count: int = 10,
-    scan_limit: int = 50,
+    runtime_dir: str | None = None,
+    cooldown_seconds: float = 7 * 86400,
+) -> dict[str, dict[str, Any]]:
+    """读取已沉淀的 scan_ledger.jsonl，在冷却期内提取可复用的事实。"""
+    base_dir = Path(runtime_dir or os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
+    ledger_file = base_dir / "cycles" / project_id / "scan_ledger.jsonl"
+    if not ledger_file.exists():
+        return {}
+    
+    facts: dict[str, dict[str, Any]] = {}
+    now = time.time()
+    try:
+        with ledger_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    bid = canonical_domain(entry.get("backlink_id") or entry.get("domain") or "")
+                    if not bid:
+                        continue
+
+                    # 兼容读取 timestamp / scanned_timestamp / scanned_at (支持 ISO 字符串与 float 戳)
+                    ts = None
+                    for key in ("scanned_timestamp", "timestamp", "scanned_at"):
+                        val = entry.get(key)
+                        if val is None:
+                            continue
+                        if isinstance(val, (int, float)):
+                            ts = float(val)
+                            break
+                        val_str = str(val).strip()
+                        if not val_str:
+                            continue
+                        try:
+                            ts = float(val_str)
+                            break
+                        except ValueError:
+                            pass
+                        try:
+                            dt = datetime.datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+                            ts = dt.timestamp()
+                            break
+                        except Exception:
+                            pass
+
+                    if ts is not None and (now - float(ts)) <= cooldown_seconds:
+                        facts[bid] = entry
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[警告] 读取 scan_ledger.jsonl 失败: {e}", file=sys.stderr)
+    return facts
+
+
+def make_scan_ledger_entry(
+    domain: str,
+    disposition: str,
+    reason: str,
+    probe_duration_sec: float = 0.0,
+    verified_entry_url: str | None = None,
+    scanned_timestamp: float | None = None,
+    scanned_at: str | None = None,
+) -> dict[str, Any]:
+    """生成具备完整字段与时间戳的 scan_ledger 条目。
+    
+    支持显式传入原观察时间 (scanned_timestamp / scanned_at)，复用旧事实时严禁续期。
+    """
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_ts = time.time()
+    cid = canonical_domain(domain)
+    eff_ts = float(scanned_timestamp) if scanned_timestamp is not None else now_ts
+    eff_at = str(scanned_at) if scanned_at is not None else (
+        datetime.datetime.fromtimestamp(eff_ts, datetime.timezone.utc).isoformat() if scanned_timestamp is not None else now_iso
+    )
+    return {
+        "backlink_id": cid or domain,
+        "domain": cid or domain,
+        "timestamp": now_iso,
+        "scanned_timestamp": eff_ts,
+        "scanned_at": eff_at,
+        "disposition": disposition,
+        "reason": reason,
+        "probe_duration_sec": round(probe_duration_sec, 3),
+        "verified_entry_url": verified_entry_url,
+    }
+
+
+def prepare_execution_batch(
+    project_id: str,
+    target_ready_count: int,
+    scan_limit: int,
+    project_rows: list[dict[str, Any]],
+    master_rows: list[dict[str, Any]],
+    project_context: dict[str, Any] | None = None,
     entry_verifier: Callable[[str, str], tuple[VerifiedEntry | None, str]] | None = None,
     entry_finder: Callable[[str], tuple[VerifiedEntry | None, str]] | None = None,
-    project_context: dict[str, Any] | None = None,
     fetcher: Callable[[str], dict] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     use_cursor: bool = False,
     runtime_dir: str | None = None,
+    use_scan_ledger: bool = True,
+    ledger_cooldown_seconds: float = 7 * 86400,
 ) -> dict[str, Any]:
-    """从已有项目 Backlog 中筛选待提交记录，执行有界的现场 Entry 核验，产出 Ready for Autofill 队列。
-    
-    契约规则：
-    1. 从 project_rows 中选择 项目ID == project_id AND 状态 == '待提交' 的小批量项目记录；
-    2. target_ready_count 控制目标 Ready 数量，scan_limit 控制最多扫描候选数；
-    3. 支持轻量本地 Ready scan cursor：定位上次扫描 ID，从后继续，末尾 wrap；
-    4. 逐个关联 Master Row：
-       - 若 Master 已有'提交入口'：Live Revalidate existing entry；
-       - 若 Master 无'提交入口'：现场探测 discover_and_verify_entry；
-       - 若 Master 缺失该行 (Orphan Row)：显式统计 orphan_count，记录 orphan IDs，不进 ready，不阻断后续；
-    5. 验证成功：
-       - 更新 Master 提交入口（如原为空或需要规范化更新）；
-       - 加入 ready_rows 批次；
-       - ready_count += 1；
-    6. 验证失败 / unresolved：
-       - 项目行仍然存在，状态仍为'待提交'，尝试次数仍为 0；
-       - 不得标记为'失败'，不得标记为'不适用'；
-       - batch 继续扫描下一个候选；
-    7. 仅当 ready_count >= target_ready_count 或 scanned_count >= scan_limit 时停止。
-    """
+    """从已有项目 Backlog 中筛选待提交记录，执行有界的现场 Entry 核验，产出 Ready for Autofill 队列。"""
     proj = str(project_id or "").strip()
     if not proj:
         raise ValueError("必须显式指定 project_id")
@@ -1075,16 +1504,25 @@ def prepare_execution_batch(
     if scan_limit < target_ready_count:
         raise ValueError("scan_limit 不能小于 target_ready_count")
 
-    _verifier = entry_verifier or (lambda d, u: verify_submission_entry(d, u, fetcher=fetcher))
-    _finder = entry_finder or (lambda d: discover_and_verify_entry(d, fetcher=fetcher))
-    p_ctx = resolve_project_context(proj, project_context)
+    def _default_verifier(d: str, u: str, negated_entries: set[str] | list[str] | None = None, **kw) -> tuple[VerifiedEntry | None, str]:
+        return verify_submission_entry(d, u, fetcher=fetcher, negated_entries=negated_entries)
 
-    # 建立 master 映射
+    def _default_finder(d: str, negated_entries: set[str] | list[str] | None = None, **kw) -> tuple[VerifiedEntry | None, str]:
+        return discover_and_verify_entry(d, fetcher=fetcher, negated_entries=negated_entries)
+
+    _verifier = entry_verifier or _default_verifier
+    _finder = entry_finder or _default_finder
+    p_ctx = resolve_project_context(proj, project_context)
+    ledger_facts = load_scan_ledger_facts(proj, runtime_dir=runtime_dir, cooldown_seconds=ledger_cooldown_seconds) if use_scan_ledger else {}
+
+    # 建立 master 映射并记录 _orig_实测限制，确保仅写回新增事实
     master_map: dict[str, dict[str, Any]] = {}
     for mrow in master_rows:
         cid = canonical_domain(mrow.get("外链ID") or mrow.get("平台域名") or "")
         if cid:
             master_map[cid] = mrow
+            if "_orig_实测限制" not in mrow:
+                mrow["_orig_实测限制"] = mrow.get("实测限制")
 
     # 筛选当前项目且状态为待提交的候选行
     eligible_project_rows: list[dict[str, Any]] = []
@@ -1114,6 +1552,8 @@ def prepare_execution_batch(
     failed_verification_count = 0
     orphan_count = 0
     orphan_backlink_ids: list[str] = []
+    scanned_backlink_ids: list[str] = []
+    scan_ledger_entries: list[dict[str, Any]] = []
     last_scanned_id: str | None = None
 
     for prow in scan_sequence:
@@ -1122,16 +1562,27 @@ def prepare_execution_batch(
 
         cid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
         raw_bid = str(prow.get("外链ID") or prow.get("外链域名") or "").strip()
+        bid_key = cid or raw_bid
+        if bid_key:
+            scanned_backlink_ids.append(bid_key)
 
         # 每访问一个待提交行，先计入本轮扫描边界并推进游标
         scanned_count += 1
-        last_scanned_id = cid or raw_bid
+        last_scanned_id = bid_key
+        cand_t0 = time.time()
 
         # 检查是否为 Orphan Row (在 Master Sheet 中不存在对应 row)
         if not cid or cid not in master_map:
             orphan_count += 1
             orphan_id = raw_bid or cid or "unknown"
             orphan_backlink_ids.append(orphan_id)
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid or raw_bid,
+                disposition="orphan",
+                reason="在 Master Sheet 中缺少对应平台行 (Orphan Row)",
+                probe_duration_sec=0.0,
+                verified_entry_url=None,
+            ))
             if progress_callback:
                 progress_callback({
                     "scanned_count": scanned_count,
@@ -1148,6 +1599,13 @@ def prepare_execution_batch(
         mrow = master_map[cid]
         m_status = str(mrow.get("基础状态") or "").strip()
         if m_status != MASTER_STATUS_CANDIDATE:
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid,
+                disposition="master_non_candidate",
+                reason=f"Master 基础状态为非候选: {m_status}",
+                probe_duration_sec=0.0,
+                verified_entry_url=None,
+            ))
             if progress_callback:
                 progress_callback({
                     "scanned_count": scanned_count,
@@ -1161,46 +1619,205 @@ def prepare_execution_batch(
                 })
             continue
 
+        # 1. 检查 Master 表已持久化排他限制 (严格复用 get_persisted_project_incompatibility，仅当明确为非 AI 项目时排除)
+        is_incompat, ev_text, incomp_reason = get_persisted_project_incompatibility(mrow, p_ctx)
+        if is_incompat:
+            skipped_incompatible += 1
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid,
+                disposition="incompatible_ai_only",
+                reason=f"命中总表已持久化排他限制: {incomp_reason}",
+                probe_duration_sec=0.0,
+                verified_entry_url=None,
+            ))
+            if progress_callback:
+                progress_callback({
+                    "scanned_count": scanned_count,
+                    "domain": cid,
+                    "outcome": "incompatible",
+                    "entry_url": None,
+                    "ready_count": len(ready_rows),
+                    "target_ready_count": target_ready_count,
+                    "scan_limit": scan_limit,
+                    "orphan_count": orphan_count,
+                })
+            continue
+
+        # 1.2 检查 Master 表已持久化付费限制 (严格复用 get_persisted_paid_incompatibility，仅当项目明确声明 accepts_paid is False 时排除)
+        is_paid_incompat, paid_ev_text, paid_incomp_reason = get_persisted_paid_incompatibility(mrow, p_ctx)
+        if is_paid_incompat:
+            skipped_incompatible += 1
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid,
+                disposition="incompatible_paid_only",
+                reason=f"命中总表已持久化付费限制: {paid_incomp_reason}",
+                probe_duration_sec=0.0,
+                verified_entry_url=None,
+            ))
+            if progress_callback:
+                progress_callback({
+                    "scanned_count": scanned_count,
+                    "domain": cid,
+                    "outcome": "incompatible_paid",
+                    "entry_url": None,
+                    "ready_count": len(ready_rows),
+                    "target_ready_count": target_ready_count,
+                    "scan_limit": scan_limit,
+                    "orphan_count": orphan_count,
+                })
+            continue
+
+        # 1.5 查阅 scan_ledger 冷却期复用事实 (落实实施约束 3)
+        cached_fact = ledger_facts.get(cid)
         current_entry = str(mrow.get("提交入口") or "").strip()
+        if cached_fact and not current_entry:
+            c_disp = str(cached_fact.get("disposition") or cached_fact.get("result") or "").strip().lower()
+            # 统一枚举映射：支持 no_entry / no_entry_found / unverified_no_form 与 negated / negated_entry
+            # 超时项 (probe_timeout) 始终保留为候选，绝不复用跳过
+            if c_disp in ("no_entry", "no_entry_found", "negated", "negated_entry", "unverified_no_form"):
+                orig_ts = cached_fact.get("scanned_timestamp") or cached_fact.get("timestamp")
+                orig_at = cached_fact.get("scanned_at") or cached_fact.get("timestamp")
+                scan_ledger_entries.append(make_scan_ledger_entry(
+                    domain=cid,
+                    disposition=c_disp,
+                    reason=f"复用近期账本事实 (冷却期内已记录为 {c_disp}): {cached_fact.get('reason', '')}",
+                    probe_duration_sec=0.0,
+                    verified_entry_url=None,
+                    scanned_timestamp=orig_ts,
+                    scanned_at=orig_at,
+                ))
+                if progress_callback:
+                    progress_callback({
+                        "scanned_count": scanned_count,
+                        "domain": cid,
+                        "outcome": "reused_ledger",
+                        "entry_url": None,
+                        "ready_count": len(ready_rows),
+                        "target_ready_count": target_ready_count,
+                        "scan_limit": scan_limit,
+                        "orphan_count": orphan_count,
+                    })
+                continue
+
+        # 2. 提取已否定入口
+        negated_entries = extract_negated_entries_from_row(mrow)
+
+        current_entry = str(mrow.get("提交入口") or "").strip()
+        orig_submission_url = current_entry
         verified_obj: VerifiedEntry | None = None
         verify_reason: str = ""
 
-        if current_entry:
+        # 检查现有入口是否被否定
+        neg_norm_set = {normalize_canonical_url(x) for x in negated_entries if normalize_canonical_url(x)}
+        cur_norm = normalize_canonical_url(current_entry) if current_entry else ""
+        if current_entry and (cur_norm in neg_norm_set or current_entry.rstrip("/") in {x.rstrip("/") for x in negated_entries}):
+            verified_obj = None
+            verify_reason = f"当前入口已被确认为否定入口: {current_entry}"
+            # 否定入口与现有入口完全一致时，清除该提交入口
+            mrow["提交入口"] = ""
+        elif current_entry:
             # Live Revalidate existing entry
-            verified_obj, verify_reason = _verifier(cid, current_entry)
+            try:
+                verified_obj, verify_reason = _verifier(cid, current_entry, negated_entries=negated_entries)
+            except TypeError:
+                try:
+                    verified_obj, verify_reason = _verifier(cid, current_entry)
+                except TypeError:
+                    verified_obj, verify_reason = verify_submission_entry(cid, current_entry, fetcher=fetcher, negated_entries=negated_entries)
         else:
             # 现场探测 entry
-            verified_obj, verify_reason = _finder(cid)
+            try:
+                verified_obj, verify_reason = _finder(cid, negated_entries=negated_entries)
+            except TypeError:
+                try:
+                    verified_obj, verify_reason = _finder(cid)
+                except TypeError:
+                    verified_obj, verify_reason = discover_and_verify_entry(cid, fetcher=fetcher, negated_entries=negated_entries)
             if verified_obj:
                 mrow["提交入口"] = verified_obj.url
 
         if verified_obj:
-            # 聚合主页 ai_only 约束
+            # 最终守卫：若交付的入口命中否定入口，强制拒绝
+            v_clean = str(verified_obj.url).strip().rstrip("/")
+            if v_clean in {x.rstrip("/") for x in negated_entries} or any(v_clean == n.rstrip("/") or v_clean.startswith(n.rstrip("/") + "/") for n in negated_entries):
+                verified_obj = None
+                verify_reason = f"最终入口命中已否定入口: {v_clean}"
+
+        if verified_obj:
+            # 聚合主页 ai_only 约束 (落实 F5: 统一接入 DaemonProbeExecutor 硬预算强杀执行器，严禁慢滴流绕过预算)
             if not verified_obj.ai_only:
                 _fetch = fetcher or fetch_page
+                cand_budget = 10.0
                 for scheme in ("https", "http"):
-                    home_res = _fetch(f"{scheme}://{cid}/")
-                    if home_res and home_res.get("status") == 200:
+                    cur_rem = max(0.0, (cand_t0 + cand_budget) - time.time())
+                    if cur_rem <= 0.1:
+                        break
+                    home_url = f"{scheme}://{cid}/"
+                    home_timeout = min(3.0, cur_rem)
+                    
+                    def _do_home_fetch(u=home_url, t=home_timeout):
+                        try:
+                            return _fetch(u, timeout=t)
+                        except TypeError:
+                            return _fetch(u)
+                    
+                    ok, home_res, is_to = DaemonProbeExecutor.execute(_do_home_fetch, timeout=home_timeout)
+                    if not ok or is_to or not home_res:
+                        continue
+                    if isinstance(home_res, dict) and home_res.get("status") == 200:
                         if home_res.get("ai_only_signals"):
                             verified_obj = VerifiedEntry(
                                 url=verified_obj.url,
                                 domain=verified_obj.domain,
                                 evidence_type=verified_obj.evidence_type,
-                                evidence_summary=verified_obj.evidence_summary,
+                                evidence_summary=verified_obj.evidence_summary + " [主页核实为仅限AI工具]",
                                 form_details=verified_obj.form_details,
                                 ai_only=True,
                             )
-                        break
+                            break
 
-            # 检查项目兼容性
-            if verified_obj.ai_only and p_ctx.get("ai_powered") is not True:
-                skipped_incompatible += 1
-                # 兼容性不通过，不放入 ready，但项目行保持待提交
-                continue
+            cand_duration = round(time.time() - cand_t0, 2)
+            if verified_obj.ai_only:
+                # 现场证实 AI-only，记录到 mrow（供后续写入总表）
+                mrow["实测限制"] = "仅限AI工具"
+                if not mrow.get("最后验证时间"):
+                    mrow["最后验证时间"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+                # 严格判断项目兼容性：仅当当前项目明确为非 AI 项目 (ai_powered is False) 时才排除！
+                # 若 ai_powered 为 None (属性未知)，绝不主观排除，保留待核实
+                if p_ctx.get("ai_powered") is False:
+                    skipped_incompatible += 1
+                    scan_ledger_entries.append(make_scan_ledger_entry(
+                        domain=cid,
+                        disposition="incompatible_ai_only",
+                        reason="平台仅限AI工具，当前项目明确为非AI项目",
+                        probe_duration_sec=cand_duration,
+                        verified_entry_url=verified_obj.url,
+                    ))
+                    if progress_callback:
+                        progress_callback({
+                            "scanned_count": scanned_count,
+                            "domain": cid,
+                            "outcome": "incompatible",
+                            "entry_url": verified_obj.url,
+                            "ready_count": len(ready_rows),
+                            "target_ready_count": target_ready_count,
+                            "scan_limit": scan_limit,
+                            "orphan_count": orphan_count,
+                        })
+                    continue
+
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid,
+                disposition="ready",
+                reason=verify_reason or "现场核验通过",
+                probe_duration_sec=cand_duration,
+                verified_entry_url=verified_obj.url,
+            ))
             ready_rows.append({
                 "project_row": dict(prow),
                 "master_row": dict(mrow),
+                "orig_submission_url": orig_submission_url,
                 "verified_entry": verified_obj,
                 "verify_reason": verify_reason,
             })
@@ -1208,9 +1825,26 @@ def prepare_execution_batch(
             # 核验失败 / unresolved:
             # 项目行仍然存在，状态仍然待提交，尝试次数仍然 0，不得标记为失败或不适用
             failed_verification_count += 1
+            cand_duration = round(time.time() - cand_t0, 2)
+            vr_lower = verify_reason.lower()
+            if "超时" in verify_reason or "timeout" in vr_lower:
+                disp = "probe_timeout"
+            elif "不可达" in verify_reason or "unreachable" in vr_lower:
+                disp = "site_unreachable"
+            elif "已否定" in verify_reason or "negated" in vr_lower:
+                disp = "negated_entry"
+            else:
+                disp = "no_entry_found"
+            scan_ledger_entries.append(make_scan_ledger_entry(
+                domain=cid,
+                disposition=disp,
+                reason=verify_reason or "未能定位可操作提交入口，保持候选",
+                probe_duration_sec=cand_duration,
+                verified_entry_url=None,
+            ))
 
         if progress_callback:
-            outcome = "ready" if (verified_obj and not (verified_obj.ai_only and p_ctx.get("ai_powered") is not True)) else ("incompatible" if (verified_obj and verified_obj.ai_only) else "unresolved")
+            outcome = "ready" if (verified_obj and not (verified_obj.ai_only and p_ctx.get("ai_powered") is False)) else ("incompatible" if (verified_obj and verified_obj.ai_only) else "unresolved")
             progress_callback({
                 "scanned_count": scanned_count,
                 "domain": cid,
@@ -1231,10 +1865,12 @@ def prepare_execution_batch(
         "updated_master_rows": master_rows,
         "ready_count": len(ready_rows),
         "scanned_count": scanned_count,
+        "scanned_backlink_ids": scanned_backlink_ids,
         "skipped_incompatible": skipped_incompatible,
         "failed_verification_count": failed_verification_count,
         "orphan_count": orphan_count,
         "orphan_backlink_ids": orphan_backlink_ids,
+        "scan_ledger_entries": scan_ledger_entries,
     }
 
 
@@ -1473,3 +2109,508 @@ def batch_hydrate_candidates(
         "processed_candidates": ready_res["scanned_count"],
         "skipped_incompatible": ready_res["skipped_incompatible"],
     }
+
+
+# ==========================================
+# 6. 排除分类与跨项目同步 (Cross-Project Exclusion Sync)
+# ==========================================
+
+class ExclusionScope:
+    GLOBAL_UNAVAILABLE = "GLOBAL_UNAVAILABLE"      # 平台级全局不可用：死站、关闭收录、全量禁止等 -> 总表已排除/失效，传播给其他项目待提交
+    PROJECT_INCOMPATIBLE = "PROJECT_INCOMPATIBLE"  # 项目特定不兼容：如仅限AI产品，而当前项目非AI -> 仅当前项目不适用，总表记事实，其他项目不排除
+    PAID_ONLY = "PAID_ONLY"                        # 付费平台：总表记录实测非免费事实，各项目依自身付费政策决定是否排除
+    UNKNOWN_TEMPORARY = "UNKNOWN_TEMPORARY"        # 未知/暂时性问题：超时、未找到入口、读取不完整 -> 保持候选，绝不永久排除
+
+
+_GLOBAL_UNAVAILABLE_KEYWORDS = [
+    "关闭收录", "停止收录", "不再接受", "停止接受", "关闭提交", "停止提交",
+    "域名出售", "域名过期", "永久下线", "停止运营", "服务终止", "网站关闭",
+    "dead", "closed", "shut down", "out of business", "domain for sale",
+    "no longer accepting", "submissions closed", "permanently closed",
+    "nxdomain", "dns failure", "dns failed", "死站"
+]
+
+
+def classify_exclusion(
+    status: str,
+    reason: str = "",
+    limits: str = "",
+    free_status: str = "",
+) -> str:
+    """根据已有明确证据和适用范围准确识别排除适用性分类。
+    
+    1. GLOBAL_UNAVAILABLE: 平台彻底关闭收录、域名过期、永久死站等对所有项目成立的禁止条件；
+    2. PROJECT_INCOMPATIBLE: 平台仅收录特定类型（如 AI-only），仅针对不兼容项目成立；
+    3. PAID_ONLY: 平台仅支持付费收录，由各项目的免费/付费政策分别决定；
+    4. UNKNOWN_TEMPORARY: 未找到入口、网络超时、读取不完整、状态不明确，绝不能作为永久排除理由。
+    """
+    s = str(status or "").strip()
+    r = str(reason or "").strip().lower()
+    lim = str(limits or "").strip().lower()
+    free = str(free_status or "").strip()
+
+    # 1. 临时或未知情况：超时、未找到入口、读取不完整
+    if any(k in r for k in ["未找到入口", "找不到入口", "超时", "timeout", "未解决", "unresolved", "读取不完整"]):
+        return ExclusionScope.UNKNOWN_TEMPORARY
+
+    # 2. 项目特定限制（如 AI-only）
+    if "ai-only" in lim or "仅限ai" in lim or "ai only" in lim or "ai-only" in r or "仅限ai" in r:
+        return ExclusionScope.PROJECT_INCOMPATIBLE
+
+    # 3. 付费-only
+    if free == "非免费" or "付费" in r or "paid only" in r or "收费" in r:
+        return ExclusionScope.PAID_ONLY
+
+    # 4. 全局不可用事实
+    if s in (MASTER_STATUS_EXCLUDED, MASTER_STATUS_DEAD):
+        for kw in _GLOBAL_UNAVAILABLE_KEYWORDS:
+            if kw in r:
+                return ExclusionScope.GLOBAL_UNAVAILABLE
+        if s == MASTER_STATUS_DEAD:
+            return ExclusionScope.GLOBAL_UNAVAILABLE
+        if s == MASTER_STATUS_EXCLUDED and not ("ai" in r or "付费" in r):
+            return ExclusionScope.GLOBAL_UNAVAILABLE
+
+    return ExclusionScope.UNKNOWN_TEMPORARY
+
+
+def sync_global_exclusions_across_projects(
+    master_rows: list[dict[str, Any]],
+    project_rows: list[dict[str, Any]],
+    target_backlink_ids: list[str] | set[str] | None = None,
+    now_iso: str | None = None,
+    exclude_project_id: str | None = None,
+) -> dict[str, Any]:
+    """计算跨项目全局排除同步变更明细。
+    
+    规则：
+    1. 仅针对经确认的平台级全局不可用事实（GLOBAL_UNAVAILABLE）；
+    2. 根据稳定的项目 ID + 外链 ID 定位；
+    3. 写前核实当前状态：严格仅允许同步尚未开始的“待提交”记录；
+    4. 绝不覆盖已提交、审核中、已排期、已上线、处理中、需人工等任何历史或中间状态；
+    5. 绝不复制源项目的项目专属限制、项目素材、结果链接或提交结果给其他项目；
+    6. 返回精确变更列表与保护统计。
+    """
+    iso_time = now_iso or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    target_filter = {canonical_domain(b) for b in target_backlink_ids} if target_backlink_ids else None
+
+    # 建立 master 映射
+    master_map: dict[str, dict[str, Any]] = {}
+    for m in master_rows:
+        cid = canonical_domain(m.get("外链ID") or m.get("平台域名") or "")
+        if cid:
+            master_map[cid] = m
+
+    planned_mutations: list[dict[str, Any]] = []
+    skipped_historical: list[dict[str, Any]] = []
+    affected_projects: set[str] = set()
+    skipped_projects: set[str] = set()
+
+    for prow in project_rows:
+        bid = canonical_domain(prow.get("外链ID") or prow.get("外链域名") or "")
+        if not bid:
+            continue
+        if target_filter is not None and bid not in target_filter:
+            continue
+
+        p_proj = str(prow.get("项目ID") or "").strip()
+        if exclude_project_id and p_proj == exclude_project_id:
+            continue
+
+        mrow = master_map.get(bid)
+        if not mrow:
+            continue
+
+        m_status = str(mrow.get("基础状态") or "").strip()
+        m_reason = str(mrow.get("基础排除原因") or "").strip()
+        m_limits = str(mrow.get("实测限制") or mrow.get("平台备注") or "").strip()
+        m_free = str(mrow.get("实测免费") or "").strip()
+
+        scope = classify_exclusion(m_status, m_reason, m_limits, m_free)
+        if scope != ExclusionScope.GLOBAL_UNAVAILABLE:
+            continue
+
+        # 平台级全局不可用
+        p_proj = str(prow.get("项目ID") or "").strip()
+        p_status = str(prow.get("状态") or "").strip()
+
+        # 写前核实当前状态：必须精确等于待提交
+        if p_status != PROJECT_STATUS_TO_SUBMIT:
+            skipped_historical.append({
+                "project_id": p_proj,
+                "backlink_id": bid,
+                "current_status": p_status,
+                "reason": f"保护历史状态 {p_status}，禁止修改",
+            })
+            skipped_projects.add(p_proj)
+            continue
+
+        # 构造安全同步 mutation
+        if m_status == MASTER_STATUS_EXCLUDED:
+            target_status = "不适用"
+            target_reason = f"平台级不可用：总表已排除（{m_reason}）" if m_reason else "平台级不可用：总表已排除"
+        else:
+            target_status = "失败"
+            target_reason = f"平台级不可用：总表已失效（{m_reason}）" if m_reason else "平台级不可用：总表已失效"
+
+        evidence_summary = f"[跨项目全局排除同步: {target_reason}]"
+
+        mutation = {
+            "project_id": p_proj,
+            "backlink_id": bid,
+            "original_row": prow,
+            "master_row": dict(mrow),
+            "sheet_row_num": prow.get("_sheet_row_num"),
+            "proposed_fields": {
+                "状态": target_status,
+                "最近操作时间": iso_time,
+                "结果链接": "",  # 严禁复制其他项目结果链接
+                "原因/备注": target_reason,
+                "证据摘要": evidence_summary,
+            },
+        }
+        planned_mutations.append(mutation)
+        affected_projects.add(p_proj)
+
+    return {
+        "ok": True,
+        "planned_mutations": planned_mutations,
+        "mutated_count": len(planned_mutations),
+        "skipped_historical_count": len(skipped_historical),
+        "skipped_historical": skipped_historical,
+        "affected_projects": sorted(affected_projects),
+        "skipped_projects": sorted(skipped_projects),
+    }
+
+
+def _get_production_gate():
+    """动态获取 ProductionSheetGate 门禁类，支持多种安装路径与环境。"""
+    try:
+        from execution_state import ProductionSheetGate, EvidenceContractError
+        return ProductionSheetGate, EvidenceContractError
+    except ImportError:
+        pass
+
+    import sys
+    cand_paths = [
+        Path.home() / "plugins" / "backlink-autofill" / "scripts",
+        Path.home() / "Projects" / "backlink-autofill" / "plugins" / "backlink-autofill" / "scripts",
+        Path.home() / ".codex" / "plugins" / "cache" / "personal" / "backlink-autofill" / "0.2.1" / "scripts",
+    ]
+    for p in cand_paths:
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+    try:
+        from execution_state import ProductionSheetGate, EvidenceContractError
+        return ProductionSheetGate, EvidenceContractError
+    except Exception:
+        return None, None
+
+
+def _col_idx_to_letter(col_idx: int) -> str:
+    """0-indexed column number to Excel column letters (0->A, 25->Z, 26->AA)."""
+    result = ""
+    col_idx += 1
+    while col_idx > 0:
+        col_idx, remainder = divmod(col_idx - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def execute_cross_project_sync_mutations(
+    sheets_service,
+    spreadsheet_id: str,
+    project_sheet_name: str,
+    project_header: list[str],
+    planned_mutations: list[dict[str, Any]],
+    commit: bool = False,
+    runtime_dir: str | None = None,
+) -> dict[str, Any]:
+    """实际执行跨项目同步写回并回读验证 (落实 R5 与 R6 修复)。
+    
+    安全契约规则：
+    1. 写前通过 API 读取当前整行，严格核实 (项目ID == p_id AND 外链ID == b_id AND 状态 == '待提交')，杜绝行移位误写；
+    2. 真实调用 ProductionSheetGate.validate_cross_project_sync_mutation 门禁校验；
+    3. 写入后立即整行回读，校验身份字段与写入值完全匹配；
+    4. 待恢复文件 pending_cross_project_sync.json 采用稳定复合键 (project_id::backlink_id) 合并管理，成功项精确移除。
+    """
+    results: list[dict[str, Any]] = []
+    failed_items: list[dict[str, Any]] = []
+    base_dir = Path(runtime_dir or os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
+    base_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = base_dir / "pending_cross_project_sync.json"
+
+    # 读取并初始化以稳定键为索引的 pending_map
+    pending_map: dict[str, dict[str, Any]] = {}
+    if pending_path.exists():
+        try:
+            saved_pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            if isinstance(saved_pending.get("pending_map"), dict):
+                pending_map = saved_pending["pending_map"]
+            elif isinstance(saved_pending.get("failed_items"), list):
+                for item in saved_pending["failed_items"]:
+                    k = f"{item.get('project_id')}::{canonical_domain(item.get('backlink_id', ''))}"
+                    pending_map[k] = item
+        except Exception:
+            pending_map = {}
+
+    p_id_col = project_header.index("项目ID") if "项目ID" in project_header else 0
+    b_id_col = project_header.index("外链ID") if "外链ID" in project_header else 1
+    status_col = project_header.index("状态") if "状态" in project_header else 2
+    time_col = project_header.index("最近操作时间") if "最近操作时间" in project_header else -1
+    res_url_col = project_header.index("结果链接") if "结果链接" in project_header else -1
+    reason_col = project_header.index("原因/备注") if "原因/备注" in project_header else -1
+    ev_col = project_header.index("证据摘要") if "证据摘要" in project_header else -1
+
+    gate_cls, gate_err_cls = _get_production_gate()
+
+    for item in planned_mutations:
+        p_id = item["project_id"]
+        b_id = item["backlink_id"]
+        item_key = f"{p_id}::{canonical_domain(b_id)}"
+        row_num = item.get("sheet_row_num")
+        fields = item["proposed_fields"]
+        master_row = item.get("master_row") or {}
+
+        if not row_num:
+            fail_record = {
+                "project_id": p_id,
+                "backlink_id": b_id,
+                "sheet_row_num": None,
+                "proposed_fields": fields,
+                "master_row": master_row,
+                "error": "缺少 sheet_row_num，无法精确定位",
+            }
+            failed_items.append(fail_record)
+            pending_map[item_key] = fail_record
+            continue
+
+        try:
+            # 写前重新核实：通过 API 读取当前整行
+            get_res = sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{project_sheet_name}'!A{row_num}:J{row_num}",
+            ).execute()
+            cur_vals = get_res.get("values", [[]])[0]
+
+            cur_p_id = cur_vals[p_id_col].strip() if p_id_col < len(cur_vals) else ""
+            cur_b_id = cur_vals[b_id_col].strip() if b_id_col < len(cur_vals) else ""
+            cur_status = cur_vals[status_col].strip() if status_col < len(cur_vals) else ""
+
+            # 1. 严格核实行身份（防行移位错杀）
+            if cur_p_id != p_id or (canonical_domain(cur_b_id) != canonical_domain(b_id) and cur_b_id != b_id):
+                fail_record = {
+                    "project_id": p_id,
+                    "backlink_id": b_id,
+                    "sheet_row_num": row_num,
+                    "proposed_fields": fields,
+                    "master_row": master_row,
+                    "error": f"写前行身份核实失败: 期望 (项目ID={p_id!r}, 外链ID={b_id!r})，实际读取 (项目ID={cur_p_id!r}, 外链ID={cur_b_id!r})，可能发生行移位，拒绝修改",
+                }
+                failed_items.append(fail_record)
+                pending_map[item_key] = fail_record
+                continue
+
+            # 2. 严格核实待提交状态
+            if cur_status != PROJECT_STATUS_TO_SUBMIT:
+                fail_record = {
+                    "project_id": p_id,
+                    "backlink_id": b_id,
+                    "sheet_row_num": row_num,
+                    "proposed_fields": fields,
+                    "master_row": master_row,
+                    "error": f"写前状态核实失败: 当前状态为 {cur_status!r}，非待提交，拒绝覆盖",
+                }
+                failed_items.append(fail_record)
+                pending_map[item_key] = fail_record
+                continue
+
+            # 3. 门禁校验 (调用 ProductionSheetGate.validate_cross_project_sync_mutation)
+            if gate_cls:
+                cur_row_dict = {
+                    h: (cur_vals[i].strip() if i < len(cur_vals) else "")
+                    for i, h in enumerate(project_header)
+                }
+                master_row_synth = dict(master_row)
+                if "基础状态" not in master_row_synth:
+                    master_row_synth["基础状态"] = "已排除" if fields.get("状态") == "不适用" else "失效"
+                if "基础排除原因" not in master_row_synth:
+                    master_row_synth["基础排除原因"] = fields.get("原因/备注", "")
+                
+                try:
+                    gate_cls.validate_cross_project_sync_mutation(
+                        cur_row_dict, master_row_synth, fields
+                    )
+                except Exception as gate_exc:
+                    fail_record = {
+                        "project_id": p_id,
+                        "backlink_id": b_id,
+                        "sheet_row_num": row_num,
+                        "proposed_fields": fields,
+                        "master_row": master_row,
+                        "error": f"门禁拦截: {gate_exc}",
+                    }
+                    failed_items.append(fail_record)
+                    pending_map[item_key] = fail_record
+                    continue
+
+            if not commit:
+                results.append({
+                    "project_id": p_id,
+                    "backlink_id": b_id,
+                    "sheet_row_num": row_num,
+                    "status": "dry_run",
+                    "proposed_fields": fields,
+                })
+                continue
+
+            # 4. commit 模式下批量写回目标单元格
+            batch_data = [
+                {"range": f"'{project_sheet_name}'!{_col_idx_to_letter(status_col)}{row_num}", "values": [[fields["状态"]]]},
+            ]
+            if time_col >= 0 and "最近操作时间" in fields:
+                batch_data.append({"range": f"'{project_sheet_name}'!{_col_idx_to_letter(time_col)}{row_num}", "values": [[fields["最近操作时间"]]]})
+            if res_url_col >= 0 and "结果链接" in fields:
+                batch_data.append({"range": f"'{project_sheet_name}'!{_col_idx_to_letter(res_url_col)}{row_num}", "values": [[fields["结果链接"]]]})
+            if reason_col >= 0 and "原因/备注" in fields:
+                batch_data.append({"range": f"'{project_sheet_name}'!{_col_idx_to_letter(reason_col)}{row_num}", "values": [[fields["原因/备注"]]]})
+            if ev_col >= 0 and "证据摘要" in fields:
+                batch_data.append({"range": f"'{project_sheet_name}'!{_col_idx_to_letter(ev_col)}{row_num}", "values": [[fields["证据摘要"]]]})
+
+            sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": batch_data},
+            ).execute()
+
+            # 5. 写后精确整行回读校验
+            read_back = sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{project_sheet_name}'!A{row_num}:J{row_num}",
+            ).execute()
+            rb_vals = read_back.get("values", [[]])[0]
+            rb_p_id = rb_vals[p_id_col].strip() if p_id_col < len(rb_vals) else ""
+            rb_b_id = rb_vals[b_id_col].strip() if b_id_col < len(rb_vals) else ""
+            rb_status = rb_vals[status_col].strip() if status_col < len(rb_vals) else ""
+            rb_reason = rb_vals[reason_col].strip() if (reason_col >= 0 and reason_col < len(rb_vals)) else ""
+
+            if (
+                rb_p_id != p_id
+                or (canonical_domain(rb_b_id) != canonical_domain(b_id) and rb_b_id != b_id)
+                or rb_status != fields["状态"]
+                or (reason_col >= 0 and "原因/备注" in fields and rb_reason != fields["原因/备注"])
+            ):
+                fail_record = {
+                    "project_id": p_id,
+                    "backlink_id": b_id,
+                    "sheet_row_num": row_num,
+                    "proposed_fields": fields,
+                    "master_row": master_row,
+                    "error": f"回读校验不匹配: 期望 (状态={fields['状态']!r}, 备注={fields.get('原因/备注')!r})，实读 (状态={rb_status!r}, 备注={rb_reason!r})",
+                }
+                failed_items.append(fail_record)
+                pending_map[item_key] = fail_record
+            else:
+                results.append({
+                    "project_id": p_id,
+                    "backlink_id": b_id,
+                    "sheet_row_num": row_num,
+                    "status": "committed",
+                    "readback_status": rb_status,
+                })
+                # 写入并校验成功，从待恢复集合中精确移除
+                pending_map.pop(item_key, None)
+
+        except Exception as exc:
+            fail_record = {
+                "project_id": p_id,
+                "backlink_id": b_id,
+                "sheet_row_num": row_num,
+                "proposed_fields": fields,
+                "master_row": master_row,
+                "error": str(exc),
+            }
+            failed_items.append(fail_record)
+            pending_map[item_key] = fail_record
+
+    # 仅在 commit 模式下持久化/清理 pending 文件
+    if commit:
+        if pending_map:
+            pending_data = {
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "pending_map": pending_map,
+                "failed_items": list(pending_map.values()),
+            }
+            pending_path.write_text(json.dumps(pending_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        elif pending_path.exists():
+            try:
+                pending_path.unlink()
+            except Exception:
+                pass
+
+    return {
+        "ok": len(failed_items) == 0,
+        "committed_count": len(results),
+        "failed_count": len(failed_items),
+        "results": results,
+        "failed_items": failed_items,
+        "remaining_pending_count": len(pending_map),
+    }
+
+
+def recover_pending_cross_project_sync(
+    sheets_service,
+    spreadsheet_id: str,
+    project_sheet_name: str,
+    project_header: list[str],
+    commit: bool = True,
+    runtime_dir: str | None = None,
+) -> dict[str, Any]:
+    """从 pending_cross_project_sync.json 恢复并安全重试未完成的跨项目排除同步 (落实 R6 修复)。"""
+    base_dir = Path(runtime_dir or os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
+    pending_path = base_dir / "pending_cross_project_sync.json"
+    if not pending_path.exists():
+        return {"ok": True, "recovered_count": 0, "message": "No pending cross-project sync"}
+
+    try:
+        data = json.loads(pending_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to read pending file: {exc}"}
+
+    items_to_recover: list[dict[str, Any]] = []
+    if isinstance(data.get("pending_map"), dict):
+        items_to_recover = list(data["pending_map"].values())
+    elif isinstance(data.get("failed_items"), list):
+        items_to_recover = data["failed_items"]
+
+    if not items_to_recover:
+        try:
+            pending_path.unlink()
+        except Exception:
+            pass
+        return {"ok": True, "recovered_count": 0, "message": "Pending sync items empty"}
+
+    planned_mutations: list[dict[str, Any]] = []
+    for item in items_to_recover:
+        if "project_id" in item and "backlink_id" in item and "proposed_fields" in item:
+            planned_mutations.append({
+                "project_id": item["project_id"],
+                "backlink_id": item["backlink_id"],
+                "sheet_row_num": item.get("sheet_row_num"),
+                "proposed_fields": item["proposed_fields"],
+                "master_row": item.get("master_row") or {},
+            })
+
+    if not planned_mutations:
+        return {"ok": True, "recovered_count": 0, "message": "No valid planned mutations"}
+
+    return execute_cross_project_sync_mutations(
+        sheets_service=sheets_service,
+        spreadsheet_id=spreadsheet_id,
+        project_sheet_name=project_sheet_name,
+        project_header=project_header,
+        planned_mutations=planned_mutations,
+        commit=commit,
+        runtime_dir=runtime_dir,
+    )
+
+

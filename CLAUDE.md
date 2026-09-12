@@ -25,12 +25,25 @@ pytest -v tests/test_master_sheet_sync.py
 
 ESM + `module: NodeNext`，`api/` 和 `lib/` 里的相对 import **必须写 `.js` 后缀**（指向编译产物），`tests/runtime-imports.test.ts` 会在写成 `.ts` 时失败。
 
+## 正式使用入口 (Formal Submission Workflow)
+
+当用户在新会话中输入类似：
+> “按本项目正式流程，为 quick-iching 提交外链，本轮目标新增成功提交 200 个。”
+
+**统一正式流程见：** 👉 **[docs/FORMAL_SUBMISSION_WORKFLOW.md](docs/FORMAL_SUBMISSION_WORKFLOW.md)**
+
+运行命令：
+```bash
+python3 scripts/run_submission_cycle.py --project-id quick-iching --target-success 200
+```
+
 ## 权威层级（改动前先确认自己在哪一层）
 
-1. `.agents/skills/discovering-backlinks/SKILL.md` + `references/`
-2. `.agents/skills/screening-backlinks/SKILL.md` + `references/` *(Legacy / Optional)*
-3. `docs/REPOSITORY_ARCHITECTURE.md`
-4. `docs/V4_PRODUCT_STRATEGY.md`
+1. `docs/FORMAL_SUBMISSION_WORKFLOW.md` (正式提交流程统一规范)
+2. `.agents/skills/discovering-backlinks/SKILL.md` + `references/`
+3. `.agents/skills/screening-backlinks/SKILL.md` + `references/` *(Legacy / Optional)*
+4. `docs/REPOSITORY_ARCHITECTURE.md`
+5. `docs/V4_PRODUCT_STRATEGY.md`
 
 `docs/V1_PRODUCT_PLAN.md`、`docs/V2_PRODUCT_PLAN.md`、`docs/superpowers/`、`docs/live-runs/` 只是历史记录，**不定义当前行为**。
 

@@ -602,12 +602,30 @@ def analyze_html(raw_html, base_url):
 class Redirects(HTTPRedirectHandler): pass
 OPENER=build_opener(Redirects())
 
-def fetch_page(url, timeout=8, _retry=True):
+def fetch_page(url, timeout=8, _retry=True, deadline=None):
     req=Request(url, headers={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'})
+    t_start = time.time()
+    max_dur = timeout if timeout is not None else 8.0
+    dl = deadline if deadline is not None else (t_start + max_dur)
+    rem = dl - time.time()
+    if rem <= 0:
+        return {'url':url,'final_url':url,'status':0,'error':'TimeoutError: probe deadline exceeded'}
+    call_timeout = min(max_dur, rem)
     try:
-        with OPENER.open(req, timeout=timeout) as resp:
+        with OPENER.open(req, timeout=call_timeout) as resp:
             status=getattr(resp,'status',200); final=resp.geturl(); ctype=resp.headers.get('content-type','')
-            data=resp.read(MAX_BYTES)
+            chunks = []
+            total_bytes = 0
+            chunk_size = 8192
+            while total_bytes < MAX_BYTES:
+                if time.time() >= dl:
+                    raise TimeoutError("Wall-clock timeout exceeded while reading body")
+                part = resp.read(min(chunk_size, MAX_BYTES - total_bytes))
+                if not part:
+                    break
+                chunks.append(part)
+                total_bytes += len(part)
+            data = b"".join(chunks)
             if 'html' not in ctype.lower() and b'<html' not in data[:1000].lower():
                 return {'url':url,'final_url':final,'status':status,'content_type':ctype,'title':'','noindex':False,'mechanism_signals':[],'free_signals':[],'paid_signals':[],'spam_signals':[],'external_follow_count':0,'external_nofollow_count':0,'candidate_urls':[]}
             enc=resp.headers.get_content_charset() or 'utf-8'
@@ -621,7 +639,9 @@ def fetch_page(url, timeout=8, _retry=True):
         # 不是站点的问题。退避后重试一次，否则会把上千个正常站点误记成不可达。
         if _retry and "assign requested address" in str(e):
             time.sleep(1.5)
-            return fetch_page(url, timeout, _retry=False)
+            rem_retry = dl - time.time()
+            if rem_retry > 0:
+                return fetch_page(url, timeout=rem_retry, _retry=False, deadline=dl)
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}
     except Exception as e:
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}

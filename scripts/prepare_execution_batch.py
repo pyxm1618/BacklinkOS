@@ -22,6 +22,7 @@ import datetime
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 # 优先载入本地 scripts 目录模块
@@ -36,6 +37,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
 from master_sheet_sync import (
+    DEFAULT_BACKLINKOS_RUNTIME_DIR,
     MASTER_HEADER,
     PROJECT_HEADER,
     canonical_domain,
@@ -224,6 +226,29 @@ def run_phase_c_preparation(
                 "new_val": ventry.url,
             })
 
+        # 检查实测限制动态写回
+        if mrow.get("实测限制") == "仅限AI工具" and "实测限制" in master_header and row_num:
+            limits_col_letter = col_index_to_letter(master_header.index("实测限制"))
+            vtime_col_letter = col_index_to_letter(master_header.index("最后验证时间")) if "最后验证时间" in master_header else ""
+            raw_r = master_raw[row_num - 1]
+            orig_limits = raw_r[master_header.index("实测限制")].strip() if master_header.index("实测限制") < len(raw_r) else ""
+            if not orig_limits:
+                updates_to_master.append({
+                    "domain": cid,
+                    "row_num": row_num,
+                    "cell_range": f"'{master_sheet_name}'!{limits_col_letter}{row_num}",
+                    "old_val": orig_limits,
+                    "new_val": "仅限AI工具",
+                })
+                if vtime_col_letter and mrow.get("最后验证时间"):
+                    updates_to_master.append({
+                        "domain": cid,
+                        "row_num": row_num,
+                        "cell_range": f"'{master_sheet_name}'!{vtime_col_letter}{row_num}",
+                        "old_val": "",
+                        "new_val": mrow.get("最后验证时间"),
+                    })
+
         ready_items.append({
             "domain": cid,
             "submission_url": ventry.url,
@@ -236,14 +261,14 @@ def run_phase_c_preparation(
             "attempts": prow.get("尝试次数"),
         })
 
-    # 4. Master 提交入口精准写回与 Read-Back
-    print(f"\n[4/5] Master 提交入口写回阶段 (待写回项: {len(updates_to_master)}):")
+    # 4. Master 提交入口及实测限制精准写回与 Read-Back
+    print(f"\n[4/5] Master 表写回阶段 (待写回项: {len(updates_to_master)}):")
     if not updates_to_master:
-        print("  - 所有 Ready 项的 Master 提交入口均已是最新，无需写回。")
+        print("  - 所有 Ready 项的 Master 提交入口及实测限制均已是最新，无需写回。")
     elif not commit:
-        print("  - [DRY-RUN] 预览将写回 Master 的提交入口:")
+        print("  - [DRY-RUN] 预览将写回 Master 的字段:")
         for u in updates_to_master:
-            print(f"    * 行 {u["row_num"]} ({u["domain"]}): '{u["old_val"]}' -> '{u["new_val"]}'")
+            print(f"    * 行 {u['row_num']} ({u['domain']}): {u['cell_range']} = '{u['old_val']}' -> '{u['new_val']}'")
         print("  - 未指定 --commit，跳过真实写入。")
     else:
         print("  - [--commit 模式] 开始精准单项写回与 Read-Back 校验...")
@@ -265,10 +290,10 @@ def run_phase_c_preparation(
             rb_val = (rb.get("values", [[]])[0] or [""])[0]
             if rb_val != new_val:
                 raise RuntimeError(
-                    f"Master 提交入口写回校验失败！单元格 {cell} 预期 '{new_val}'，实际读回 '{rb_val}'"
+                    f"Master 表写回校验失败！单元格 {cell} 预期 '{new_val}'，实际读回 '{rb_val}'"
                 )
-            print(f"    * 已安全写回并验证: 行 {u["row_num"]} ({u["domain"]}) -> {cell} = {new_val}")
-        print("  - 全部 Master 提交入口安全更新完毕！")
+            print(f"    * 已安全写回并验证: 行 {u['row_num']} ({u['domain']}) -> {cell} = {new_val}")
+        print("  - 全部 Master 表字段安全更新完毕！")
 
     # 5. 生成 Ready Batch Manifest
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -300,6 +325,19 @@ def run_phase_c_preparation(
 
     with open(output_manifest, "w", encoding="utf-8") as f:
         json.dump(manifest_data, f, ensure_ascii=False, indent=2)
+
+    ledger_entries = batch_result.get("scan_ledger_entries") or []
+    if ledger_entries:
+        try:
+            base_dir = Path(os.environ.get("BACKLINKOS_RUNTIME_DIR", DEFAULT_BACKLINKOS_RUNTIME_DIR))
+            ledger_file = base_dir / "cycles" / project_id / "scan_ledger.jsonl"
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            with ledger_file.open("a", encoding="utf-8") as lf:
+                for entry in ledger_entries:
+                    lf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            print(f"  - 探测账本已沉淀: {len(ledger_entries)} 条事实记录至 {ledger_file}")
+        except Exception as le_exc:
+            print(f"[警告] 写入 scan_ledger.jsonl 出现异常: {le_exc}", file=sys.stderr)
 
     print(f"\n[5/5] Ready Batch Manifest 已保存至: {output_manifest}")
     print(f"  - Ready Domains 列表 ({len(ready_domains)} 个):")
