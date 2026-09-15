@@ -124,7 +124,10 @@ class DaemonProbeExecutor:
                     result_box.append(("err", exc))
             finally:
                 with cls._lock:
-                    cls._active_probes_count -= 1
+                    # A test or caller may reset counters while a timed-out
+                    # daemon worker is still unwinding.  Never expose an
+                    # impossible negative active-worker count.
+                    cls._active_probes_count = max(0, cls._active_probes_count - 1)
                 sem.release()
                 done_event.set()
 
@@ -3187,6 +3190,15 @@ def _get_production_gate():
             sys.path.insert(0, str(p))
     try:
         from execution_state import ProductionSheetGate, EvidenceContractError
+        return ProductionSheetGate, EvidenceContractError
+    except Exception:
+        pass
+
+    # The formal orchestrator must remain self-contained in this repository.
+    # A developer's local plugin installation may provide execution_state, but
+    # CI and a fresh checkout must not silently lose the production gate.
+    try:
+        from production_sheet_gate import ProductionSheetGate, EvidenceContractError
         return ProductionSheetGate, EvidenceContractError
     except Exception:
         return None, None
