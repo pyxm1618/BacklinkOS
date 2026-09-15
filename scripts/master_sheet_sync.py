@@ -506,6 +506,8 @@ def discover_and_verify_entry(
         u = urljoin(base_url, cp)
         if u not in probe_targets:
             probe_targets.append(u)
+    probe_target_count = len(probe_targets)
+    probe_limit_reached = probe_target_count > max_probes
     probe_targets = probe_targets[:max_probes]
 
     def nested_fetch(url: str) -> dict[str, Any]:
@@ -545,7 +547,13 @@ def discover_and_verify_entry(
             form_details=top_form, ai_only=bool(home.get("ai_only_signals")),
         ), "通过首页真实表单闭环入口"
 
-    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA，保持候选状态）"
+    if probe_limit_reached:
+        return None, (
+            f"未定位到用户可提交的入口页；达到本次探测上限 (max_probes={max_probes})，"
+            f"已核验 {len(probe_targets)}/{probe_target_count} 个候选；尚有候选未核验，保持候选状态"
+        )
+
+    return None, "未定位到用户可提交的入口页（已完成本次有界候选核验；证据缺失，保持候选状态）"
 
 
 def build_empty_master_row(domain: str) -> dict[str, str]:
