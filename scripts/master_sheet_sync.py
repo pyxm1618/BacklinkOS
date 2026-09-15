@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -652,36 +653,100 @@ def verify_submission_entry(
     return sub_verified, sub_reason
 
 
+def _probe_evidence_record(url: str, phase: str, result: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
+    status_raw = result.get("status")
+    try:
+        status = int(status_raw or 0)
+    except (TypeError, ValueError):
+        status = 0
+    error = str(result.get("error") or "").strip()
+    timeout_stage = None
+    if status == 0 and re.search(r"timeout|timed\s*out", error, re.I):
+        # The underlying crawler preserves raw exception text but does not
+        # reliably prove connect-vs-read stage. Do not invent one.
+        timeout_stage = "unknown"
+    return {
+        "url": url,
+        "phase": phase,
+        "final_url": str(result.get("final_url") or url),
+        "status": status,
+        "error": error or None,
+        "timeout_stage": timeout_stage,
+        "elapsed_ms": max(0, int(elapsed_ms)),
+    }
+
+
+def _summarize_probe_failure(records: list[dict[str, Any]]) -> str:
+    facts: list[str] = []
+    for item in records[:4]:
+        url = item.get("url") or "?"
+        status = int(item.get("status") or 0)
+        error = item.get("error")
+        if status > 0:
+            facts.append(f"{url} => HTTP {status}")
+        elif error:
+            facts.append(f"{url} => {error}")
+        else:
+            facts.append(f"{url} => 未取得 HTTP 响应")
+    return "; ".join(facts) if facts else "无可用探测证据"
+
+
 def discover_and_verify_entry(
     domain: str,
     fetcher: Callable[[str], dict] | None = None,
     max_probes: int = 15,
+    evidence_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[VerifiedEntry | None, str]:
-    """使用已有经过测试的爬虫机制，对指定域名进行真实页面探测，寻找最低限度提交入口。"""
+    """真实页面探测提交入口；单请求失败只记录事实，不升级成整站终态。"""
     cd = canonical_domain(domain)
     if not cd:
         return None, "域名无效"
-        
+
     _fetch = fetcher or fetch_page
-    
-    # 尝试 https 和 http 首页
+    evidence = evidence_sink if evidence_sink is not None else []
+
+    def observed_fetch(url: str, phase: str) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            result = _fetch(url)
+            if not isinstance(result, dict):
+                result = {
+                    "url": url,
+                    "final_url": url,
+                    "status": 0,
+                    "error": f"InvalidFetcherResult: {type(result).__name__}",
+                }
+        except Exception as exc:
+            result = {
+                "url": url,
+                "final_url": url,
+                "status": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        evidence.append(_probe_evidence_record(url, phase, result, elapsed_ms))
+        return result
+
     home = None
+    home_records_start = len(evidence)
     for scheme in ("https", "http"):
-        res = _fetch(f"{scheme}://{cd}/")
+        url = f"{scheme}://{cd}/"
+        res = observed_fetch(url, "home")
         if res.get("status") == 200:
             home = res
             break
-            
+
     if not home or home.get("status") != 200:
-        # 尝试 www
         for scheme in ("https", "http"):
-            res = _fetch(f"{scheme}://www.{cd}/")
+            url = f"{scheme}://www.{cd}/"
+            res = observed_fetch(url, "home")
             if res.get("status") == 200:
                 home = res
                 break
-                
+
     if not home or home.get("status") != 200:
-        return None, f"站点首页不可达 (HTTP {home.get('status') if home else 0})"
+        home_records = [x for x in evidence[home_records_start:] if x.get("phase") == "home"]
+        return None, f"站点首页未取得 HTTP 200；{_summarize_probe_failure(home_records)}"
 
     base_url = home.get("final_url") or f"https://{cd}/"
     candidate_urls = list(home.get("candidate_urls") or [])
@@ -689,8 +754,7 @@ def discover_and_verify_entry(
         u = cta.get("url")
         if u and u not in candidate_urls:
             candidate_urls.append(u)
-    
-    # 将 COMMON_PATHS 与 candidate_urls 合并，优先试探 candidate_urls，再试探常见路径
+
     probe_targets: list[str] = []
     for u in candidate_urls:
         if u not in probe_targets:
@@ -700,19 +764,22 @@ def discover_and_verify_entry(
         if u not in probe_targets:
             probe_targets.append(u)
 
-    # 限制探测数量
+    probe_target_count = len(probe_targets)
+    probe_limit_reached = probe_target_count > max_probes
     probe_targets = probe_targets[:max_probes]
-    
-    # 逐个探测子页面
+
+    def nested_fetch(url: str) -> dict[str, Any]:
+        return observed_fetch(url, "nested")
+
     for target_url in probe_targets:
-        allowed, guard_reason = submission_entry_policy_guard(target_url, domain=cd)
+        allowed, _ = submission_entry_policy_guard(target_url, domain=cd)
         if not allowed:
             continue
-            
-        page_res = _fetch(target_url)
+
+        page_res = observed_fetch(target_url, "candidate")
         if page_res.get("status") != 200:
             continue
-            
+
         final_url = page_res.get("final_url") or target_url
         allowed_final, _ = submission_entry_policy_guard(final_url, domain=cd)
         if not allowed_final:
@@ -723,12 +790,11 @@ def discover_and_verify_entry(
             page_res=page_res,
             req_url=target_url,
             domain=cd,
-            fetcher=_fetch,
+            fetcher=nested_fetch,
             is_discovered_candidate=is_from_candidate_list,
             allow_cta_follow=True,
         )
         if sub_verified:
-            # 继承主页的 ai_only_signals
             if home and home.get("ai_only_signals") and not sub_verified.ai_only:
                 sub_verified = VerifiedEntry(
                     url=sub_verified.url,
@@ -740,7 +806,6 @@ def discover_and_verify_entry(
                 )
             return sub_verified, f"通过真实页面探测闭环真实入口 ({sub_reason})"
 
-    # 首页检查
     if home.get("actionable_forms"):
         top_form = home["actionable_forms"][0]
         return VerifiedEntry(
@@ -752,8 +817,13 @@ def discover_and_verify_entry(
             ai_only=bool(home.get("ai_only_signals")),
         ), "通过首页真实表单闭环入口"
 
-    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA，保持候选状态）"
+    if probe_limit_reached:
+        return None, (
+            f"未定位到用户可提交的入口页；达到本次探测上限 (max_probes={max_probes})，"
+            f"已核验 {len(probe_targets)}/{probe_target_count} 个候选；尚有候选未核验，保持候选状态"
+        )
 
+    return None, "未定位到用户可提交的入口页（已完成本次有界候选核验；证据缺失，保持候选状态）"
 
 
 # ==========================================
