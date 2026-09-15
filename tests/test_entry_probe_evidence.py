@@ -113,6 +113,40 @@ class EntryProbeEvidenceTests(unittest.TestCase):
         self.assertTrue(all(item["timeout_stage"] == "unknown" for item in evidence))
         self.assertIn("socket.timeout", reason)
 
+    def test_probe_limit_stop_is_reported_as_a_bound_not_as_platform_failure(self):
+        calls = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            if url == "https://bounded.example/":
+                return {
+                    "url": url,
+                    "final_url": url,
+                    "status": 200,
+                    "candidate_urls": [
+                        "https://bounded.example/one",
+                        "https://bounded.example/two",
+                        "https://bounded.example/three",
+                    ],
+                    "submission_cta_links": [],
+                    "actionable_forms": [],
+                    "ai_only_signals": [],
+                }
+            return {"url": url, "final_url": url, "status": 404, "error": "HTTP 404"}
+
+        entry, reason = discover_and_verify_entry(
+            "bounded.example",
+            fetcher=fake_fetch,
+            max_probes=2,
+        )
+
+        self.assertIsNone(entry)
+        self.assertIn("max_probes=2", reason)
+        self.assertIn("探测上限", reason)
+        self.assertIn("https://bounded.example/one", calls)
+        self.assertIn("https://bounded.example/two", calls)
+        self.assertNotIn("https://bounded.example/three", calls)
+
 
 if __name__ == "__main__":
     unittest.main()
