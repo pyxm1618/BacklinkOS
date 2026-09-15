@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -15,36 +15,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Repair bounded-stop reason contract on PR head
-        if: github.event_name == 'pull_request' && github.head_ref == 'fix/20260915-entry-probe-evidence'
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-        run: |
-          git fetch origin "refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"
-          git checkout -B "$HEAD_REF" "origin/$HEAD_REF"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('scripts/master_sheet_sync.py')
-          text = path.read_text(encoding='utf-8')
-          old_bound = '''        return None, (\n            f"未定位到用户可提交的入口页；达到本次探测上限 (max_probes={max_probes})，"\n            f"已核验 {len(probe_targets)}/{probe_target_count} 个候选；尚有候选未核验，保持候选状态"\n        )\n\n    return None, "未定位到用户可提交的入口页（已完成本次有界候选核验；证据缺失，保持候选状态）"\n'''
-          new_bound = '''        return None, (\n            f"未定位到用户可提交的入口页；证据缺失，无 Actionable Form 或可跟随的有效提交 CTA；"\n            f"达到本次探测上限 (max_probes={max_probes})，已核验 {len(probe_targets)}/{probe_target_count} 个候选；"\n            f"尚有候选未核验，保持候选状态"\n        )\n\n    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA；已完成本次有界候选核验，保持候选状态）"\n'''
-          if new_bound in text:
-              print('reason contract already repaired')
-              raise SystemExit(0)
-          if old_bound not in text:
-              raise SystemExit('expected bounded-stop reason block not found')
-          path.write_text(text.replace(old_bound, new_bound, 1), encoding='utf-8')
-          PY
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add scripts/master_sheet_sync.py
-          if ! git diff --cached --quiet; then
-            git commit -m "fix(probe): preserve existing unresolved reason semantics"
-            git push origin "HEAD:$HEAD_REF"
-          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
