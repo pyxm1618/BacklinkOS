@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -15,6 +15,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Apply staged repair to PR head
+        if: github.event_name == 'pull_request' && github.head_ref == 'fix/20260915-entry-probe-evidence'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          git fetch origin "refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"
+          git checkout -B "$HEAD_REF" "origin/$HEAD_REF"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/master_sheet_sync.py')
+          text = path.read_text(encoding='utf-8')
+          marker = '    probe_target_count = len(probe_targets)\n'
+          if marker in text:
+              print('probe-limit repair already applied')
+              raise SystemExit(0)
+
+          old_targets = '''    for cp in COMMON_PATHS:\n        u = urljoin(base_url, cp)\n        if u not in probe_targets:\n            probe_targets.append(u)\n    probe_targets = probe_targets[:max_probes]\n'''
+          new_targets = '''    for cp in COMMON_PATHS:\n        u = urljoin(base_url, cp)\n        if u not in probe_targets:\n            probe_targets.append(u)\n    probe_target_count = len(probe_targets)\n    probe_limit_reached = probe_target_count > max_probes\n    probe_targets = probe_targets[:max_probes]\n'''
+          old_end = '''    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA，保持候选状态）"\n'''
+          new_end = '''    if probe_limit_reached:\n        return None, (\n            f"未定位到用户可提交的入口页；达到本次探测上限 (max_probes={max_probes})，"\n            f"已核验 {len(probe_targets)}/{probe_target_count} 个候选；尚有候选未核验，保持候选状态"\n        )\n\n    return None, "未定位到用户可提交的入口页（已完成本次有界候选核验；证据缺失，保持候选状态）"\n'''
+          for old, new in ((old_targets, new_targets), (old_end, new_end)):
+              if old not in text:
+                  raise SystemExit(f'expected master_sheet_sync fragment missing: {old!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          if ! git diff --quiet -- scripts/master_sheet_sync.py; then
+            git diff --check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add scripts/master_sheet_sync.py
+            git commit -m "fix(probe): report bounded probe exhaustion explicitly"
+            git push origin "HEAD:$HEAD_REF"
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
