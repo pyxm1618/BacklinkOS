@@ -819,11 +819,12 @@ def discover_and_verify_entry(
 
     if probe_limit_reached:
         return None, (
-            f"未定位到用户可提交的入口页；达到本次探测上限 (max_probes={max_probes})，"
-            f"已核验 {len(probe_targets)}/{probe_target_count} 个候选；尚有候选未核验，保持候选状态"
+            f"未定位到用户可提交的入口页；证据缺失，无 Actionable Form 或可跟随的有效提交 CTA；"
+            f"达到本次探测上限 (max_probes={max_probes})，已核验 {len(probe_targets)}/{probe_target_count} 个候选；"
+            f"尚有候选未核验，保持候选状态"
         )
 
-    return None, "未定位到用户可提交的入口页（已完成本次有界候选核验；证据缺失，保持候选状态）"
+    return None, "未定位到用户可提交的入口页（证据缺失，无 Actionable Form 或可跟随的有效提交 CTA；已完成本次有界候选核验，保持候选状态）"
 
 
 # ==========================================
