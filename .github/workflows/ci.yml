@@ -36,4 +36,20 @@ jobs:
           python-version: '3.13'
 
       - name: Run Python regression tests
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+        id: python-tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -p 'test_*.py' -v 2>&1 | tee python-tests.log
+
+      - name: Upload Python regression log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-regression-log
+          path: python-tests.log
+
+      - name: Enforce Python regression result
+        if: steps.python-tests.outcome == 'failure'
+        run: exit 1
