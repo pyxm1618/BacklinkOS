@@ -433,7 +433,9 @@ def analyze_html(raw_html, base_url):
 
         # 提取字段特征
         resource_fields_found = []
+        visible_resource_fields_found = []
         gp_fields_found = []
+        visible_gp_fields_found = []
         is_pure_search = True
         has_email = False
         has_message = False
@@ -496,10 +498,14 @@ def analyze_html(raw_html, base_url):
             else:
                 if RESOURCE_FIELD_RE.search(field_desc):
                     resource_fields_found.append(cname or cid or cplaceholder or 'resource_field')
+                    if ctype != 'hidden':
+                        visible_resource_fields_found.append(cname or cid or cplaceholder or 'resource_field')
                     is_pure_search = False
 
                 if GUEST_POST_FIELD_RE.search(field_desc):
                     gp_fields_found.append(cname or cid or cplaceholder or 'gp_field')
+                    if ctype != 'hidden':
+                        visible_gp_fields_found.append(cname or cid or cplaceholder or 'gp_field')
                     is_pure_search = False
 
                 if 'email' in field_desc or ctype == 'email':
@@ -514,28 +520,33 @@ def analyze_html(raw_html, base_url):
                     if ctype not in ('hidden', 'search'):
                         is_pure_search = False
 
-        # P0-A 核心防守 4：如果表单没有任何 resource/gp 字段，或者全是 search 控件，绝对不是 actionable form
-        if is_pure_search or not (resource_fields_found or gp_fields_found):
+        # P0-A 核心防守 4：如果表单没有任何可见 resource/gp 字段，或者全是 search 控件，绝对不是 actionable form
+        # 隐藏字段如 hidden url 仅为页面跳转/重定向，外部访客无法输入产品信息
+        if is_pure_search or not (visible_resource_fields_found or visible_gp_fields_found):
             continue
 
         # 区分 Pure login/auth form vs Signup + submission combo form
         # 纯登录 (Pure login/auth form, 如仅 email/user + password + Login) 坚决排除；
-        # 组合表单 (具备 password 但同时具备 resource_fields 且具备明确提交意图) 予以识别为候选
+        # 组合表单 (具备 password 但同时具备 visible_resource_fields 且具备明确提交意图) 予以识别为候选
         has_password = any(c.get('type') == 'password' or 'password' in (c.get('name') or '').lower() for c in controls)
         if has_password:
-            has_submit_intent = bool(submit_buttons or gp_submit_buttons)
+            is_pure_login_btn = any(
+                re.search(r'^(?:log\s*in|sign\s*in|zaloguj|anmelden|connexion|accedi|entrar)$', (c.get('text') or c.get('value') or '').strip().lower())
+                for c in controls if (c.get('type') in ('submit', 'button') or c.get('tag') == 'button')
+            )
+            has_submit_intent = bool(submit_buttons or gp_submit_buttons) and not is_pure_login_btn
             has_intent_text = bool(
                 DIRECTORY_SUBMIT_INTENT_RE.search(form_text) or
                 GP_SUBMIT_INTENT_RE.search(form_text) or
                 DIRECTORY_SUBMIT_INTENT_RE.search(page_path) or
                 GP_SUBMIT_INTENT_RE.search(page_path)
             )
-            is_combo_form = bool(resource_fields_found or gp_fields_found) and (has_submit_intent or has_intent_text)
+            is_combo_form = bool(visible_resource_fields_found or visible_gp_fields_found) and (has_submit_intent or has_intent_text)
             if not is_combo_form:
                 continue
 
         # 检查是否为纯订阅 newsletter 表单 (仅 email + subscribe)
-        if has_email and not resource_fields_found and not gp_fields_found and not has_message:
+        if has_email and not visible_resource_fields_found and not visible_gp_fields_found and not has_message:
             if re.search(r'\b(subscribe|newsletter)\b', form_text):
                 continue
 
@@ -602,12 +613,30 @@ def analyze_html(raw_html, base_url):
 class Redirects(HTTPRedirectHandler): pass
 OPENER=build_opener(Redirects())
 
-def fetch_page(url, timeout=8, _retry=True):
+def fetch_page(url, timeout=8, _retry=True, deadline=None):
     req=Request(url, headers={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'})
+    t_start = time.time()
+    max_dur = timeout if timeout is not None else 8.0
+    dl = deadline if deadline is not None else (t_start + max_dur)
+    rem = dl - time.time()
+    if rem <= 0:
+        return {'url':url,'final_url':url,'status':0,'error':'TimeoutError: probe deadline exceeded'}
+    call_timeout = min(max_dur, rem)
     try:
-        with OPENER.open(req, timeout=timeout) as resp:
+        with OPENER.open(req, timeout=call_timeout) as resp:
             status=getattr(resp,'status',200); final=resp.geturl(); ctype=resp.headers.get('content-type','')
-            data=resp.read(MAX_BYTES)
+            chunks = []
+            total_bytes = 0
+            chunk_size = 8192
+            while total_bytes < MAX_BYTES:
+                if time.time() >= dl:
+                    raise TimeoutError("Wall-clock timeout exceeded while reading body")
+                part = resp.read(min(chunk_size, MAX_BYTES - total_bytes))
+                if not part:
+                    break
+                chunks.append(part)
+                total_bytes += len(part)
+            data = b"".join(chunks)
             if 'html' not in ctype.lower() and b'<html' not in data[:1000].lower():
                 return {'url':url,'final_url':final,'status':status,'content_type':ctype,'title':'','noindex':False,'mechanism_signals':[],'free_signals':[],'paid_signals':[],'spam_signals':[],'external_follow_count':0,'external_nofollow_count':0,'candidate_urls':[]}
             enc=resp.headers.get_content_charset() or 'utf-8'
@@ -621,7 +650,9 @@ def fetch_page(url, timeout=8, _retry=True):
         # 不是站点的问题。退避后重试一次，否则会把上千个正常站点误记成不可达。
         if _retry and "assign requested address" in str(e):
             time.sleep(1.5)
-            return fetch_page(url, timeout, _retry=False)
+            rem_retry = dl - time.time()
+            if rem_retry > 0:
+                return fetch_page(url, timeout=rem_retry, _retry=False, deadline=dl)
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}
     except Exception as e:
         return {'url':url,'final_url':url,'status':0,'error':type(e).__name__+': '+str(e)[:180]}
