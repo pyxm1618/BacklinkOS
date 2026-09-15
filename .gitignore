@@ -21,3 +21,6 @@ __pycache__/
 # Local runtime checkpoints and state
 .backlinkos/
 ready_cursor_*.json
+
+# Temporary / personal spreadsheet data
+/123/

@@ -6,15 +6,28 @@ This file provides guidance to Claude Code when working with this repository.
 
 BacklinkOS 是 **Agent Skill 宿主仓库 + 外链控制面支撑基础设施**。当前默认生产行为由 `discovering-backlinks` Skill 与其 current references 定义；Python/TypeScript 是实现这些契约的支撑代码。
 
+## 正式使用入口 (Formal Submission Workflow)
+
+当用户在新会话中输入类似：
+> “按本项目正式流程，为 quick-iching 提交外链，本轮目标新增成功提交 200 个。”
+
+**统一正式流程见：** 👉 **[docs/FORMAL_SUBMISSION_WORKFLOW.md](docs/FORMAL_SUBMISSION_WORKFLOW.md)**
+
+运行命令：
+```bash
+python3 scripts/run_submission_cycle.py --project-id quick-iching --target-success 200
+```
+
 ## 当前权威层级
 
 默认生产主链路的权威顺序：
 
-1. `.agents/skills/discovering-backlinks/SKILL.md` + current `references/`
-2. `docs/REPOSITORY_ARCHITECTURE.md`
-3. `docs/V4_PRODUCT_STRATEGY.md`
-4. `BacklinkOS-HANDOFF.md`
-5. root `README.md`
+1. `docs/FORMAL_SUBMISSION_WORKFLOW.md` (正式提交流程统一规范)
+2. `.agents/skills/discovering-backlinks/SKILL.md` + current `references/`
+3. `docs/REPOSITORY_ARCHITECTURE.md`
+4. `docs/V4_PRODUCT_STRATEGY.md`
+5. `BacklinkOS-HANDOFF.md`
+6. root `README.md`
 
 `.agents/skills/screening-backlinks/` 是 **Legacy / Optional**。只有用户明确要求旧式 Screening/历史排查时才以其 Skill 与 references 定义该旁路行为；它不能覆盖默认主链路。
 
@@ -28,6 +41,7 @@ BacklinkOS 是 **Agent Skill 宿主仓库 + 外链控制面支撑基础设施**�
 历史文档保留 point-in-time 决策，不定义当前行为。不要从历史“未实现”“待开发”文字推断当前 main 仍缺功能。
 
 Skill 的唯一可编辑源在 `.agents/skills/`；`.claude/skills/` 是 symlink compatibility entry，不要复制成第二套 Skill。
+
 
 ## 当前四阶段架构
 
