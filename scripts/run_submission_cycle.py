@@ -392,21 +392,21 @@ def validate_platform_facts(
 
         if login_val == "不需要":
             # 矛盾拦截：证据中要求登录
-            if ev_login in ("是", True, "yes", "true") or any(kw in str(ev_login).lower() for kw in ["需登录", "是"]):
+            if ev_login in ("是", "需要", True, "yes", "true") or any(kw in str(ev_login).lower() for kw in ["需登录", "需要", "是"]):
                 raise ValueError(f"声明平台事实 requires_login='不需要' 与证据中观察到的需登录相矛盾 (证据: {ev_login!r})")
             if any(kw in ev_text for kw in ["强制跳转登录", "强制登录", "需登录账号", "需认证", "oauth拦截"]):
-                raise ValueError(f"声明平台事实 requires_login='否' 与证据文本中的需登录描述相矛盾")
-            has_no_login = (ev_login in ("否", False, "no", "false") or any(kw in ev_text for kw in no_login_keywords))
+                raise ValueError(f"声明平台事实 requires_login='不需要' 与证据文本中的需登录描述相矛盾")
+            has_no_login = (ev_login in ("否", "不需要", False, "no", "false") or any(kw in ev_text for kw in no_login_keywords))
             if not has_no_login:
-                raise ValueError(f"声明平台事实 requires_login='否' 缺乏免登录相关证据支持")
+                raise ValueError(f"声明平台事实 requires_login='不需要' 缺乏免登录相关证据支持")
 
         elif login_val == "需要":
             # 矛盾拦截：证据明确为免登录
-            if ev_login in ("否", False, "no", "false") and not any(kw in ev_text for kw in login_keywords):
+            if ev_login in ("否", "不需要", False, "no", "false") and not any(kw in ev_text for kw in login_keywords):
                 raise ValueError(f"声明平台事实 requires_login='需要' 与证据中观察到的免登录相矛盾 (证据: {ev_login!r})")
-            has_login = (ev_login in ("是", True, "yes", "true") or any(kw in ev_text for kw in login_keywords))
+            has_login = (ev_login in ("是", "需要", True, "yes", "true") or any(kw in ev_text for kw in login_keywords))
             if not has_login:
-                raise ValueError(f"声明平台事实 requires_login='是' 缺乏具体登录/认证拦截相关证据支持")
+                raise ValueError(f"声明平台事实 requires_login='需要' 缺乏具体登录/认证拦截相关证据支持")
 
         valid_facts["requires_login"] = login_val
 
