@@ -342,8 +342,11 @@ def validate_platform_facts(
     # 3. 实测免费 free
     if "free" in facts and facts["free"]:
         free_val = str(facts["free"]).strip()
-        if free_val not in ("免费", "非免费", "部分免费"):
-            raise ValueError(f"实测免费字段仅允许'免费'、'非免费'、'部分免费'，当前为: {free_val!r}")
+        # 2026-09-20 Master 规范统一使用“混合”；兼容旧调用的“部分免费”输入。
+        if free_val == "部分免费":
+            free_val = "混合"
+        if free_val not in ("免费", "非免费", "混合"):
+            raise ValueError(f"实测免费字段仅允许'免费'、'非免费'、'混合'，当前为: {free_val!r}")
 
         # 结构化字段检查与明确矛盾拦截 (落实 S2 修复)
         ev_free = str(ev_dict.get("free") or ev_dict.get("pricing") or ev_dict.get("实测免费") or "").strip()
@@ -361,7 +364,7 @@ def validate_platform_facts(
             if not has_free:
                 raise ValueError(f"声明平台事实 free='免费' 缺乏具体免费相关证据支持")
 
-        elif free_val in ("非免费", "部分免费"):
+        elif free_val in ("非免费", "混合"):
             # 矛盾拦截：若证据明确为完全免费且无收费
             if ev_free in ("免费", "free") and not any(kw in ev_text for kw in paid_keywords):
                 raise ValueError(f"声明平台事实 free={free_val!r} 与证据中观察到的免费相矛盾 (证据: {ev_free!r})")
@@ -375,27 +378,32 @@ def validate_platform_facts(
     # 4. 实测需登录 requires_login
     if "requires_login" in facts and facts["requires_login"]:
         login_val = str(facts["requires_login"]).strip()
-        if login_val not in ("是", "否"):
-            raise ValueError(f"实测需登录字段仅允许'是'、'否'，当前为: {login_val!r}")
+        # Master 展示统一为“需要/不需要”；兼容旧调用的“是/否”输入。
+        if login_val == "是":
+            login_val = "需要"
+        elif login_val == "否":
+            login_val = "不需要"
+        if login_val not in ("需要", "不需要"):
+            raise ValueError(f"实测需登录字段仅允许'需要'、'不需要'，当前为: {login_val!r}")
 
         ev_login = ev_dict.get("requires_login") or ev_dict.get("auth_required") or ev_dict.get("实测需登录")
         login_keywords = ["登录", "sign-in", "signin", "sign in", "oauth", "需登录", "要求登录", "认证", "拦截", "注册账号"]
         no_login_keywords = ["免登录", "无需登录", "直接提交", "不需注册", "未要求登录", "not required", "guest"]
 
-        if login_val == "否":
+        if login_val == "不需要":
             # 矛盾拦截：证据中要求登录
             if ev_login in ("是", True, "yes", "true") or any(kw in str(ev_login).lower() for kw in ["需登录", "是"]):
-                raise ValueError(f"声明平台事实 requires_login='否' 与证据中观察到的需登录相矛盾 (证据: {ev_login!r})")
+                raise ValueError(f"声明平台事实 requires_login='不需要' 与证据中观察到的需登录相矛盾 (证据: {ev_login!r})")
             if any(kw in ev_text for kw in ["强制跳转登录", "强制登录", "需登录账号", "需认证", "oauth拦截"]):
                 raise ValueError(f"声明平台事实 requires_login='否' 与证据文本中的需登录描述相矛盾")
             has_no_login = (ev_login in ("否", False, "no", "false") or any(kw in ev_text for kw in no_login_keywords))
             if not has_no_login:
                 raise ValueError(f"声明平台事实 requires_login='否' 缺乏免登录相关证据支持")
 
-        elif login_val == "是":
+        elif login_val == "需要":
             # 矛盾拦截：证据明确为免登录
             if ev_login in ("否", False, "no", "false") and not any(kw in ev_text for kw in login_keywords):
-                raise ValueError(f"声明平台事实 requires_login='是' 与证据中观察到的免登录相矛盾 (证据: {ev_login!r})")
+                raise ValueError(f"声明平台事实 requires_login='需要' 与证据中观察到的免登录相矛盾 (证据: {ev_login!r})")
             has_login = (ev_login in ("是", True, "yes", "true") or any(kw in ev_text for kw in login_keywords))
             if not has_login:
                 raise ValueError(f"声明平台事实 requires_login='是' 缺乏具体登录/认证拦截相关证据支持")
