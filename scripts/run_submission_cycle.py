@@ -1981,6 +1981,11 @@ def record_task_outcome(
 
     # 预计算 Master 表变更
     proposed_master_updates: dict[str, Any] = {}
+    # 用户可见业务分类层（O:R）。隐藏技术列继续由既有 MASTER_HEADER 维护。
+    business_master_updates: dict[str, Any] = {}
+    if status in ("已提交", "审核中", "已排期", "已上线"):
+        # 真实成功状态本身足以证明该平台是可用外链渠道。
+        business_master_updates["状态"] = "可用"
     m_status = target_mrow.get("基础状态", "") if target_mrow else ""
     m_reason = target_mrow.get("基础排除原因", "") if target_mrow else (reason or "")
     m_limits = target_mrow.get("实测限制", "") if target_mrow else ""
@@ -2085,15 +2090,33 @@ def record_task_outcome(
             m_reason = reason or "平台关闭收录"
             is_global_unavail = True
 
+    # 当前单用户业务策略：只有在“非免费”已被直接观察，且文本明确证明没有任何免费路径时，
+    # 才把平台认定为 pure paid-only。仅看到一个收费套餐绝不够。
+    paid_only_markers = (
+        "纯付费", "付费-only", "paid-only", "paid only", "无免费通道",
+        "无免费提交", "没有免费", "必须付费", "强制付费"
+    )
+    is_pure_paid_only = (
+        status == "不适用"
+        and m_free == "非免费"
+        and any(marker in combined_info for marker in paid_only_markers)
+    )
+
     if is_global_unavail:
         proposed_master_updates["基础状态"] = m_status
         proposed_master_updates["基础排除原因"] = m_reason
+        business_master_updates["状态"] = ""
+    elif is_pure_paid_only:
+        proposed_master_updates["基础状态"] = "已排除"
+        proposed_master_updates["基础排除原因"] = "纯付费"
+        business_master_updates["状态"] = ""
+        business_master_updates["获取方式"] = "付费-only"
     elif "master_status" in valid_facts:
         proposed_master_updates["基础状态"] = valid_facts["master_status"]
         if "master_exclusion_reason" in valid_facts:
             proposed_master_updates["基础排除原因"] = valid_facts["master_exclusion_reason"]
 
-    if proposed_master_updates:
+    if proposed_master_updates or business_master_updates:
         proposed_master_updates["最后验证时间"] = valid_facts.get("observed_at") or iso_now
 
     # 门禁校验 Master 变更 (调用 ProductionSheetGate.validate_master_mutation, 落实 S2 门禁接入，证据与拟写事实保持绝对独立)
@@ -2398,9 +2421,11 @@ def record_task_outcome(
     sync_result = None
     master_sync_status = "ok"
 
-    if proposed_master_updates:
+    if proposed_master_updates or business_master_updates:
         if target_mrow:
             for k, v in proposed_master_updates.items():
+                target_mrow[k] = v
+            for k, v in business_master_updates.items():
                 target_mrow[k] = v
 
         if commit and sheets_service:
@@ -2441,11 +2466,24 @@ def record_task_outcome(
 
                 m_row_num = target_valid_row
 
-                # 构造更新 payload
+                # 构造更新 payload。A:N 为技术兼容字段；O:R 为当前用户可见业务分类层。
                 m_updates = []
                 for f_name, f_val in proposed_master_updates.items():
                     if f_name in MASTER_HEADER:
                         c_letter = col_index_to_letter(MASTER_HEADER.index(f_name))
+                        m_updates.append({
+                            "range": f"'{m_sheet}'!{c_letter}{m_row_num}",
+                            "values": [[str(f_val if f_val is not None else "")]]
+                        })
+
+                master_header_rb = sheets_service.spreadsheets().values().get(
+                    spreadsheetId=state["spreadsheet_id"],
+                    range=f"'{m_sheet}'!A1:R1",
+                ).execute()
+                master_full_header = master_header_rb.get("values", [[]])[0]
+                for f_name, f_val in business_master_updates.items():
+                    if f_name in master_full_header:
+                        c_letter = col_index_to_letter(master_full_header.index(f_name))
                         m_updates.append({
                             "range": f"'{m_sheet}'!{c_letter}{m_row_num}",
                             "values": [[str(f_val if f_val is not None else "")]]
@@ -2459,7 +2497,7 @@ def record_task_outcome(
                 # 写后全字段严格回读核验
                 post_rb = sheets_service.spreadsheets().values().get(
                     spreadsheetId=state["spreadsheet_id"],
-                    range=f"'{m_sheet}'!A{m_row_num}:N{m_row_num}",
+                    range=f"'{m_sheet}'!A{m_row_num}:R{m_row_num}",
                 ).execute()
                 post_vals = post_rb.get("values", [[]])[0]
                 act_bid = canonical_domain(post_vals[MASTER_HEADER.index("外链ID")]) if len(post_vals) > MASTER_HEADER.index("外链ID") else ""
@@ -2478,6 +2516,15 @@ def record_task_outcome(
                     elif act_val != exp_val:
                         raise RuntimeError(f"Master 表回读字段 {f_name} 不一致: 期望 {exp_val!r}, 实际 {act_val!r}")
 
+                for f_name, f_val in business_master_updates.items():
+                    if f_name not in master_full_header:
+                        continue
+                    f_idx = master_full_header.index(f_name)
+                    act_val = post_vals[f_idx].strip() if len(post_vals) > f_idx else ""
+                    exp_val = str(f_val if f_val is not None else "").strip()
+                    if act_val != exp_val:
+                        raise RuntimeError(f"Master 业务字段 {f_name} 回读不一致: 期望 {exp_val!r}, 实际 {act_val!r}")
+
             except Exception as m_write_err:
                 print(f"⚠️ [同步待恢复] Master 表写入失败或回读不一致 [{cid}]: {m_write_err}", file=sys.stderr)
                 master_sync_status = "pending_recovery"
@@ -2486,7 +2533,7 @@ def record_task_outcome(
                     "domain": cid,
                     "row_num": target_mrow.get("_sheet_row_num") if target_mrow else None,
                     "project_id": proj,
-                    "fields": proposed_master_updates,
+                    "fields": {**proposed_master_updates, **business_master_updates},
                     "expected_val": proposed_master_updates.get("提交入口") or proposed_master_updates.get("实测限制"),
                     "created_at": iso_now,
                     "error": str(m_write_err),
