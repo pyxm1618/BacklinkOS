@@ -169,12 +169,12 @@ class TestPlatformFactsCrossProject(unittest.TestCase):
         m_updates = res_a.get("master_updates", {})
         self.assertEqual(m_updates.get("提交入口"), verified_url)
         self.assertEqual(m_updates.get("实测免费"), "免费")
-        self.assertEqual(m_updates.get("实测需登录"), "否")
+        self.assertEqual(m_updates.get("实测需登录"), "不需要")
 
         # 将总表行实际更新（模拟持久化完成）
         master_rows[0]["提交入口"] = verified_url
         master_rows[0]["实测免费"] = "免费"
-        master_rows[0]["实测需登录"] = "否"
+        master_rows[0]["实测需登录"] = "不需要"
         master_rows[0]["平台备注"] = "支持免登录极速提交"
 
         # 4. 项目 B 启动并规划批次
